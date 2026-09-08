@@ -1,0 +1,10 @@
+<code_scheme name="Project" version="173">
+  <option name="RIGHT_MARGIN" value="80" />
+  <option name="SOFT_MARGINS" value="80" />
+  <JavaCodeStyleSettings>
+    <option name="RECORD_COMPONENTS_WRAP" value="2" />
+    <option name="ALIGN_MULTILINE_RECORDS" value="false" />
+    <option name="NEW_LINE_AFTER_LPAREN_IN_RECORD_HEADER" value="true" />
+    <option name="RPAREN_ON_NEW_LINE_IN_RECORD_HEADER" value="true" />
+  </JavaCodeStyleSettings>
+</code_scheme>

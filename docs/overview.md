@@ -25,5 +25,6 @@ Deliberately out of scope for now: full compiler parity, Maven/Gradle
 project-model auto-detection, and refactoring features such as rename.
 
 Next: the [requirements](requirements.md) trace users and use cases to numbered
-requirements; the [development section](dev/index.md) holds the backlog that
-turns them into work.
+requirements; the [architecture](architecture.md) describes how the code is
+shaped; the [development section](dev/index.md) holds the backlog that turns
+the requirements into work.

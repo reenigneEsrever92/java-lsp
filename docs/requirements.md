@@ -62,13 +62,23 @@ All use cases belong to the Java developer.
 | R7 | Full type-aware semantic engine (javac daemon via GraalVM Native Image vs. pure-Rust type checker — decision deliberately postponed) | Functional | medium | deferred |
 | R8 | Find references, rename, type-aware hover, Maven/Gradle project models | Functional | low | deferred |
 
-## Initial milestone
+## Milestones
 
-**v0.1 — usable syntax server**: R1–R6. A Java developer can open a project in
-any editor and immediately get symbols, folding, highlighting, parse errors,
-and typing/navigation support from the workspace index — all pure Rust, no
-semantic engine. R6 is treated as a design constraint from day one, verified by
-the benchmark harness (see `perf-benchmarks` in the backlog).
+**v0.1 — usable syntax server** (shipped): R1–R6. A Java developer can open
+a project in any editor and immediately get symbols, folding, highlighting,
+parse errors, and typing/navigation support from the workspace index — all
+pure Rust, no semantic engine. R6 was treated as a design constraint from day
+one, verified by the benchmark harness (`perf-benchmarks`).
 
-**Deferred**: R7 (the engine decision) and R8 (type-aware and project-model
-features) stay listed here so later change requests can pick them up.
+**v0.2 — project model**: the server understands the shape of a Java project
+instead of treating it as a file pile — Maven source roots and modules
+statically parsed from `pom.xml`, and the full dependency closure (direct,
+transitive, BOM-imported, parent-inherited) resolved offline from the local
+repository and indexed from their jars so external types show up in
+completions (R8, first slice; see `maven-project-model` in the backlog). The
+type-aware engine decision (R7) is explicitly pushed behind v0.2: its CR
+stays `proposed` until this milestone lands.
+
+**Deferred**: R7 (the engine decision) and the rest of R8 (find references,
+rename, type-aware hover, Gradle, transitive dependency resolution) stay
+listed here so later change requests can pick them up.

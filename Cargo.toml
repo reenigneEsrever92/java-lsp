@@ -1,0 +1,20 @@
+[package]
+name = "java-lsp"
+version = "0.1.0"
+edition = "2021"
+description = "A JVM-free Java language server written in Rust"
+
+[dependencies]
+tower-lsp = "0.20"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tree-sitter = "0.27"
+tree-sitter-java = "0.23"
+roxmltree = "0.20"
+flate2 = "1"
+serde_json = "1"
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+futures = "0.3"

@@ -1,0 +1,7 @@
+# Rust build artifacts
+**/target/
+zed-java-lsp/target/
+
+# Vendored tree-sitter-java grammar: an upstream checkout with its own .git
+# (clone it separately, or vendor it without .git if the source is needed)
+zed-java-lsp/grammars/java/

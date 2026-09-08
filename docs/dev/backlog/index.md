@@ -7,10 +7,13 @@ Change requests live here as `<slug>.md`. Each request has a `kind`
 
 | Request | Kind | Priority | State |
 |---------|------|----------|-------|
-| [lsp-shell-skeleton](lsp-shell-skeleton.md) | feature | high | proposed |
-| [syntax-features](syntax-features.md) | feature | high | proposed |
-| [workspace-symbol-index](workspace-symbol-index.md) | feature | high | proposed |
-| [completions-v1](completions-v1.md) | feature | high | proposed |
-| [navigation-v1](navigation-v1.md) | feature | medium | proposed |
-| [perf-benchmarks](perf-benchmarks.md) | feature | medium | proposed |
+| [lsp-shell-skeleton](lsp-shell-skeleton.md) | feature | high | done |
+| [syntax-features](syntax-features.md) | feature | high | done |
+| [workspace-symbol-index](workspace-symbol-index.md) | feature | high | done |
+| [completions-v1](completions-v1.md) | feature | high | done |
+| [navigation-v1](navigation-v1.md) | feature | medium | done |
+| [perf-benchmarks](perf-benchmarks.md) | feature | medium | done |
 | [type-aware-engine](type-aware-engine.md) | feature | medium | proposed |
+| [maven-project-model](maven-project-model.md) | feature | high | done |
+| [auto-import-completions](auto-import-completions.md) | feature | high | done |
+| [jdk-standard-library](jdk-standard-library.md) | feature | high | planned |
