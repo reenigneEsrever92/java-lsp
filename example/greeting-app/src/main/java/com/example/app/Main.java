@@ -2,6 +2,7 @@ package com.example.app;
 
 import com.example.greeting.Greeter;
 import com.google.gson.Gson;
+import com.example.greeting.Data;
 
 /**
  * The main class of them all
@@ -14,8 +15,8 @@ public class Main {
         Gson gson = new Gson();
         var data = new Data(5);
 
-        greeter.getName();
-        greeter.greet();
+        var name = greeter.getName();
+        var greeting = greeter.greet();
 
         var test = gson.toString();
 

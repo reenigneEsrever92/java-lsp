@@ -83,9 +83,11 @@ thereafter settled in v0.3.
 **v0.3 — type-aware engine**: the server resolves declared types instead of
 reasoning about names alone. A pure-Rust type layer (the engine chosen for R7 —
 the javac-daemon option was rejected as reintroducing a Java codebase and
-annotation-processor risk) models types, their members, and their hierarchies,
-and from it hover renders real declarations, completions after `.` offer the
-receiver's members, library types carry real signatures and inherited members
+annotation-processor risk) models types, their members, and their hierarchies —
+a source record's components modelled as the accessors a client calls, and
+indexed at the header — and from it hover renders real declarations, completions
+after `.` offer the receiver's members, library types carry real signatures and
+inherited members
 (`jvm-member-descriptors`), unresolved type names are reported as conservative
 semantic diagnostics (R7), and find references and rename — R8's first slice,
 `references-and-rename` — work for types, members, and file-local symbols,
@@ -98,7 +100,12 @@ variable types (resolving `var` from its initializer), parameter names at call
 sites, and the return types of intermediate method-chain links, scoped to the
 visible range the client requests (R9; see `type-hints` in the backlog). The
 `var` inference pulled forward for the hints also types `var` locals in the
-scope that hover and completions read. Type arguments are inferred and
+scope that hover and completions read, from every supported initializer shape —
+a conditional, array creation, `instanceof`, a `switch` expression, an
+enhanced-for iterable, or a try-with-resources initializer — and an incomplete
+`receiver.` at the end of a line keeps its receiver, so completing it offers
+the same members as when the expression continues on the same line
+(`dot-completion-and-var-inference`). Type arguments are inferred and
 substituted for calls — a method's own type parameters from its arguments and
 the receiver's from its own arguments — so `List.of(5)` renders `List<Integer>`
 and `list.get(0)` its element type

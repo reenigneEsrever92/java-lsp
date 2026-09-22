@@ -3,10 +3,14 @@ type: ChangeRequest
 kind: bug
 title: A dot at line end loses its receiver, and `var` locals frequently infer no type
 description: Completing `receiver.` returns nothing when the next line starts a new statement (the reported case is a following `var` line), and `var` bindings infer no type for several common initializers.
-state: proposed
+state: done
 priority: high
 tags: [dev, completions, types, var]
 owner: felix
+verified:
+  by: cargo test --all-targets (184 passed - 159 lib, 6 bench bin, 18 harness,
+    1 stdio)
+  at: 2026-09-22T21:15:16Z
 ---
 
 # Problem
@@ -132,3 +136,74 @@ pre-existing gaps):
   `Object` member set).
 - `docs/requirements.md` — the `var`-inference wording in the v0.4 milestone,
   extended to the newly inferred positions.
+
+# Implementation plan
+
+## Approach
+
+Three defects, three seams; no new dependencies and no LSP-shape changes. The
+acceptance criteria are referred to as AC1–AC7 below, in their listed order.
+
+- **Receiver recovery (`src/engine/syntax.rs`).** `receiver_before_dot` keeps its
+  `field_access`/`method_invocation` walk and gains a fallback that reads the
+  source: take the last non-whitespace byte before the dot, find the tree node
+  there, and climb to the outermost expression ending exactly at that byte
+  (an `is_receiver_kind` allow-list mirroring the shapes `receiver_type`
+  handles). The returned node is a real node of the open document's tree, so
+  `scope_at`/`receiver_type` keep working unchanged. `member_items` passes the
+  document text and treats `type_identifier` like `identifier` for the
+  static-receiver check, so `Widget.` still offers only statics. A following
+  `var` line parses `gson.var` as a `scoped_type_identifier`, which is why the
+  walk alone finds nothing.
+- **`var` inference (`src/types.rs`).**
+  - `collect_locals`: an enhanced-for binding written `var` stores the iterable's
+    element type (new `element_type`: an array's element, or a `Ref`'s single
+    type argument) instead of the literal `var`; a new `resource` arm collects
+    try-with-resources bindings (explicit and `var`).
+  - `receiver_type_unqualified`: new arms for `type_identifier` and
+    `scoped_identifier`/`scoped_type_identifier` (a name receiver),
+    `ternary_expression` (unify the branches, a lone `null` yielding the other),
+    `array_creation_expression` (an array of the element type),
+    `instanceof_expression` (`boolean`), and `switch_expression` (unify the rule
+    bodies and `yield`ed values). A lambda has no target type here, so it stays
+    `Unknown`, as does any shape with no single answer.
+  - `enhanced_for_hint` renders a type hint for a `var` binding too, now that the
+    element type is inferred (it needs the tree and model, so its signature
+    gains them).
+- **Resolve-only `java.lang.Object` (`src/types.rs`).** `member_of` and
+  `member_for_call` fall back to the model's `java.lang.Object` (qualified
+  lookup, then a simple-name lookup for a model that keys it without a package)
+  when the normal hierarchy walk finds nothing, and only for a known
+  reference-ish receiver (`Ref`/`Var`/`Array`) so an `Unknown` receiver never
+  gains members. `TypeLookup::members` — which `.`-completion reads directly —
+  is untouched, so `toString`/`equals`/`hashCode`/`wait`/... do not reappear in
+  listings; `member_owner` is untouched, so a library `Object` member still
+  refuses navigation, exactly like other library members.
+
+## Steps
+
+- [x] Recover the receiver from the source text before an incomplete dot in
+      `receiver_before_dot` (+ `is_receiver_kind`), and pass the text from
+      `member_items`. (AC1.)
+- [x] Teach `collect_locals` the enhanced-for `var` element type and the
+      try-with-resources `resource` binding. (AC3, AC4.)
+- [x] Add the `receiver_type_unqualified` arms: `type_identifier`/`scoped_*`,
+      ternary, array creation, `instanceof`, and `switch` expression. (AC5.)
+- [x] Add the resolve-only `java.lang.Object` fallback to `member_of` and
+      `member_for_call`. (AC2, AC6.)
+- [x] Render a type hint for a `var` enhanced-for binding in `enhanced_for_hint`.
+      (AC3.)
+- [x] Add `src/types.rs` unit tests: enhanced-for `var` element type, resource
+      binding, ternary/array/`instanceof`/`switch` inference, and `toString()`
+      through a modelled `java.lang.Object`. (AC2–AC5, AC7.)
+- [x] Add `src/engine/syntax.rs` unit tests: `gson.` with a following `var` line
+      (and other new statements) offers members like the same-line form, the
+      explicit-type controls, `var x = gson.toString()` hint/`x.` members with a
+      modelled `Object`, and that a record's `.`-list gains no `Object` members.
+      (AC1–AC3, AC6, AC7.)
+- [x] Update `docs/architecture.md`: the `TreeSitterEngine` completions paragraph
+      (receiver recovery) and the `types.rs` bullet (`var` inference and the
+      resolve-only `Object` member set). (AC1, AC2, AC6.)
+- [x] Update `docs/requirements.md`: the v0.4 `var`-inference wording, extended to
+      the newly inferred positions. (AC3–AC5.)
+- [x] Run `cargo test --all-targets` and confirm the suite passes. (all ACs.)

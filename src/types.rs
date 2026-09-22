@@ -759,6 +759,21 @@ fn type_info_from_declaration(
     if let Some(body) = node.child_by_field_name("body") {
         collect_members(&body, text, &mut info);
     }
+    // A record's components live in its `parameters` field, not its body. For a
+    // client each is the accessor `x()`, so it is modelled as a method (the
+    // private backing field is not added, so it is never offered to a receiver).
+    if node.kind() == "record_declaration" {
+        for (name, ty) in record_components(node, text) {
+            info.methods.push(Member {
+                name,
+                kind: IndexKind::Method,
+                ty,
+                params: Vec::new(),
+                type_params: Vec::new(),
+                is_static: false,
+            });
+        }
+    }
     Some(info)
 }
 
@@ -886,6 +901,30 @@ fn parameter_name(parameter: &Node, text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// A record's header components as `(name, type)` pairs. Unlike a class, a
+/// record declares its components in its `parameters` field, not its body.
+fn record_components(node: &Node, text: &str) -> Vec<(String, Ty)> {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "formal_parameter" {
+            continue;
+        }
+        let Some(name) = parameter_name(&parameter, text) else {
+            continue;
+        };
+        let ty = parameter
+            .child_by_field_name("type")
+            .map(|node| type_from_node(&node, text))
+            .unwrap_or(Ty::Unknown);
+        out.push((name, ty));
+    }
+    out
 }
 
 fn has_modifier(node: &Node, text: &str, modifier: &str) -> bool {
@@ -1085,6 +1124,20 @@ pub fn scope_at(node: Node, text: &str, tree: &Tree, model: &dyn TypeLookup) -> 
         if let Some(body) = type_node.child_by_field_name("body") {
             collect_field_members(&body, text, &mut scope);
         }
+        // A record's components are nameable unqualified inside the record, as
+        // the private backing fields would be.
+        if type_node.kind() == "record_declaration" {
+            for (name, ty) in record_components(&type_node, text) {
+                scope.fields.push(Member {
+                    name,
+                    kind: IndexKind::Field,
+                    ty,
+                    params: Vec::new(),
+                    type_params: Vec::new(),
+                    is_static: false,
+                });
+            }
+        }
         if let Some(params) = type_node.child_by_field_name("type_parameters") {
             collect_parameter_names(&params, text, &mut scope.type_params);
         }
@@ -1176,10 +1229,29 @@ fn collect_locals(
             }
         }
         "enhanced_for_statement" if node.start_byte() < cursor_byte => {
-            let ty = node
-                .child_by_field_name("type")
-                .map(|node| type_from_node(&node, text))
-                .unwrap_or(Ty::Unknown);
+            // A `var` binding takes the iterable's element type; an explicit
+            // type is used as written.
+            let ty = if is_var_binding(node, text) {
+                node.child_by_field_name("value")
+                    .map(|value| element_type(&receiver_type(&value, text, scope, model)))
+                    .unwrap_or(Ty::Unknown)
+            } else {
+                declared_type(node, text)
+            };
+            if let Some(name) = node.child_by_field_name("name") {
+                scope.locals.push((text[name.byte_range()].to_string(), ty));
+            }
+        }
+        // A try-with-resources binding, which declares a name exactly like a
+        // local: `try (Widget w = open())` and the `var` form.
+        "resource" if node.start_byte() < cursor_byte => {
+            let ty = if is_var_binding(node, text) {
+                node.child_by_field_name("value")
+                    .map(|value| receiver_type(&value, text, scope, model))
+                    .unwrap_or(Ty::Unknown)
+            } else {
+                declared_type(node, text)
+            };
             if let Some(name) = node.child_by_field_name("name") {
                 scope.locals.push((text[name.byte_range()].to_string(), ty));
             }
@@ -1189,6 +1261,31 @@ fn collect_locals(
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
         collect_locals(&child, text, cursor_byte, model, scope);
+    }
+}
+
+/// True when a declaration-like node (a local, an enhanced-for binding, a
+/// try-with-resources resource) is written with `var`.
+fn is_var_binding(node: &Node, text: &str) -> bool {
+    node.child_by_field_name("type")
+        .is_some_and(|ty| &text[ty.byte_range()] == "var")
+}
+
+/// A declaration-like node's written type, or `Unknown` when it has none.
+fn declared_type(node: &Node, text: &str) -> Ty {
+    node.child_by_field_name("type")
+        .map(|node| type_from_node(&node, text))
+        .unwrap_or(Ty::Unknown)
+}
+
+/// The element type of an iterable an enhanced-for binding ranges over: an
+/// array's element, or the single type argument of a reference type
+/// (`List<Widget>` yields `Widget`). `Unknown` when there is no single answer.
+pub fn element_type(ty: &Ty) -> Ty {
+    match ty {
+        Ty::Array(element) => (**element).clone(),
+        Ty::Ref { args, .. } if args.len() == 1 => args[0].clone(),
+        _ => Ty::Unknown,
     }
 }
 
@@ -1343,7 +1440,10 @@ fn qualified_reference(info: &TypeInfo) -> Ty {
 }
 
 /// The member named `name` on `ty`, or `None` when there is no single answer.
-/// Overloads that all share one return type are treated as one answer.
+/// Overloads that all share one return type are treated as one answer. When the
+/// hierarchy walk finds nothing, `java.lang.Object`'s members are consulted, so
+/// an inherited `toString`/`equals`/... resolves for typing and hover without
+/// ever appearing in a `.`-completion listing (which reads the hierarchy walk).
 pub fn member_of(
     ty: &Ty,
     name: &str,
@@ -1355,17 +1455,57 @@ pub fn member_of(
         .into_iter()
         .filter(|member| member.name == name)
         .collect();
+    if let Some(member) = single_member(matches) {
+        return Some(member);
+    }
+    if inherits_object(ty) {
+        return single_member(object_members(model, package, name));
+    }
+    None
+}
+
+/// The single answer among same-named members, or `None` when there is none or
+/// they disagree on return type and kind.
+fn single_member(matches: Vec<Member>) -> Option<Member> {
     match matches.len() {
         0 => None,
         1 => Some(matches[0].clone()),
         _ => {
             let first = &matches[0];
-            let same = matches
+            matches
                 .iter()
-                .all(|member| member.ty == first.ty && member.kind == first.kind);
-            same.then(|| first.clone())
+                .all(|member| member.ty == first.ty && member.kind == first.kind)
+                .then(|| first.clone())
         }
     }
+}
+
+/// True for a receiver that has `java.lang.Object` as an implicit supertype, so
+/// `Object`'s members resolve on it even though no type records the edge.
+fn inherits_object(ty: &Ty) -> bool {
+    matches!(ty, Ty::Ref { .. } | Ty::Var(_) | Ty::Array(_))
+}
+
+/// The model's `java.lang.Object`, if the model carries it. The qualified
+/// lookup finds the JDK type; the simple-name fallback covers a model that keys
+/// it without a package.
+fn object_type<'a>(model: &'a dyn TypeLookup, package: Option<&str>) -> Option<&'a TypeInfo> {
+    model
+        .lookup(&Ty::reference("java.lang.Object"), None)
+        .or_else(|| model.find_unique("Object", package))
+}
+
+/// `java.lang.Object`'s members named `name`, used only as a resolve-only
+/// fallback so `.`-completion listings stay free of `toString`/`equals`/...
+fn object_members(model: &dyn TypeLookup, package: Option<&str>, name: &str) -> Vec<Member> {
+    object_type(model, package)
+        .map(|info| {
+            info.members()
+                .filter(|member| member.name == name)
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// The member named `name` that a call with `arg_count` arguments most likely
@@ -1402,6 +1542,14 @@ pub fn member_for_call(
             .members(ty, package)
             .into_iter()
             .filter(|member| member.name == name && member.kind == IndexKind::Method)
+            .collect();
+    }
+    // Inherited `java.lang.Object` methods are resolve-only, so they are not in
+    // the hierarchy walk; consult them when nothing else matches.
+    if candidates.is_empty() && inherits_object(ty) {
+        candidates = object_members(model, package, name)
+            .into_iter()
+            .filter(|member| member.kind == IndexKind::Method)
             .collect();
     }
     let matching: Vec<Member> = candidates
@@ -1623,9 +1771,32 @@ pub fn receiver_type(node: &Node, text: &str, scope: &Scope, model: &dyn TypeLoo
 /// disambiguate an imported simple name.
 fn receiver_type_unqualified(node: &Node, text: &str, scope: &Scope, model: &dyn TypeLookup) -> Ty {
     match node.kind() {
-        "identifier" => resolve_name(&text[node.byte_range()], scope, model)
+        "identifier" | "type_identifier" => resolve_name(&text[node.byte_range()], scope, model)
             .map(|resolved| resolved.ty)
             .unwrap_or(Ty::Unknown),
+        // A receiver the parser read as a dotted type name — an incomplete
+        // `receiver.` can end up this way — is a member chain.
+        "scoped_identifier" | "scoped_type_identifier" => {
+            let Some(scope_node) = node
+                .child_by_field_name("scope")
+                .or_else(|| node.named_child(0))
+            else {
+                return Ty::Unknown;
+            };
+            let base = receiver_type(&scope_node, text, scope, model);
+            let Some(name_node) = node
+                .child_by_field_name("name")
+                .or_else(|| node.named_child(node.named_child_count().saturating_sub(1) as u32))
+            else {
+                return Ty::Unknown;
+            };
+            let name = &text[name_node.byte_range()];
+            let Some(member) = member_of(&base, name, model, scope.package.as_deref()) else {
+                return Ty::Unknown;
+            };
+            let bindings = receiver_bindings(&base, name, model, scope.package.as_deref());
+            member.access_type().substitute(&bindings)
+        }
         "this" => scope
             .enclosing_type
             .clone()
@@ -1710,7 +1881,90 @@ fn receiver_type_unqualified(node: &Node, text: &str, scope: &Scope, model: &dyn
         "character_literal" => Ty::Prim(Prim::Char),
         "true" | "false" => Ty::Prim(Prim::Boolean),
         "null_literal" => Ty::Null,
+        // A conditional expression takes its branches' common type; a lone
+        // `null` yields the other branch.
+        "ternary_expression" => {
+            let consequence = node
+                .child_by_field_name("consequence")
+                .map(|node| receiver_type(&node, text, scope, model))
+                .unwrap_or(Ty::Unknown);
+            let alternative = node
+                .child_by_field_name("alternative")
+                .map(|node| receiver_type(&node, text, scope, model))
+                .unwrap_or(Ty::Unknown);
+            unify(consequence, alternative)
+        }
+        "array_creation_expression" => node
+            .child_by_field_name("type")
+            .map(|node| Ty::Array(Box::new(type_from_node(&node, text))))
+            .unwrap_or(Ty::Unknown),
+        "instanceof_expression" => Ty::Prim(Prim::Boolean),
+        "switch_expression" => switch_result_type(node, text, scope, model),
         _ => Ty::Unknown,
+    }
+}
+
+/// The single type two branches agree on: their common type, a lone `null`
+/// yielding the other branch, or `Unknown` when there is no single answer. A
+/// lambda has no target type here, so it too stays `Unknown`.
+fn unify(left: Ty, right: Ty) -> Ty {
+    if left == right {
+        return left;
+    }
+    match (left, right) {
+        (Ty::Null, other) | (other, Ty::Null) if other != Ty::Unknown => other,
+        _ => Ty::Unknown,
+    }
+}
+
+/// The type a `switch` expression yields: the unification of every result
+/// expression — an arrow rule's expression or `block`, or a `yield`ed value.
+/// `Unknown` unless they all agree.
+fn switch_result_type(node: &Node, text: &str, scope: &Scope, model: &dyn TypeLookup) -> Ty {
+    let Some(body) = node.child_by_field_name("body") else {
+        return Ty::Unknown;
+    };
+    let mut results = Vec::new();
+    collect_switch_results(&body, &mut results);
+    let mut result: Option<Ty> = None;
+    for value in results {
+        let ty = receiver_type(&value, text, scope, model);
+        result = Some(match result {
+            Some(previous) => unify(previous, ty),
+            None => ty,
+        });
+    }
+    result.unwrap_or(Ty::Unknown)
+}
+
+/// Collects a `switch` block's result expressions: an arrow rule's expression
+/// body and every `yield`ed value, descending into blocks.
+fn collect_switch_results<'a>(node: &Node<'a>, out: &mut Vec<Node<'a>>) {
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        match child.kind() {
+            "switch_rule" => {
+                let mut inner = child.walk();
+                for part in child.named_children(&mut inner) {
+                    match part.kind() {
+                        "expression_statement" => {
+                            if let Some(value) = part.named_child(0) {
+                                out.push(value);
+                            }
+                        }
+                        "block" => collect_switch_results(&part, out),
+                        _ => {}
+                    }
+                }
+            }
+            "switch_block_statement_group" | "block" => collect_switch_results(&child, out),
+            "yield_statement" => {
+                if let Some(value) = child.named_child(0) {
+                    out.push(value);
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1805,6 +2059,59 @@ class Widget extends Base implements Runnable {
             }]
         );
         assert_eq!(get_size.display(), "int getSize(int extra)");
+    }
+
+    #[test]
+    fn record_components_become_accessor_members() {
+        let model = model_of("record Point(int x, int y) {}\n");
+        let point = model.find_unique("Point", None).expect("Point");
+        assert_eq!(point.kind, IndexKind::Record);
+
+        // To a client a component is the accessor `x()`: a method with the
+        // component's type and no parameters, and no private backing field.
+        let members = model.members(&Ty::reference("Point"), None);
+        let x = members.iter().find(|member| member.name == "x").expect("x");
+        assert_eq!(x.kind, IndexKind::Method);
+        assert_eq!(x.ty, Ty::Prim(Prim::Int));
+        assert!(x.params.is_empty());
+        assert_eq!(x.display(), "int x()");
+        assert!(members.iter().any(|member| member.name == "y"));
+        assert!(!point.fields.iter().any(|field| field.name == "x"));
+    }
+
+    #[test]
+    fn a_record_without_components_adds_no_members() {
+        let model = model_of("record Empty() {}\nrecord Marker() {\n    void run() {}\n}\n");
+        assert!(model.members(&Ty::reference("Empty"), None).is_empty());
+
+        // A record's explicitly declared methods are still offered as before.
+        let members = model.members(&Ty::reference("Marker"), None);
+        let names: Vec<&str> = members.iter().map(|member| member.name.as_str()).collect();
+        assert_eq!(names, ["run"], "{names:?}");
+    }
+
+    #[test]
+    fn a_bare_component_resolves_inside_the_record() {
+        let text = "\
+record Point(int x, int y) {
+    int sum() {
+        return x + y;
+    }
+}
+";
+        let tree = parse(text);
+        let node = node_in(&tree, text, "return x");
+        let mut model = TypeModel::new();
+        model.extend(collect_type_infos(None, &tree, text));
+        let scope = scope_at(node, text, &tree, &model);
+
+        let resolved = resolve_name("x", &scope, &model).expect("the component should resolve");
+        assert!(!resolved.is_type);
+        assert_eq!(resolved.ty, Ty::Prim(Prim::Int));
+        assert_eq!(
+            resolved.member.map(|member| member.kind),
+            Some(IndexKind::Field)
+        );
     }
 
     #[test]
@@ -2187,6 +2494,215 @@ class C {
             member_for_call(&target, "over", 3, &model, None).map(|member| member.ty),
             Some(Ty::Void)
         );
+    }
+
+    #[test]
+    fn var_enhanced_for_takes_the_element_type() {
+        let text = "\
+class Widget {}
+class C {
+    void m(Widget[] ws) {
+        for (var w : ws) {
+            // cursor
+        }
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(type_of_local(&scope, "w"), Some(Ty::reference("Widget")));
+    }
+
+    #[test]
+    fn var_enhanced_for_reads_a_generic_element_type() {
+        let text = "\
+class Widget {}
+class C {
+    void m(List<Widget> ws) {
+        for (var w : ws) {
+            // cursor
+        }
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(type_of_local(&scope, "w"), Some(Ty::reference("Widget")));
+    }
+
+    #[test]
+    fn an_explicit_enhanced_for_binding_is_unchanged() {
+        let text = "\
+class Widget {}
+class C {
+    void m(Widget[] ws) {
+        for (Widget w : ws) {
+            // cursor
+        }
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(type_of_local(&scope, "w"), Some(Ty::reference("Widget")));
+    }
+
+    #[test]
+    fn try_with_resources_bindings_are_collected() {
+        let explicit = "\
+class Widget {
+    static Widget open() { return null; }
+}
+class C {
+    void m() {
+        try (Widget w = Widget.open()) {
+            // cursor
+        } catch (Exception e) {
+        }
+    }
+}
+";
+        let model = model_of(explicit);
+        let scope = scope_with_cursor(explicit, &model);
+        assert_eq!(type_of_local(&scope, "w"), Some(Ty::reference("Widget")));
+
+        let inferred = explicit.replace("Widget w = Widget.open()", "var w = Widget.open()");
+        let model = model_of(&inferred);
+        let scope = scope_with_cursor(&inferred, &model);
+        assert_eq!(type_of_local(&scope, "w"), Some(Ty::reference("Widget")));
+    }
+
+    #[test]
+    fn var_takes_a_ternary_type_with_a_null_branch() {
+        let text = "\
+class Widget {}
+class C {
+    void m(boolean c) {
+        var w = c ? new Widget() : null;
+        // cursor
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(type_of_local(&scope, "w"), Some(Ty::reference("Widget")));
+    }
+
+    #[test]
+    fn var_takes_an_array_creation_type() {
+        let text = "\
+class Widget {}
+class C {
+    void m() {
+        var a = new Widget[3];
+        // cursor
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(
+            type_of_local(&scope, "a"),
+            Some(Ty::Array(Box::new(Ty::reference("Widget"))))
+        );
+    }
+
+    #[test]
+    fn var_takes_an_instanceof_and_a_switch_result() {
+        let text = "\
+class Widget {}
+class C {
+    void m(boolean c, Object o) {
+        var b = o instanceof Widget;
+        var e = switch (c) { case true -> new Widget(); default -> null; };
+        // cursor
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(type_of_local(&scope, "b"), Some(Ty::Prim(Prim::Boolean)));
+        assert_eq!(type_of_local(&scope, "e"), Some(Ty::reference("Widget")));
+    }
+
+    #[test]
+    fn a_switch_whose_results_disagree_infers_nothing() {
+        let text = "\
+class Widget {}
+class C {
+    void m(boolean c) {
+        var e = switch (c) { case true -> new Widget(); default -> 1; };
+        // cursor
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(type_of_local(&scope, "e"), Some(Ty::Unknown));
+    }
+
+    /// A model with a qualified `java.lang.Object` and a member-less `Gson`, as
+    /// a JDK-indexed workspace would have.
+    fn object_model() -> TypeModel {
+        let mut model = TypeModel::new();
+        let mut object = TypeInfo::new(
+            "Object".to_string(),
+            Some("java.lang".to_string()),
+            IndexKind::Class,
+        );
+        object.methods.push(Member {
+            name: "toString".to_string(),
+            kind: IndexKind::Method,
+            ty: Ty::reference("String"),
+            params: Vec::new(),
+            type_params: Vec::new(),
+            is_static: false,
+        });
+        model.insert(object);
+        model.insert(TypeInfo::new("Gson".to_string(), None, IndexKind::Class));
+        model
+    }
+
+    #[test]
+    fn an_inherited_object_method_resolves_but_stays_out_of_member_listing() {
+        let model = object_model();
+        let gson = Ty::reference("Gson");
+        // Resolution finds the inherited method ...
+        assert_eq!(
+            member_of(&gson, "toString", &model, None).map(|member| member.ty),
+            Some(Ty::reference("String"))
+        );
+        assert_eq!(
+            member_for_call(&gson, "toString", 0, &model, None).map(|member| member.ty),
+            Some(Ty::reference("String"))
+        );
+        // ... but the hierarchy walk — what `.`-completion reads — does not.
+        assert!(model
+            .members(&gson, None)
+            .iter()
+            .all(|member| member.name != "toString"));
+        // An unknown receiver gains nothing.
+        assert!(member_of(&Ty::Unknown, "toString", &model, None).is_none());
+    }
+
+    #[test]
+    fn a_call_to_an_object_method_infers_its_result() {
+        let text = "\
+package java.lang;
+class Object {
+    public String toString() { return null; }
+}
+class Gson {}
+class C {
+    void m(Gson gson) {
+        var s = gson.toString();
+        // cursor
+    }
+}
+";
+        let model = model_of(text);
+        let scope = scope_with_cursor(text, &model);
+        assert_eq!(type_of_local(&scope, "s"), Some(Ty::reference("String")));
     }
 
     fn type_of_local(scope: &Scope, name: &str) -> Option<Ty> {

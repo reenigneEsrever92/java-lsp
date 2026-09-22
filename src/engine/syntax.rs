@@ -145,7 +145,7 @@ impl TreeSitterEngine {
         prefix: &str,
     ) -> Vec<CompletionItem> {
         let text = &document.text;
-        let Some(object) = receiver_before_dot(&document.tree, offset) else {
+        let Some(object) = receiver_before_dot(&document.tree, text, offset) else {
             return Vec::new();
         };
         let local = local_model(document);
@@ -155,7 +155,7 @@ impl TreeSitterEngine {
         let query = TypeQuery::new(base, &local);
         let scope = types::scope_at(object, text, &document.tree, &query);
 
-        let static_only = object.kind() == "identifier"
+        let static_only = matches!(object.kind(), "identifier" | "type_identifier")
             && types::resolve_name(&text[object.byte_range()], &scope, &query)
                 .map(|resolved| resolved.is_type)
                 .unwrap_or(false);
@@ -1828,7 +1828,13 @@ fn declaration_text(keyword: &str, name: &str, parent: &Node, text: &str) -> Str
         .child_by_field_name("type_parameters")
         .map(|node| text[node.byte_range()].to_string())
         .unwrap_or_default();
-    format!("{keyword} {name}{parameters}")
+    // A record carries its components in a `parameters` field; no other
+    // declaration kind this renders has one.
+    let components = parent
+        .child_by_field_name("parameters")
+        .map(|node| text[node.byte_range()].to_string())
+        .unwrap_or_default();
+    format!("{keyword} {name}{parameters}{components}")
 }
 
 fn node_has_modifier(node: &Node, text: &str, modifier: &str) -> bool {
@@ -1844,7 +1850,7 @@ fn node_has_modifier(node: &Node, text: &str, modifier: &str) -> bool {
 }
 
 /// The expression a `.` at `offset` is applied to, if any.
-fn receiver_before_dot<'a>(tree: &'a Tree, offset: usize) -> Option<Node<'a>> {
+fn receiver_before_dot<'a>(tree: &'a Tree, text: &str, offset: usize) -> Option<Node<'a>> {
     if offset == 0 {
         return None;
     }
@@ -1858,7 +1864,80 @@ fn receiver_before_dot<'a>(tree: &'a Tree, offset: usize) -> Option<Node<'a>> {
         }
         current = node.parent();
     }
-    None
+    receiver_before_dot_from_text(tree, text, offset)
+}
+
+/// Recovers the receiver of an incomplete `receiver.` from the source when the
+/// tree has not formed a member access. A dot at the end of a line can be
+/// absorbed into the following token — a `var` line makes the parser read
+/// `gson.var` as a scoped type identifier — so the receiver is taken as the
+/// outermost expression ending at the last non-whitespace byte before the dot.
+/// The node is a real node of the same tree, so callers can still locate its
+/// enclosing scope.
+fn receiver_before_dot_from_text<'a>(
+    tree: &'a Tree,
+    text: &str,
+    offset: usize,
+) -> Option<Node<'a>> {
+    let bytes = text.as_bytes();
+    let mut end = offset.checked_sub(1)?;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    if end == 0 {
+        return None;
+    }
+    let mut node = tree
+        .root_node()
+        .descendant_for_byte_range(end - 1, end - 1)?;
+    let mut best = is_receiver_kind(node.kind()).then_some(node);
+    // Climb to the outermost expression that still ends at the receiver, so a
+    // call or parenthesized receiver is taken whole (`list.get(0).`, `(x).`).
+    while let Some(parent) = node.parent() {
+        if parent.end_byte() != end {
+            break;
+        }
+        node = parent;
+        if is_receiver_kind(node.kind()) {
+            best = Some(node);
+        }
+    }
+    best
+}
+
+/// True for the node kinds [`receiver_type`](crate::types::receiver_type) can
+/// type — the shapes an expression receiver may take.
+fn is_receiver_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "identifier"
+            | "type_identifier"
+            | "scoped_identifier"
+            | "scoped_type_identifier"
+            | "this"
+            | "super"
+            | "object_creation_expression"
+            | "array_creation_expression"
+            | "field_access"
+            | "method_invocation"
+            | "parenthesized_expression"
+            | "cast_expression"
+            | "array_access"
+            | "ternary_expression"
+            | "instanceof_expression"
+            | "switch_expression"
+            | "string_literal"
+            | "decimal_integer_literal"
+            | "hex_integer_literal"
+            | "octal_integer_literal"
+            | "binary_integer_literal"
+            | "decimal_floating_point_literal"
+            | "hex_floating_point_literal"
+            | "character_literal"
+            | "true"
+            | "false"
+            | "null_literal"
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -1887,7 +1966,7 @@ fn collect_inlay_hints(
         "field_declaration" | "constant_declaration" => {
             variable_hints(&node, text, tree, model, false, out)
         }
-        "enhanced_for_statement" => enhanced_for_hint(&node, text, out),
+        "enhanced_for_statement" => enhanced_for_hint(&node, text, tree, model, out),
         "method_invocation" => {
             parameter_hints(&node, text, tree, model, out);
             chain_hint(&node, text, tree, model, out);
@@ -1940,24 +2019,35 @@ fn variable_hints(
     }
 }
 
-/// The type of an enhanced-for binding. A `var` binding would need the
-/// iterable's element type, which is not inferred here, so it yields no hint.
-fn enhanced_for_hint(node: &Node, text: &str, out: &mut Vec<InlayHint>) {
-    let Some(type_node) = node.child_by_field_name("type") else {
-        return;
-    };
-    if &text[type_node.byte_range()] == "var" {
-        return;
-    }
+/// The type of an enhanced-for binding: the declared type, or — when written
+/// `var` — the element type of the iterable.
+fn enhanced_for_hint(
+    node: &Node,
+    text: &str,
+    tree: &Tree,
+    model: &dyn TypeLookup,
+    out: &mut Vec<InlayHint>,
+) {
     let Some(name) = node.child_by_field_name("name") else {
         return;
     };
-    push_type_hint(
-        name.end_byte(),
-        &types::type_from_node(&type_node, text),
-        text,
-        out,
-    );
+    let type_node = node.child_by_field_name("type");
+    let is_var = type_node
+        .as_ref()
+        .is_some_and(|ty| &text[ty.byte_range()] == "var");
+    let ty = if is_var {
+        let Some(value) = node.child_by_field_name("value") else {
+            return;
+        };
+        let scope = types::scope_at(*node, text, tree, model);
+        types::element_type(&types::receiver_type(&value, text, &scope, model))
+    } else {
+        match type_node {
+            Some(type_node) => types::type_from_node(&type_node, text),
+            None => return,
+        }
+    };
+    push_type_hint(name.end_byte(), &ty, text, out);
 }
 
 /// Parameter-name hints at a call site: the callee is resolved through the
@@ -3902,6 +3992,353 @@ class Use {
     }
 
     #[test]
+    fn member_completions_offer_record_component_accessors() {
+        let text = "\
+record Point(int x, int y) {}
+class Use {
+    void m() {
+        Point p = null;
+        p.x();
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("p.x();").unwrap() + "p.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"x"), "{names:?}");
+                assert!(names.contains(&"y"), "{names:?}");
+                // The component is the accessor `x()`, not a private field.
+                let x = items.iter().find(|item| item.label == "x").expect("x");
+                assert_eq!(x.kind, Some(CompletionItemKind::METHOD));
+                assert_eq!(x.detail.as_deref(), Some("int x()"));
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+
+        // Narrowing by the typed prefix keeps only the matching component.
+        let narrowed = text.replace("p.x();", "p.y();");
+        let offset = narrowed.find("p.y();").unwrap() + "p.y".len();
+        match engine_with(&narrowed).completions(&uri(), lsp_position(&narrowed, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert_eq!(names, ["y"], "{names:?}");
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_record_without_components_offers_nothing_extra() {
+        let text = "\
+record Empty() {}
+class Use {
+    void m() {
+        Empty e = null;
+        e.none;
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("e.none;").unwrap() + "e.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                assert!(items.is_empty(), "a member-less record, got {items:?}");
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dot_at_line_end_keeps_its_receiver() {
+        // The reported bug: `gson.` at the end of a line, with the next line
+        // starting a new statement, parses `gson.var` as a scoped type
+        // identifier, so the receiver must be recovered from the source.
+        for following in ["var test = gson.size;", "int n = 1;", "Widget w = null;"] {
+            let text = format!(
+                "class Gson {{\n    int size;\n    void run() {{}}\n}}\nclass Widget {{}}\nclass Use {{\n    Gson gson;\n    void m() {{\n        gson.\n        {following}\n    }}\n}}\n"
+            );
+            let engine = engine_with(&text);
+            let offset = text.find("gson.\n").expect("receiver") + "gson.".len();
+            match engine.completions(&uri(), lsp_position(&text, offset)) {
+                Some(CompletionResponse::Array(items)) => {
+                    let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                    assert!(names.contains(&"size"), "{following}: {names:?}");
+                    assert!(names.contains(&"run"), "{following}: {names:?}");
+                }
+                other => panic!("expected member items for {following}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_dot_continuing_on_the_same_line_keeps_its_receiver() {
+        let text = "\
+class Gson {
+    int size;
+}
+class Use {
+    Gson gson;
+    void m() {
+        gson.size;
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("gson.size").unwrap() + "gson.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"size"), "{names:?}");
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_completion_reads_enhanced_for_bindings() {
+        for binding in ["Widget w", "var w"] {
+            let text = format!(
+                "class Widget {{\n    int size;\n}}\nclass Use {{\n    void m(Widget[] ws) {{\n        for ({binding} : ws) {{\n            w.\n        }}\n    }}\n}}\n"
+            );
+            let engine = engine_with(&text);
+            let offset = text.find("w.\n").expect("receiver") + "w.".len();
+            match engine.completions(&uri(), lsp_position(&text, offset)) {
+                Some(CompletionResponse::Array(items)) => {
+                    let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                    assert!(names.contains(&"size"), "{binding}: {names:?}");
+                }
+                other => panic!("expected member items for {binding}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn member_completion_reads_try_with_resources_bindings() {
+        for binding in ["Widget w = open()", "var w = open()"] {
+            let text = format!(
+                "class Widget {{\n    int size;\n}}\nclass Use {{\n    static Widget open() {{ return null; }}\n    void m() {{\n        try ({binding}) {{\n            w.\n        }} catch (Exception e) {{\n        }}\n    }}\n}}\n"
+            );
+            let engine = engine_with(&text);
+            let offset = text.find("w.\n").expect("receiver") + "w.".len();
+            match engine.completions(&uri(), lsp_position(&text, offset)) {
+                Some(CompletionResponse::Array(items)) => {
+                    let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                    assert!(names.contains(&"size"), "{binding}: {names:?}");
+                }
+                other => panic!("expected member items for {binding}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn member_completion_reads_a_ternary_initializer() {
+        let text = "\
+class Widget {
+    int size;
+}
+class Use {
+    void m(boolean c) {
+        var w = c ? new Widget() : null;
+        w.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("w.\n").unwrap() + "w.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"size"), "{names:?}");
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    fn method_member(name: &str, ty: Ty) -> Member {
+        Member {
+            name: name.to_string(),
+            kind: IndexKind::Method,
+            ty,
+            params: Vec::new(),
+            type_params: Vec::new(),
+            is_static: false,
+        }
+    }
+
+    #[test]
+    fn a_var_from_an_object_method_infers_and_offers_its_result_members() {
+        let engine = TreeSitterEngine::new();
+        let mut model = TypeModel::new();
+        let mut object = crate::types::TypeInfo::new(
+            "Object".to_string(),
+            Some("java.lang".to_string()),
+            IndexKind::Class,
+        );
+        object
+            .methods
+            .push(method_member("toString", Ty::reference("String")));
+        model.insert(object);
+        let mut string = crate::types::TypeInfo::new(
+            "String".to_string(),
+            Some("java.lang".to_string()),
+            IndexKind::Class,
+        );
+        string
+            .methods
+            .push(method_member("length", Ty::Prim(crate::types::Prim::Int)));
+        model.insert(string);
+        engine.index.set_types(std::sync::Arc::new(model));
+
+        let text = "\
+class Gson {}
+class Use {
+    Gson gson;
+    void m() {
+        var x = gson.toString();
+        x.
+    }
+}
+";
+        engine.open(&uri(), text);
+
+        // The inferred type renders as a hint.
+        let hints = hints_in(&engine, full_range(text));
+        assert!(
+            hints.contains(&(after(text, "var x"), ": String".to_string())),
+            "{hints:?}"
+        );
+
+        // `x.` offers `String`'s members, and no inherited `Object` member.
+        let offset = text.find("x.\n").unwrap() + "x.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"length"), "{names:?}");
+                assert!(!names.contains(&"toString"), "{names:?}");
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_record_still_offers_its_declared_methods() {
+        let text = "\
+record Sized(int size) {
+    int doubled() { return size * 2; }
+}
+class Use {
+    void m() {
+        Sized s = null;
+        s.none;
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("s.none;").unwrap() + "s.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"size"), "{names:?}");
+                assert!(names.contains(&"doubled"), "{names:?}");
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_a_record_component_accessor_shows_its_signature() {
+        let text = "\
+record Point(int x, int y) {}
+class Use {
+    void m() {
+        Point p = null;
+        p.x();
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("p.x();").unwrap() + "p.".len();
+        let hover = engine
+            .hover(&uri(), lsp_position(text, offset))
+            .expect("hover");
+        match hover.contents {
+            HoverContents::Markup(markup) => {
+                assert!(markup.value.contains("int x()"), "{}", markup.value);
+                assert!(markup.value.contains("of `Point`"), "{}", markup.value);
+            }
+            other => panic!("expected markup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hover_on_a_record_declaration_shows_its_components() {
+        let text = "record Point(int x, int y) {}\n";
+        let engine = engine_with(text);
+        let offset = text.find("Point").unwrap() + 1;
+        let hover = engine
+            .hover(&uri(), lsp_position(text, offset))
+            .expect("hover");
+        match hover.contents {
+            HoverContents::Markup(markup) => {
+                assert!(
+                    markup.value.contains("record Point(int x, int y)"),
+                    "{}",
+                    markup.value
+                );
+            }
+            other => panic!("expected markup, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn navigation_targets_a_record_component_in_the_header() {
+        let text = "\
+record Point(int x, int y) {
+    int sum() { return x + y; }
+}
+class Use {
+    void m() {
+        Point p = null;
+        p.x();
+    }
+}
+";
+        let engine = engine_with(text);
+        let cursor = lsp_position(text, text.find("p.x();").unwrap() + "p.".len());
+
+        // Go-to-definition lands on the component in the header, not the body.
+        let location = engine.definition(&uri(), cursor).expect("definition");
+        assert_eq!(location.range.start.line, 0, "{location:?}");
+        assert_eq!(location.range.start.character, 17, "{location:?}");
+
+        // References cover the header, the unqualified use inside the record,
+        // and the qualified use outside it.
+        let references = engine.references(&uri(), cursor, true);
+        assert_eq!(references.len(), 3, "{references:?}");
+
+        // Rename edits every occurrence, the header declaration included.
+        let edit = engine.rename(&uri(), cursor, "first").expect("rename");
+        let changes = edit.changes.expect("changes");
+        let edits = changes.values().next().expect("edits");
+        assert_eq!(edits.len(), 3, "{edits:?}");
+        assert!(edits.iter().all(|edit| edit.new_text == "first"));
+
+        // The component is a workspace symbol.
+        let symbols: Vec<(String, SymbolKind)> = engine
+            .workspace_symbols("")
+            .into_iter()
+            .map(|symbol| (symbol.name, symbol.kind))
+            .collect();
+        assert!(
+            symbols.contains(&("x".to_string(), SymbolKind::METHOD)),
+            "{symbols:?}"
+        );
+        assert!(symbols.contains(&("Point".to_string(), SymbolKind::STRUCT)));
+    }
+
+    #[test]
     fn hover_resolves_a_member_through_the_receiver_type() {
         let text = "\
 class Widget {
@@ -4503,6 +4940,17 @@ class Widget {
         let hints = hints_in(&engine, full_range(text));
         assert!(
             hints.contains(&(after(text, "String s"), ": String".to_string())),
+            "{hints:?}"
+        );
+    }
+
+    #[test]
+    fn a_var_enhanced_for_binding_gets_its_element_type_hint() {
+        let text = "class Widget {\n    void run() {}\n}\nclass Sample {\n    void m(Widget[] ws) {\n        for (var w : ws) {\n            w.run();\n        }\n    }\n}\n";
+        let engine = engine_with(text);
+        let hints = hints_in(&engine, full_range(text));
+        assert!(
+            hints.contains(&(after(text, "var w"), ": Widget".to_string())),
             "{hints:?}"
         );
     }

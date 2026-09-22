@@ -3,10 +3,14 @@ type: ChangeRequest
 kind: bug
 title: Record components are not modelled, so member completion on a record is empty
 description: A source record's components are ignored by the type model and the index, so `.`-completion, hover, and navigation on a record expose no components or accessors.
-state: proposed
+state: done
 priority: high
 tags: [dev, types, completions, records]
 owner: felix
+verified:
+  by: cargo test --all-targets (167 passed - 142 lib, 6 bench bin, 18 harness,
+    1 stdio)
+  at: 2026-09-22T21:00:16Z
 ---
 
 # Problem
@@ -107,3 +111,76 @@ a member of the record:
   header.
 - `docs/requirements.md` — the record case of declarations should be reflected
   wherever the member/type model is described.
+
+# Implementation plan
+
+## Approach
+
+No new dependencies and no LSP-shape changes. Work lands in three source files,
+their unit tests, and two docs. The grammar is confirmed: a
+`record_declaration` carries its components in a `parameters` field (a
+`formal_parameters` of `formal_parameter`s, each with `type` and `name`), and a
+record body is a normal `class_body`, so the existing body walk already sees
+any explicitly declared methods.
+
+- **`src/types.rs` — the type model and the scope.** A shared helper
+  `record_components(node, text)` reads a `record_declaration`'s `parameters`
+  into `(name, ty)` pairs, reusing `parameter_name`/`type_from_node`.
+  - `type_info_from_declaration` (~L709): after the body's members are
+    collected, a record's components are pushed onto `info.methods` as
+    method-like accessors — `IndexKind::Method`, the component's declared type
+    as the return type, no parameters, not static. That is what a client sees:
+    `.`-completion offers `x`, `p.x()` hovers and resolves as a method. Appending
+    after the body walk lets an explicitly declared accessor win the name-dedupe
+    in `members`. The private backing field is *not* added, so it is never
+    offered to an outside receiver.
+  - `scope_at` (~L1050): when the enclosing type is a record, the same
+    components are added to `scope.fields` as `IndexKind::Field` members — the
+    private-field view — so `resolve_name` resolves a bare component name inside
+    the record (a compact constructor or a custom method).
+- **`src/index.rs` — the flat index.** `collect_entries` (~L282) additionally
+  indexes each record component at its source position in the header: the
+  `formal_parameter` node as the full range and its name as the selection range,
+  kind `IndexKind::Method` (the accessor), with the record as the container. That
+  is what lets definition, references, rename, and `workspace/symbol` target the
+  component and lets a `p.x()` use resolve to the header declaration.
+- **`src/engine/syntax.rs` — declaration hover.** `declaration_text` (~L1826)
+  appends the record's `parameters` text to the rendered declaration, so hovering
+  a record's name shows `record Point(int x, int y)`. Only a record supplies a
+  `parameters` field, so class/interface/enum rendering is unchanged.
+- **Tests.** One unit test per acceptance criterion, in the file the criterion
+  exercises: `src/types.rs` (component accessor members, an empty record adding
+  nothing, and an unqualified component resolving inside the record),
+  `src/index.rs` (component entries at their header positions with the record as
+  container), and `src/engine/syntax.rs` (`.`-completion offers and prefix
+  narrowing, hover of `p.x()` and of the declaration, go-to-definition,
+  references, rename, and `workspace/symbol`).
+- **Docs.** `docs/architecture.md`: the type-layer bullet notes record components
+  as accessor members and the scope view inside the record; the `WorkspaceIndex`
+  bullet notes components indexed at the header. `docs/requirements.md`: the v0.3
+  milestone notes the record case of the member/type model.
+
+## Steps
+
+- [x] Model a record's components as accessor members in
+      `type_info_from_declaration` via a shared `record_components` helper; leave
+      the backing field out. (AC1, AC2.)
+- [x] Add the same components to `scope.fields` in `scope_at` so a bare component
+      name resolves inside the record. (AC5.)
+- [x] Index each record component at its header position in `collect_entries`,
+      kind `Method`, container the record. (AC4.)
+- [x] Include a record's `parameters` in `declaration_text` so declaration hover
+      shows the component list. (AC3.)
+- [x] Add the `src/types.rs` unit tests: component accessor members, empty record,
+      and unqualified resolution inside the record. (AC6.)
+- [x] Add the `src/index.rs` unit test: component entries at the header with the
+      record as container. (AC6.)
+- [x] Add the `src/engine/syntax.rs` unit tests: completion offers/narrows,
+      `p.x()` hover, declaration hover, definition, references/rename, and
+      `workspace/symbol`. (AC6.)
+- [x] Update `docs/architecture.md`: the type-layer bullet (record components as
+      accessor members, scope view inside the record) and the `WorkspaceIndex`
+      bullet (components indexed at the header). (AC1, AC4.)
+- [x] Update `docs/requirements.md`: the v0.3 milestone notes the record case of
+      the member/type model. (AC1.)
+- [x] Run `cargo test --all-targets` and confirm the suite passes. (all ACs.)

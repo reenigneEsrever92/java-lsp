@@ -106,7 +106,11 @@ graph LR
   is inferred and its members are offered with their signatures as `detail`
   (inherited members included for workspace types), while an uninferrable
   receiver still returns an empty list, claiming nothing a type-free engine
-  cannot verify.
+  cannot verify. The receiver of a `.` is normally the tree's member access, but
+  an incomplete `receiver.` at the end of a line can parse the dot into the next
+  token (a following `var` line reads `gson.var` as a scoped type identifier);
+  then the receiver is recovered from the source as the expression ending at the
+  last non-whitespace byte before the dot, so the same members are offered.
   Auto-import: every index-sourced item whose symbol lives outside the open
   file's package carries an `additionalTextEdits` inserting
   `import <fqcn>;` (after the last import, else after the `package`
@@ -165,21 +169,28 @@ graph LR
   their generic arguments kept as written, and type variables — and keeps each
   type's package, kind, supertypes (`extends`/`implements`), fields, and
   methods with their declared types (source-declared methods also keep their
-  parameter names, which class-file descriptors cannot supply). The model is
-  built in two layers during
-  warm-up: source files contribute full `TypeInfo`s (member types and
-  supertypes) from the trees the scan already parses, and the resolved jars and
+  parameter names, which class-file descriptors cannot supply). A source
+  record's components are modelled as accessor methods — the component's type
+  with no parameters — so an outside receiver sees `x()` and never the private
+  backing field, while inside the record the bare component name resolves as
+  that field would. The model is built in two layers during warm-up: source
+  files contribute full `TypeInfo`s (member types and supertypes) from the
+  trees the scan already parses, and the resolved jars and
   JDK contribute `TypeInfo`s with real signatures and supertypes, parsed from
   their class files (or, for a source-only JDK, from `lib/src.zip` through the
   same tree-sitter extractor). Member
   lookup walks supertypes breadth-first, cycle-guarded, first declaration
   winning, so inherited members are found.
   **Binding** turns a cursor position into an answer: it collects the names
-  visible there (locals and parameters with their declared types, the enclosing
+  visible there (locals and parameters with their declared types — an
+  enhanced-for binding written `var` taking its iterable's element type and a
+  try-with-resources `resource` binding collected like a local — the enclosing
   type's fields, type parameters, imports including `.*`, and the file's
   package) and then resolves a simple name in Java's precedence order, or
   infers the type of a `.`-receiver (`identifier`, `this`/`super`, `new T(...)`,
-  and chained field/method access). Everything the layer cannot pin to a single
+  chained field/method access, and — as a `var` initializer — a conditional
+  (a lone `null` yielding the other branch), array creation, `instanceof`, or
+  `switch` expression). Everything the layer cannot pin to a single
   answer is `Unknown`, and callers treat that as "no answer".
   **Semantic diagnostics** flag a simple type name in a declaration, `new`,
   cast, `extends`, or `implements` that resolves nowhere — but only when the
@@ -202,7 +213,11 @@ graph LR
   call the layer cannot pin down keeps the written form; overloads are chosen by
   arity at a call site and by name alone elsewhere; and the implicit
   `java.lang.Object` is not recorded as a supertype (matching source-extracted
-  types), so its members are offered only where a type extends it explicitly.
+  types), so its members never appear in a `.`-completion listing. They do
+  resolve, though, as a fallback when the hierarchy walk finds nothing — so an
+  inherited `toString()`/`equals()`/... types a call, hover, and `var`
+  inference — and only for a known reference-ish receiver (`Ref`/`Var`/`Array`),
+  never an `Unknown` one.
   The semantic diagnostic is deliberately narrow so it never cries wolf: it
   checks a bare simple type name in a declaration, `new`, a cast, `extends`, or
   `implements` only, and treats a name the model knows in *any* package as
@@ -220,7 +235,9 @@ graph LR
   alone). A local declared with `var` has its initializer's type inferred
   through `receiver_type` — including a call's type arguments, so
   `List.of(5)` is `List<Integer>` — and that inference also feeds the scope, so a
-  `var` local completes and hovers like an explicitly typed one. Parameter names
+  `var` local completes and hovers like an explicitly typed one; an
+  enhanced-for binding written `var` shows its iterable's element type the same
+  way. Parameter names
   come from the type model: source-declared methods keep them (each `Member`
   parameter carries a name and a type) and the overload matching the call's
   arity is chosen, so class-file members — every jar/JDK method
@@ -237,7 +254,10 @@ graph LR
   declarations and imports, owned by `TreeSitterEngine`. Entries are flat
   `SymbolEntry`s (name, kind, package, enclosing-type container chain,
   ranges, `dependency` flag) — no trees, no text — so memory stays
-  proportional to workspace size. The package (from the file's
+  proportional to workspace size. A source record's header components are
+  indexed too, as method entries at their declared positions with the record as
+  their container, so definition, references, rename, and `workspace/symbol`
+  can target the accessor. The package (from the file's
   `package_declaration`, or the class's internal name for jars) is what
   lets completions auto-import accepted symbols. The shell captures `rootUri` (or the first workspace
   folder) in `initialize` and hands it to the engine in `initialized`; the

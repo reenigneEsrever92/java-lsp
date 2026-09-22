@@ -12,6 +12,28 @@ named change.
 
 ## 2026-09-22
 
+- **Dot receiver recovery and wider `var` inference** — an incomplete
+  `receiver.` at the end of a line now keeps its receiver (the dot can parse
+  into the next token, so `gson.` before a `var` line read `gson.var` as a
+  scoped type identifier and completed to nothing), and `var` bindings infer
+  from more initializer shapes: an enhanced-for iterable's element type, a
+  try-with-resources binding, and a conditional, array creation, `instanceof`,
+  or `switch` expression. Inherited `java.lang.Object` methods now resolve for
+  typing, hover, and `var` inference without rejoining `.`-completion listings.
+  Verified by `cargo test --all-targets` (184 tests). See
+  [A dot at line end loses its receiver, and `var` locals frequently infer no type](backlog/dot-completion-and-var-inference.md).
+
+- **Record components as accessors** — a source record's header components are
+  now modelled and indexed. `.`-completion on a record value offers each
+  component as its accessor (`x()`), narrowed by the typed prefix, and a record
+  with no components adds nothing; hover renders the accessor's signature and,
+  on the declaration, the component list (`record Point(int x, int y)`); and
+  go-to-definition, references, rename, and `workspace/symbol` target the
+  component at its position in the header, while the bare component name
+  resolves inside the record. Verified by `cargo test --all-targets` (167
+  tests). See
+  [Record components are not modelled, so member completion on a record is empty](backlog/record-members.md).
+
 - **Type-aware review follow-ups** — fixes the defects found reviewing the
   type-aware work. References and rename now identify a member's declaring type
   by simple name *and* package, so renaming `a.Widget.run` no longer touches

@@ -1,8 +1,9 @@
 package com.example.greeting;
 
-import static org.junit.Assert.assertEquals;
-
 import org.junit.Test;
+
+
+import static org.junit.Assert.assertEquals;
 
 public class GreeterTest {
     @Test
@@ -10,3 +11,4 @@ public class GreeterTest {
         assertEquals("Hello, Ada!", new Greeter("Ada").greet());
     }
 }
+

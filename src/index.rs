@@ -299,11 +299,15 @@ fn collect_entries(
             };
             if let Some(name) = node.child_by_field_name("name") {
                 out.push(entry(uri, node, &name, kind, container, text));
-                if let Some(body) = node.child_by_field_name("body") {
-                    container.push(text[name.byte_range()].to_string());
-                    collect_entries(uri, &body, text, container, out);
-                    container.pop();
+                container.push(text[name.byte_range()].to_string());
+                // A record's components are declared in its header, not its body.
+                if node.kind() == "record_declaration" {
+                    collect_record_components(uri, node, text, container, out);
                 }
+                if let Some(body) = node.child_by_field_name("body") {
+                    collect_entries(uri, &body, text, container, out);
+                }
+                container.pop();
                 return;
             }
         }
@@ -346,6 +350,37 @@ fn collect_entries(
     for child in node.children(&mut cursor) {
         if child.is_named() {
             collect_entries(uri, &child, text, container, out);
+        }
+    }
+}
+
+/// A record's header components, indexed as accessor methods at their declared
+/// positions so go-to-definition, references, rename, and `workspace/symbol`
+/// can target them.
+fn collect_record_components(
+    uri: &Url,
+    node: &Node,
+    text: &str,
+    container: &[String],
+    out: &mut Vec<SymbolEntry>,
+) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "formal_parameter" {
+            continue;
+        }
+        if let Some(name) = parameter.child_by_field_name("name") {
+            out.push(entry(
+                uri,
+                &parameter,
+                &name,
+                IndexKind::Method,
+                container,
+                text,
+            ));
         }
     }
 }
@@ -665,6 +700,28 @@ record Point(int x, int y) {}
 
         // Enum constants are intentionally not indexed (seven kinds only).
         assert!(!entries.iter().any(|entry| entry.name == "RED"));
+    }
+
+    #[test]
+    fn record_components_are_indexed_at_their_header_positions() {
+        let text = "record Point(int x, int y) {}\n";
+        let entries = extract_entries(&uri("file:///Point.java"), &parse(text), text);
+
+        assert_eq!(entry_named(&entries, "Point").kind, IndexKind::Record);
+
+        let x = entry_named(&entries, "x");
+        assert_eq!(x.kind, IndexKind::Method);
+        assert_eq!(x.container, vec!["Point".to_string()]);
+        // Indexed where it is declared, in the header, not in the (empty) body.
+        let declared = text.find("int x").unwrap() as u32;
+        assert_eq!(x.full_range.start.line, 0);
+        assert_eq!(x.full_range.start.character, declared);
+        assert_eq!(x.selection_range.start.character, declared + 4);
+        assert_eq!(x.selection_range.end.character, declared + 5);
+
+        let y = entry_named(&entries, "y");
+        assert_eq!(y.kind, IndexKind::Method);
+        assert_eq!(y.container, vec!["Point".to_string()]);
     }
 
     #[test]
