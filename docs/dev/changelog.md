@@ -25,8 +25,10 @@ named change.
   the requested range, `rename` rejects restricted identifiers
   (`var`/`record`/`yield`), the harness no longer prints debug output, and the
   committed `example/` is back to valid Java with no build artifacts in the
-  change. Verified by `cargo test --all-targets` (157 tests). See
-  [Type-aware review follow-ups](backlog/type-aware-review-followups.md).
+  change. Verified by `cargo test --all-targets` (157 tests); bench with a real
+  JDK indexed (Temurin 25, `java-lsp-bench --files 5`, release): warm-up ≈ 6.2 s,
+  peak RSS ≈ 197 MB, warm-up hover RTT ≤ 1.1 ms, post-warm-up hover RTT 1.2 ms.
+  See [Type-aware review follow-ups](backlog/type-aware-review-followups.md).
 
 - **Generic type-argument inference** — `receiver_type` now binds and substitutes
   type arguments for calls: a method's own type parameters from its argument

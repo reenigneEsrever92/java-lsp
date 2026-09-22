@@ -8,7 +8,10 @@ priority: high
 tags: [dev, review, types, navigation]
 owner: felix
 verified:
-  by: cargo test --all-targets (157 passed - 132 lib, 6 bench bin, 18 harness, 1 stdio)
+  by: cargo test --all-targets (157 passed - 132 lib, 6 bench bin, 18 harness,
+    1 stdio) + java-lsp-bench --files 5 with the machine JDK indexed (Temurin 25,
+    warm-up 6.2 s, peak RSS 197 MB, warm-up hover RTT <= 1.1 ms, post-warm-up
+    hover RTT 1.2 ms)
   at: 2026-09-22T20:19:48Z
 ---
 
