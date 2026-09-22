@@ -12,7 +12,14 @@ public class Main {
     public static void main(String[] args) {
         Greeter greeter = new Greeter("world");
         Gson gson = new Gson();
+        var data = new Data(5);
+
+        greeter.getName();
+        greeter.greet();
+
+        var test = gson.toString();
 
         System.out.println(greeter.greet() + " -> " + gson.toJson(greeter));
     }
 }
+

@@ -24,3 +24,5 @@ Change requests live here as `<slug>.md`. Each request has a `kind`
 | [same-name-completions](same-name-completions.md) | bug | high | done |
 | [generic-type-argument-inference](generic-type-argument-inference.md) | feature | medium | done |
 | [type-aware-review-followups](type-aware-review-followups.md) | bug | high | done |
+| [record-members](record-members.md) | bug | high | proposed |
+| [dot-completion-and-var-inference](dot-completion-and-var-inference.md) | bug | high | proposed |
