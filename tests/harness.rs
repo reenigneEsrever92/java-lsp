@@ -56,6 +56,62 @@ async fn initialize(service: &mut LspService<JavaLanguageServer>) -> Value {
     .expect("initialize must respond")
 }
 
+/// Holds the JDK environment lock and restores `JAVA_LSP_JDK` on drop, so
+/// scan-driven tests neither race each other nor leak their JDK setting.
+struct JdkEnv {
+    _lock: std::sync::MutexGuard<'static, ()>,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl JdkEnv {
+    /// Pins the JDK to a non-existent path, opting out of machine-JDK indexing.
+    fn none() -> JdkEnv {
+        JdkEnv::set("/definitely/not/a/jdk")
+    }
+
+    fn set(value: &str) -> JdkEnv {
+        let lock = java_lsp::jdk::env_lock();
+        let previous = std::env::var_os("JAVA_LSP_JDK");
+        std::env::set_var("JAVA_LSP_JDK", value);
+        JdkEnv {
+            _lock: lock,
+            previous,
+        }
+    }
+}
+
+impl Drop for JdkEnv {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var("JAVA_LSP_JDK", value),
+            None => std::env::remove_var("JAVA_LSP_JDK"),
+        }
+    }
+}
+
+/// Sets an environment variable and restores its previous value on drop.
+struct EnvVar {
+    name: &'static str,
+    previous: Option<std::ffi::OsString>,
+}
+
+impl EnvVar {
+    fn set(name: &'static str, value: impl AsRef<std::ffi::OsStr>) -> EnvVar {
+        let previous = std::env::var_os(name);
+        std::env::set_var(name, value);
+        EnvVar { name, previous }
+    }
+}
+
+impl Drop for EnvVar {
+    fn drop(&mut self) {
+        match &self.previous {
+            Some(value) => std::env::set_var(self.name, value),
+            None => std::env::remove_var(self.name),
+        }
+    }
+}
+
 #[tokio::test]
 async fn initialize_advertises_incremental_sync_and_language_capabilities() {
     let mut service = service();
@@ -74,6 +130,9 @@ async fn initialize_advertises_incremental_sync_and_language_capabilities() {
         .contains(&json!(".")));
     assert_eq!(capabilities["documentSymbolProvider"], true);
     assert_eq!(capabilities["workspaceSymbolProvider"], true);
+    assert_eq!(capabilities["referencesProvider"], true);
+    assert_eq!(capabilities["renameProvider"], true);
+    assert_eq!(capabilities["inlayHintProvider"], true);
     assert_eq!(capabilities["foldingRangeProvider"], true);
     assert!(
         capabilities["semanticTokensProvider"]["legend"]["tokenTypes"]
@@ -480,7 +539,7 @@ async fn maven_project_roots_and_dependency_jars_feed_the_index() {
         std::fs::write(path, content).unwrap();
     };
     // The scan reads MAVEN_REPO at warm-up; no other test consumes it.
-    std::env::set_var("MAVEN_REPO", &repo);
+    let _maven = EnvVar::set("MAVEN_REPO", &repo);
 
     write_file(
         root.join("pom.xml"),
@@ -737,12 +796,10 @@ package com.example;\n\npublic class App {\n    private Lib lib;\n\n    public S
 
 #[tokio::test]
 async fn jdk_types_are_offered_with_imports_but_stay_out_of_navigation() {
-    // Serializes env-var mutation across scan-driven tests.
-    let _env = java_lsp::jdk::env_lock();
     // A fake JDK whose java.base jmod contains List and String.
     let jdk = temp_dir("jdk");
     std::fs::create_dir_all(jdk.join("jmods")).unwrap();
-    std::env::set_var("JAVA_LSP_JDK", jdk.display().to_string());
+    let _env = JdkEnv::set(&jdk.display().to_string());
     let list_class = test_class_bytes("java/util/List", 0x0601, Some("java/lang/Object"), &[], &[]);
     let string_class = test_class_bytes(
         "java/lang/String",
@@ -902,6 +959,212 @@ class Main {\n    List names;\n    String greeting;\n}\n",
     let _ = std::fs::remove_dir_all(&jdk);
 }
 
+#[tokio::test]
+async fn inlay_hints_resolve_an_imported_name_shared_across_packages() {
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+
+    // Two `List` types in different packages make the simple name ambiguous, so
+    // only a resolved import can pin `List.of(3)` down.
+    let root = temp_dir("ambiguous-import");
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::create_dir_all(root.join("b")).unwrap();
+    std::fs::write(
+        root.join("a").join("List.java"),
+        "package a;\n\npublic class List {\n    public static List of(int n) { return null; }\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        root.join("b").join("List.java"),
+        "package b;\n\npublic class List {\n}\n",
+    )
+    .unwrap();
+
+    let imported_uri = Url::from_file_path(root.join("Imported.java")).unwrap();
+    let imported = "package demo;\n\nimport a.List;\n\nclass Imported {\n    void m() {\n        var x = List.of(3);\n    }\n}\n";
+    std::fs::write(root.join("Imported.java"), imported).unwrap();
+    let bare_uri = Url::from_file_path(root.join("Bare.java")).unwrap();
+    let bare =
+        "package demo;\n\nclass Bare {\n    void m() {\n        var x = List.of(3);\n    }\n}\n";
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while socket.next().await.is_some() {}
+    });
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": Url::from_file_path(&root).unwrap().as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |entries, ready| {
+        ready && entries.iter().any(|e| e.name == "of")
+    })
+    .await;
+
+    for (uri, text, expect_hint) in [(&imported_uri, imported, true), (&bare_uri, bare, false)] {
+        respond(
+            &mut service,
+            Request::build("textDocument/didOpen")
+                .params(json!({
+                    "textDocument": {
+                        "uri": uri.as_str(),
+                        "languageId": "java",
+                        "version": 1,
+                        "text": text,
+                    }
+                }))
+                .finish(),
+        )
+        .await;
+        let hints = respond(
+            &mut service,
+            Request::build("textDocument/inlayHint")
+                .id(Id::Number(2))
+                .params(json!({
+                    "textDocument": { "uri": uri.as_str() },
+                    "range": {
+                        "start": {"line": 0, "character": 0},
+                        "end": {"line": 20, "character": 0},
+                    },
+                }))
+                .finish(),
+        )
+        .await
+        .expect("inlay hint must respond");
+        let labels: Vec<&str> = hints
+            .as_array()
+            .expect("inlay hints must be an array")
+            .iter()
+            .filter_map(|hint| hint["label"].as_str())
+            .collect();
+        if expect_hint {
+            assert!(
+                labels.contains(&": List"),
+                "the import should resolve List.of: {labels:?}"
+            );
+        } else {
+            assert!(
+                labels.is_empty(),
+                "an ambiguous name must not be guessed: {labels:?}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn inlay_hints_resolve_a_jdk_static_factory() {
+    // A fake JDK sourced from `lib/src.zip`, with `List` in two packages so the
+    // simple name is ambiguous unless the import pins it down.
+    let jdk = temp_dir("srczip-hints");
+    std::fs::create_dir_all(jdk.join("lib")).unwrap();
+    let list_source = b"package java.util;\n\npublic interface List<E> {\n    static <E> List<E> of() { return null; }\n    static <E> List<E> of(E e1) { return null; }\n    static <E> List<E> of(E... elements) { return null; }\n}\n";
+    let awt_source = b"package java.awt;\n\npublic class List {\n}\n";
+    std::fs::write(
+        jdk.join("lib").join("src.zip"),
+        test_stored_zip(&[
+            ("java.base/java/util/List.java", list_source),
+            ("java.desktop/java/awt/List.java", awt_source),
+        ]),
+    )
+    .unwrap();
+    let _env = JdkEnv::set(&jdk.display().to_string());
+
+    let root = temp_dir("srczip-hints-workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let uri = Url::from_file_path(root.join("Main.java")).unwrap();
+    let text = "package demo;\n\nimport java.util.List;\n\nclass Main {\n    void m() {\n        var list = List.of(5);\n    }\n}\n";
+    std::fs::write(root.join("Main.java"), text).unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while socket.next().await.is_some() {}
+    });
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": Url::from_file_path(&root).unwrap().as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |entries, ready| {
+        ready
+            && entries
+                .iter()
+                .any(|e| e.name == "of" && e.package.as_deref() == Some("java.util"))
+    })
+    .await;
+
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": uri.as_str(),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    let hints = respond(
+        &mut service,
+        Request::build("textDocument/inlayHint")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": uri.as_str() },
+                "range": {
+                    "start": {"line": 0, "character": 0},
+                    "end": {"line": 20, "character": 0},
+                },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("inlay hint must respond");
+    let labels: Vec<&str> = hints
+        .as_array()
+        .expect("inlay hints must be an array")
+        .iter()
+        .filter_map(|hint| hint["label"].as_str())
+        .collect();
+    assert!(
+        labels.contains(&": List<Integer>"),
+        "the generic factory call should resolve to its element type: {labels:?}"
+    );
+    assert!(
+        labels.contains(&"e1:"),
+        "the arity-matched overload's parameter name: {labels:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&jdk);
+}
+
 fn app_uri(root: &std::path::Path) -> Url {
     Url::from_file_path(
         root.join("app")
@@ -936,7 +1199,7 @@ fn test_class_bytes(
     methods: &[&str],
 ) -> Vec<u8> {
     let mut pool: Vec<(u8, Vec<u8>)> = Vec::new();
-    let mut utf8 = |text: &str, pool: &mut Vec<(u8, Vec<u8>)>| -> u16 {
+    let utf8 = |text: &str, pool: &mut Vec<(u8, Vec<u8>)>| -> u16 {
         pool.push((
             1,
             [
@@ -1084,7 +1347,315 @@ async fn wait_for_index(
 }
 
 #[tokio::test]
+async fn inlay_hints_render_types_parameters_and_chains() {
+    let mut service = service();
+    initialize(&mut service).await;
+
+    // Self-contained: the open buffer's own type model supplies everything, so
+    // no workspace scan is needed.
+    let text = "\
+package demo;
+
+class Widget {
+    private int size;
+
+    int getSize() {
+        return size;
+    }
+
+    Widget self() {
+        return this;
+    }
+
+    void run(int amount, String label) {
+        var w = new Widget();
+        int total = w.self().getSize();
+        w.run(2, \"x\");
+    }
+}
+";
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": HELLO_URI,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    let hints = respond(
+        &mut service,
+        Request::build("textDocument/inlayHint")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": HELLO_URI },
+                "range": {
+                    "start": { "line": 0, "character": 0 },
+                    "end": { "line": 200, "character": 0 },
+                },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("inlay hint must respond");
+
+    let labels: Vec<&str> = hints
+        .as_array()
+        .expect("inlay hints must be an array")
+        .iter()
+        .filter_map(|hint| hint["label"].as_str())
+        .collect();
+    assert!(labels.contains(&": Widget"), "{labels:?}");
+    assert!(labels.contains(&": int"), "{labels:?}");
+    assert!(labels.contains(&"amount:"), "{labels:?}");
+    assert!(labels.contains(&"label:"), "{labels:?}");
+    // `: Widget` comes from both the `var w` variable hint and the `w.self()`
+    // chain hint, so the chain family is only covered when both appear.
+    assert_eq!(
+        labels.iter().filter(|label| **label == ": Widget").count(),
+        2,
+        "the chain link must be hinted too: {labels:?}"
+    );
+}
+
+#[tokio::test]
+async fn hover_and_member_completion_use_the_receiver_type() {
+    // Serializes env-var mutation across scan-driven tests, and opts out of
+    // machine-JDK indexing (covered by its own test).
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let root = std::env::temp_dir().join(format!(
+        "java-lsp-harness-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Widget.java"),
+        "package demo;\n\npublic class Widget {\n    private int size;\n    public int getSize() { return size; }\n}\n",
+    )
+    .unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while socket.next().await.is_some() {}
+    });
+    let root_uri = Url::from_file_path(&root).unwrap();
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": root_uri.as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    // `Use.java` is never written to disk: the open buffer is what features
+    // answer from, with the scanned `Widget` reachable through the model.
+    let uri = "file:///src/Use.java";
+    let text = "package demo;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n        w.getSize();\n    }\n}\n";
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": uri,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |entries, ready| {
+        ready && entries.iter().any(|entry| entry.name == "getSize")
+    })
+    .await;
+
+    // Hover inside `getSize` resolves through the receiver's declared type.
+    let hover = respond(
+        &mut service,
+        Request::build("textDocument/hover")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 5, "character": 12 },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("hover must respond");
+    let value = hover["contents"]["value"].as_str().unwrap_or_default();
+    assert!(value.contains("int getSize()"), "{value}");
+    assert!(value.contains("of `Widget`"), "{value}");
+
+    // A completion right after `w.` offers that type's members.
+    let completion = respond(
+        &mut service,
+        Request::build("textDocument/completion")
+            .id(Id::Number(3))
+            .params(json!({
+                "textDocument": { "uri": uri },
+                "position": { "line": 5, "character": 10 },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("completion must respond");
+    let labels: Vec<&str> = completion
+        .as_array()
+        .expect("completion must return an array")
+        .iter()
+        .filter_map(|item| item["label"].as_str())
+        .collect();
+    assert!(labels.contains(&"getSize"), "{labels:?}");
+    assert!(labels.contains(&"size"), "{labels:?}");
+}
+
+#[tokio::test]
+async fn references_and_rename_span_the_workspace() {
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let root = std::env::temp_dir().join(format!(
+        "java-lsp-harness-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("a")).unwrap();
+    std::fs::write(
+        root.join("a/Widget.java"),
+        "package a;\n\npublic class Widget {\n}\n",
+    )
+    .unwrap();
+    let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while socket.next().await.is_some() {}
+    });
+    let root_uri = Url::from_file_path(&root).unwrap();
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": root_uri.as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    let text =
+        "package a;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n    }\n}\n";
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": use_uri.as_str(),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |entries, ready| {
+        ready && entries.iter().any(|entry| entry.name == "Widget")
+    })
+    .await;
+
+    // `Widget` is written on line 4 (`        Widget w = null;`).
+    let position = json!({ "line": 4, "character": 9 });
+    let references = respond(
+        &mut service,
+        Request::build("textDocument/references")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": use_uri.as_str() },
+                "position": position,
+                "context": { "includeDeclaration": true },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("references must respond");
+    let locations = references.as_array().expect("references array");
+    assert_eq!(locations.len(), 2, "{references}");
+
+    let rename = respond(
+        &mut service,
+        Request::build("textDocument/rename")
+            .id(Id::Number(3))
+            .params(json!({
+                "textDocument": { "uri": use_uri.as_str() },
+                "position": position,
+                "newName": "Gadget",
+            }))
+            .finish(),
+    )
+    .await
+    .expect("rename must respond");
+    let changes = rename["changes"].as_object().expect("changes object");
+    assert_eq!(changes.len(), 2, "{rename}");
+    for edits in changes.values() {
+        for edit in edits.as_array().expect("edits array") {
+            assert_eq!(edit["newText"], "Gadget");
+        }
+    }
+    // A library/nonexistent rename attempt is refused with null.
+    let refused = respond(
+        &mut service,
+        Request::build("textDocument/rename")
+            .id(Id::Number(4))
+            .params(json!({
+                "textDocument": { "uri": use_uri.as_str() },
+                "position": position,
+                "newName": "class",
+            }))
+            .finish(),
+    )
+    .await
+    .expect("rename must respond");
+    assert!(refused.is_null(), "{refused}");
+}
+
+#[tokio::test]
 async fn completion_offers_keywords_locals_and_workspace_symbols() {
+    // Serializes env-var mutation across scan-driven tests, and opts out of
+    // machine-JDK indexing (covered by its own test).
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
     // Fixture project so the workspace index has symbols to offer.
     let root = std::env::temp_dir().join(format!(
         "java-lsp-harness-{}-{}",
@@ -1305,6 +1876,7 @@ public class Greet {
 
 #[tokio::test]
 async fn definition_resolves_usages_imports_and_reports_ambiguity() {
+    let _env = JdkEnv::none();
     // Fixture project on disk, so the scan has targets to resolve to.
     let root = std::env::temp_dir().join(format!(
         "java-lsp-harness-{}-{}",
@@ -1449,6 +2021,7 @@ class Hello {
 
 #[tokio::test]
 async fn workspace_symbol_finds_scanned_files_without_opening_them() {
+    let _env = JdkEnv::none();
     // Fixture project on disk; Greet.java is never opened in the editor.
     let root = std::env::temp_dir().join(format!(
         "java-lsp-harness-{}-{}",

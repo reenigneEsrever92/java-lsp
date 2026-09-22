@@ -64,6 +64,10 @@ pub struct WorkspaceIndex {
     /// The project model discovered by the background scan; drives the
     /// close-policy's "is this file a workspace source" check.
     model: Arc<std::sync::Mutex<Option<crate::project::ProjectModel>>>,
+    /// The declared-type model (R7), built by the same warm-up scan: source
+    /// types with signatures alongside the jars' and JDK's, parsed from their
+    /// class files. `None` until warm-up has built it.
+    types: Arc<std::sync::Mutex<Option<Arc<crate::types::TypeModel>>>>,
 }
 
 impl WorkspaceIndex {
@@ -172,6 +176,37 @@ impl WorkspaceIndex {
         if let Ok(mut slot) = self.model.lock() {
             *slot = Some(model);
         }
+    }
+
+    /// The workspace's declared-type model, if warm-up has built it yet.
+    pub fn type_model(&self) -> Option<Arc<crate::types::TypeModel>> {
+        self.types
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(Arc::clone))
+    }
+
+    pub fn set_types(&self, model: Arc<crate::types::TypeModel>) {
+        if let Ok(mut slot) = self.types.lock() {
+            *slot = Some(model);
+        }
+    }
+
+    /// The workspace's `.java` source files (jar and JDK archive URIs are
+    /// excluded), sorted — the candidate set for a references or rename search,
+    /// requiring no second directory walk.
+    pub fn source_files(&self) -> Vec<Url> {
+        let Ok(state) = self.state.read() else {
+            return Vec::new();
+        };
+        let mut files: Vec<Url> = state
+            .files
+            .keys()
+            .filter(|uri| uri.path().ends_with(".java"))
+            .cloned()
+            .collect();
+        files.sort();
+        files
     }
 
     /// The workspace's source roots (empty until the scan ran; the fallback
@@ -368,6 +403,7 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
 
     let mut parser = java_parser();
     let mut indexed = 0usize;
+    let mut types = crate::types::TypeModel::new();
     for path in &files {
         let Ok(text) = std::fs::read_to_string(path) else {
             continue;
@@ -375,6 +411,12 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
         let Some(tree) = parser.parse(text.as_bytes(), None) else {
             continue;
         };
+        let package = crate::types::file_package(&tree, &text);
+        types.extend(crate::types::collect_type_infos(
+            package.as_deref(),
+            &tree,
+            &text,
+        ));
         if let Some(uri) = Url::from_file_path(path).ok() {
             index.upsert_file(&uri, extract_entries(&uri, &tree, &text));
             indexed += 1;
@@ -393,8 +435,9 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
             if !jar_path.is_file() {
                 continue;
             }
-            if let Some(entries) = crate::classfile::entries_from_jar(&jar_path) {
+            if let Some((entries, infos)) = crate::classfile::jar_outputs(&jar_path) {
                 if let Some(jar_uri) = Url::from_file_path(&jar_path).ok() {
+                    types.extend(infos);
                     index.upsert_file(&jar_uri, entries);
                     jars += 1;
                 }
@@ -406,14 +449,16 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
     // completions, filtered from navigation); a missing JDK is a no-op.
     let mut jdk_classes = 0usize;
     if let Some(home) = crate::jdk::locate_jdk() {
-        for (archive_uri, entries) in crate::jdk::jdk_entries(&home) {
+        for (archive_uri, entries, infos) in crate::jdk::jdk_entries(&home) {
             jdk_classes += entries.len();
+            types.extend(infos);
             index.upsert_file(&archive_uri, entries);
         }
     } else {
         tracing::info!("no usable JDK found; standard library not indexed");
     }
 
+    index.set_types(Arc::new(types));
     index.set_ready();
     tracing::info!(
         root = %root,
@@ -551,6 +596,16 @@ mod tests {
         assert!(!index.ready());
         index.set_ready();
         assert!(index.ready());
+    }
+
+    #[test]
+    fn source_files_lists_java_files_only() {
+        let index = WorkspaceIndex::new();
+        let java = uri("file:///src/Widget.java");
+        let jar = uri("file:///repo/lib-1.0.jar");
+        index.upsert_file(&java, Vec::new());
+        index.upsert_file(&jar, Vec::new());
+        assert_eq!(index.source_files(), vec![java]);
     }
 
     #[test]
@@ -692,6 +747,11 @@ class A {}
         // nested/Deep.java ('T' < 'n').
         assert_eq!(classes, vec!["Top", "Deep"]);
         assert!(index.query_name("Skip").is_empty());
+
+        // The same warm-up builds the declared-type model.
+        let model = index.type_model().expect("type model");
+        assert!(!model.find("Top").is_empty());
+        assert!(!model.find("Deep").is_empty());
 
         std::env::remove_var("JAVA_LSP_JDK");
         let _ = std::fs::remove_dir_all(&root);

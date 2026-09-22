@@ -3,10 +3,13 @@ type: ChangeRequest
 kind: feature
 title: Standard library (JDK) indexing
 description: java.* and javax.* declarations from the installed JDK's jmods (rt.jar fallback) feed completions with auto-import.
-state: planned
+state: done
 priority: high
 tags: [dev, jdk, index, completions]
 owner: felix
+verified:
+  by: cargo test (92 passed) + real-JDK bench (Temurin 25 src.zip: warm-up 5.5 s, peak RSS 165 MB, hover RTT <= 1.6 ms during warm-up)
+  at: 2026-09-09T22:01:31Z
 ---
 
 # Problem
@@ -117,26 +120,26 @@ retired.
 
 ## Steps
 
-- [ ] Refactor `classfile.rs`: `read_zip_entries_filtered(data, predicate)`
+- [x] Refactor `classfile.rs`: `read_zip_entries_filtered(data, predicate)`
       with the existing `read_zip_entries` delegating to it, so jmods' native
       libraries are skipped without decompression; unit test that a filtered
       entry is never read. (Groundwork: jmods are multi-hundred-MB archives)
-- [ ] Implement `src/jdk.rs`: `locate_jdk` (override → JAVA_HOME → heuristic
+- [x] Implement `src/jdk.rs`: `locate_jdk` (override → JAVA_HOME → heuristic
       → None) and `jdk_entries` (jmods first, rt.jar fallback, package and
       module-info filtering, reuse of `class_entries`); unit tests with a
       generated fake JDK covering jmod reading, package filtering, the
       rt.jar fallback, and discovery. (AC: JDK types indexed; internals and
       module-info excluded; graceful no-op)
-- [ ] Wire the warm-up (`index.rs`): after dependency jars, locate the JDK
+- [x] Wire the warm-up (`index.rs`): after dependency jars, locate the JDK
       and upsert its entries; extend the readiness log line with `jdk=`.
       (AC: standard library appears in the index off the request path)
-- [ ] Add the java.lang rule to `import_edit` (`engine/syntax.rs`) with a
+- [x] Add the java.lang rule to `import_edit` (`engine/syntax.rs`) with a
       unit test: `java.lang.*` symbols are offered but carry no import edit.
       (AC: no redundant java.lang imports)
-- [ ] Integration test in `tests/harness.rs`: fake-JDK workspace, completion
+- [x] Integration test in `tests/harness.rs`: fake-JDK workspace, completion
       offers `List` with `import java.util.List;` and `String` without an
       edit; definition/`workspace/symbol` still return nothing for JDK
       symbols. (AC: end-to-end behaviour)
-- [ ] Run the bench harness and record the new warm-up/memory baseline in
+- [x] Run the bench harness and record the new warm-up/memory baseline in
       the changelog entry. (AC: impact measured, R6 intact)
-- [ ] Update `docs/architecture.md` per the doc note above. (Doc step)
+- [x] Update `docs/architecture.md` per the doc note above. (Doc step)

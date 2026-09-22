@@ -1,10 +1,11 @@
 //! Minimal readers for dependency jars: a ZIP central-directory reader and a
 //! minimal Java class-file parser that extracts what the index needs — the
-//! class kind, its nested-name container chain, and declared members.
+//! class kind, its nested-name container chain, declared members (with their
+//! descriptor types), and its supertypes.
 //!
-//! Declaration-only by design: descriptors and attributes are skipped, so a
-//! class file yields names, not types (member descriptors are a later
-//! refinement). Everything here runs on the background scan task.
+//! Attributes are skipped, so method bodies and annotations never cost anything
+//! here; an unreadable descriptor degrades to `Ty::Unknown` rather than losing
+//! the member. Everything here runs on the background scan task.
 
 use std::io::Read;
 use std::path::Path;
@@ -12,6 +13,7 @@ use std::path::Path;
 use tower_lsp::lsp_types::{Position, Range, Url};
 
 use crate::index::{IndexKind, SymbolEntry};
+use crate::types::{Member, Param, Ty, TypeInfo};
 
 /// Parsed surface of one `.class` file: the pieces the index stores.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,15 +23,22 @@ pub struct ClassInfo {
     pub kind: IndexKind,
     pub methods: Vec<String>,
     pub fields: Vec<String>,
+    /// Declared members, public and non-synthetic, with descriptor types.
+    pub members: Vec<Member>,
+    /// The superclass and interfaces, as dotted references. The implicit
+    /// `java.lang.Object` is not recorded (see the request's Decisions).
+    pub supertypes: Vec<Ty>,
 }
 
-/// Reads every `.class` entry in the jar at `path` and turns it into index
-/// entries attributed to the jar's own file URI, flagged as dependencies.
-pub fn entries_from_jar(path: &Path) -> Option<Vec<SymbolEntry>> {
+/// Reads every `.class` entry in the jar at `path`, producing both the index
+/// entries and the declared types (with descriptor-typed members and
+/// supertypes) — one pass over the archive, so no caller parses it twice.
+pub fn jar_outputs(path: &Path) -> Option<(Vec<SymbolEntry>, Vec<TypeInfo>)> {
     let data = std::fs::read(path).ok()?;
     let jar_url = Url::from_file_path(path).ok()?;
     let entries = read_zip_entries(&data)?;
     let mut out = Vec::new();
+    let mut types = Vec::new();
     for (name, data) in entries {
         if !name.ends_with(".class") || name.contains("module-info") {
             continue;
@@ -38,8 +47,47 @@ pub fn entries_from_jar(path: &Path) -> Option<Vec<SymbolEntry>> {
             continue;
         };
         out.extend(class_entries(&jar_url, &info));
+        if let Some(type_info) = class_type_info(&info) {
+            types.push(type_info);
+        }
     }
-    Some(out)
+    Some((out, types))
+}
+
+/// The declared type of one parsed class, for the workspace type model.
+pub fn class_type_info(info: &ClassInfo) -> Option<TypeInfo> {
+    let simple = info.internal_name.rsplit('/').next().unwrap_or("");
+    let package = info
+        .internal_name
+        .rsplit_once('/')
+        .map(|(directory, _)| directory.replace('/', "."));
+    // Nested types are keyed by their innermost simple name, like the index and
+    // source extraction, with their enclosing chain recorded so two nested types
+    // sharing that name in one package do not overwrite each other. Anonymous
+    // classes (`Outer$1`) are skipped.
+    let name = simple.rsplit('$').next().unwrap_or(simple);
+    if name.is_empty() || name.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let mut info_type = TypeInfo::new(name.to_string(), package, info.kind);
+    if let Some((owner, _)) = simple.rsplit_once('$') {
+        info_type.nested = Some(owner.to_string());
+    }
+    info_type.supertypes = info.supertypes.clone();
+    for member in &info.members {
+        if member.kind == IndexKind::Method {
+            info_type.methods.push(member.clone());
+        } else {
+            info_type.fields.push(member.clone());
+        }
+    }
+    Some(info_type)
+}
+
+/// Reads every `.class` entry in the jar at `path` and turns it into index
+/// entries attributed to the jar's own file URI, flagged as dependencies.
+pub fn entries_from_jar(path: &Path) -> Option<Vec<SymbolEntry>> {
+    jar_outputs(path).map(|(entries, _)| entries)
 }
 
 /// One jar (or class) entry per type plus one per declared member; ranges are
@@ -186,16 +234,32 @@ pub fn parse_class(data: &[u8]) -> Result<ClassInfo, String> {
     let Some(internal_name) = class_name(this_class) else {
         return Err("unresolvable this_class".into());
     };
-    let interfaces = reader.u2()? as usize;
-    reader.bytes(interfaces * 2)?;
 
-    let fields = {
+    // Supertypes: the superclass and every implemented interface. The implicit
+    // `java.lang.Object` is skipped to match source-extracted types, which
+    // never record one — otherwise every type in the workspace would offer
+    // `toString`/`equals`/`wait`/... in its completion list.
+    let mut supertypes = Vec::new();
+    if let Some(super_name) = class_name(super_class) {
+        if super_name != "java/lang/Object" {
+            supertypes.push(Ty::reference(super_name.replace('/', ".")));
+        }
+    }
+    let interface_count = reader.u2()? as usize;
+    for _ in 0..interface_count {
+        let slot = reader.u2()? as usize;
+        if let Some(name) = class_name(slot) {
+            supertypes.push(Ty::reference(name.replace('/', ".")));
+        }
+    }
+
+    let field_members = {
         let count = reader.u2()?;
-        read_members(&mut reader, count, &utf8_at)?
+        read_members(&mut reader, count, &utf8_at, IndexKind::Field)?
     };
-    let methods = {
+    let method_members = {
         let count = reader.u2()?;
-        read_members(&mut reader, count, &utf8_at)?
+        read_members(&mut reader, count, &utf8_at, IndexKind::Method)?
     };
     let attributes = reader.u2()?;
     for _ in 0..attributes {
@@ -214,11 +278,18 @@ pub fn parse_class(data: &[u8]) -> Result<ClassInfo, String> {
         IndexKind::Class
     };
 
+    let fields: Vec<String> = field_members.iter().map(|m| m.name.clone()).collect();
+    let methods: Vec<String> = method_members.iter().map(|m| m.name.clone()).collect();
+    let mut members = field_members;
+    members.extend(method_members);
+
     Ok(ClassInfo {
         internal_name,
         kind,
         methods,
         fields,
+        members,
+        supertypes,
     })
 }
 
@@ -228,17 +299,20 @@ struct Reader<'a> {
 }
 
 /// Reads one member table (fields or methods): `flags/name/descriptor` plus
-/// skipped attributes per entry; keeps only source-visible member names.
+/// skipped attributes. Keeps public, non-synthetic members and parses each
+/// descriptor into a [`Member`]; an unreadable descriptor leaves the member's
+/// type `Unknown` rather than dropping it.
 fn read_members<'a>(
     reader: &mut Reader<'a>,
     count: u16,
     utf8_at: &dyn Fn(usize) -> Option<&'a str>,
-) -> Result<Vec<String>, String> {
-    let mut names = Vec::new();
+    kind: IndexKind,
+) -> Result<Vec<Member>, String> {
+    let mut members = Vec::new();
     for _ in 0..count {
         let member_flags = reader.u2()?;
         let name_index = reader.u2()? as usize;
-        reader.u2()?; // descriptor
+        let descriptor_index = reader.u2()? as usize;
         let attributes = reader.u2()?;
         for _ in 0..attributes {
             reader.u2()?; // attribute name
@@ -256,9 +330,24 @@ fn read_members<'a>(
         if member_flags & 0x0002 != 0 {
             continue; // ACC_PRIVATE: not visible to callers
         }
-        names.push(name.to_string());
+        let descriptor = utf8_at(descriptor_index).unwrap_or("");
+        let (ty, params): (Ty, Vec<Param>) = match kind {
+            IndexKind::Method => {
+                let (params, ret) = Ty::method_from_descriptor(descriptor);
+                (ret, params.into_iter().map(Param::unnamed).collect())
+            }
+            _ => (Ty::from_descriptor(descriptor), Vec::new()),
+        };
+        members.push(Member {
+            name: name.to_string(),
+            kind,
+            ty,
+            params,
+            type_params: Vec::new(),
+            is_static: member_flags & 0x0008 != 0,
+        });
     }
-    Ok(names)
+    Ok(members)
 }
 
 impl Reader<'_> {
@@ -475,6 +564,213 @@ mod tests {
         member_table(&method_specs, &mut out);
         out.extend_from_slice(&0u16.to_be_bytes()); // class attributes
         out
+    }
+
+    /// Like `class_bytes`, but writes real member descriptors and an interface
+    /// list, so descriptor parsing and supertypes can be exercised.
+    fn class_bytes_typed(
+        internal: &str,
+        super_name: Option<&str>,
+        interfaces: &[&str],
+        fields: &[(&str, &str)],
+        methods: &[(&str, &str)],
+    ) -> Vec<u8> {
+        let mut pool: Vec<(u8, Vec<Vec<u8>>)> = Vec::new();
+        let utf8 = |text: &str, pool: &mut Vec<(u8, Vec<Vec<u8>>)>| -> u16 {
+            pool.push((
+                1,
+                vec![
+                    (text.len() as u16).to_be_bytes().to_vec(),
+                    text.as_bytes().to_vec(),
+                ],
+            ));
+            pool.len() as u16
+        };
+        let name_slot = utf8(internal, &mut pool);
+        pool.push((7, vec![name_slot.to_be_bytes().to_vec()]));
+        let this_class = pool.len() as u16;
+        let super_class = super_name.map_or(0, |super_name| {
+            let slot = utf8(super_name, &mut pool);
+            pool.push((7, vec![slot.to_be_bytes().to_vec()]));
+            pool.len() as u16
+        });
+        let mut interface_slots = Vec::new();
+        for interface in interfaces {
+            let slot = utf8(interface, &mut pool);
+            pool.push((7, vec![slot.to_be_bytes().to_vec()]));
+            interface_slots.push(pool.len() as u16);
+        }
+        let mut field_slots = Vec::new();
+        for (name, descriptor) in fields {
+            let n = utf8(name, &mut pool);
+            let d = utf8(descriptor, &mut pool);
+            field_slots.push((n, d));
+        }
+        let mut method_slots = Vec::new();
+        for (name, descriptor) in methods {
+            let n = utf8(name, &mut pool);
+            let d = utf8(descriptor, &mut pool);
+            method_slots.push((n, d));
+        }
+
+        let mut out = Vec::new();
+        out.extend_from_slice(&0xCAFEBABEu32.to_be_bytes());
+        out.extend_from_slice(&0u16.to_be_bytes()); // minor
+        out.extend_from_slice(&(52u16).to_be_bytes()); // major
+        out.extend_from_slice(&((pool.len() + 1) as u16).to_be_bytes());
+        for (tag, operands) in &pool {
+            out.push(*tag);
+            for operand in operands {
+                out.extend_from_slice(operand);
+            }
+        }
+        out.extend_from_slice(&0x0021u16.to_be_bytes()); // ACC_PUBLIC
+        out.extend_from_slice(&this_class.to_be_bytes());
+        out.extend_from_slice(&super_class.to_be_bytes());
+        out.extend_from_slice(&(interface_slots.len() as u16).to_be_bytes());
+        for slot in &interface_slots {
+            out.extend_from_slice(&slot.to_be_bytes());
+        }
+        let member_table = |members: &[(u16, u16)], out: &mut Vec<u8>| {
+            out.extend_from_slice(&(members.len() as u16).to_be_bytes());
+            for (name, descriptor) in members {
+                out.extend_from_slice(&0x0001u16.to_be_bytes()); // public
+                out.extend_from_slice(&name.to_be_bytes());
+                out.extend_from_slice(&descriptor.to_be_bytes());
+                out.extend_from_slice(&0u16.to_be_bytes()); // no attributes
+            }
+        };
+        member_table(&field_slots, &mut out);
+        member_table(&method_slots, &mut out);
+        out.extend_from_slice(&0u16.to_be_bytes()); // class attributes
+        out
+    }
+
+    #[test]
+    fn member_descriptors_and_supertypes_become_types() {
+        let bytes = class_bytes_typed(
+            "demo/Foo",
+            Some("demo/Base"),
+            &["java/lang/Runnable"],
+            &[("size", "I"), ("name", "Ljava/lang/String;")],
+            &[
+                ("getSize", "()I"),
+                ("byName", "(Ljava/lang/String;Ljava/util/List;)V"),
+            ],
+        );
+        let info = parse_class(&bytes).unwrap();
+        // Name lists are unchanged.
+        assert_eq!(info.fields, vec!["size", "name"]);
+        assert_eq!(info.methods, vec!["getSize", "byName"]);
+
+        let size = info.members.iter().find(|m| m.name == "size").unwrap();
+        assert_eq!(size.ty, Ty::Prim(crate::types::Prim::Int));
+        assert!(!size.is_static);
+        let by_name = info.members.iter().find(|m| m.name == "byName").unwrap();
+        assert_eq!(by_name.ty, Ty::Void);
+        assert_eq!(by_name.params.len(), 2);
+        assert_eq!(by_name.params[1].ty, Ty::reference("java.util.List"));
+        // Class-file descriptors carry no parameter names.
+        assert_eq!(by_name.params[1].name, None);
+
+        // The explicit superclass and interface, in that order.
+        assert_eq!(
+            info.supertypes,
+            vec![
+                Ty::reference("demo.Base"),
+                Ty::reference("java.lang.Runnable")
+            ]
+        );
+    }
+
+    #[test]
+    fn object_is_not_recorded_as_a_supertype() {
+        let info = parse_class(&class_bytes_typed(
+            "demo/Foo",
+            Some("java/lang/Object"),
+            &[],
+            &[],
+            &[],
+        ))
+        .unwrap();
+        assert!(info.supertypes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_descriptor_degrades_to_unknown() {
+        // The shared `class_bytes` helper writes descriptor index 0, which is
+        // not a constant-pool Utf8; the member must survive without a type.
+        let info = parse_class(&class_bytes(
+            "demo/Foo",
+            0x0021,
+            Some("java/lang/Object"),
+            &["size"],
+            &["getSize"],
+        ))
+        .unwrap();
+        let size = info.members.iter().find(|m| m.name == "size").unwrap();
+        assert_eq!(size.ty, Ty::Unknown);
+        assert!(size.params.is_empty());
+    }
+
+    #[test]
+    fn jar_outputs_carry_types_with_signatures() {
+        let bytes = class_bytes_typed(
+            "demo/Lib",
+            Some("java/lang/Object"),
+            &[],
+            &[("count", "I")],
+            &[("getName", "()Ljava/lang/String;")],
+        );
+        let jar = write_stored_zip(&[("demo/Lib.class", &bytes)]);
+        let path = std::env::temp_dir().join(format!(
+            "java-lsp-classfile-types-test-{}.jar",
+            std::process::id()
+        ));
+        std::fs::write(&path, &jar).unwrap();
+
+        let (entries, types) = jar_outputs(&path).unwrap();
+        assert!(entries.iter().any(|entry| entry.name == "Lib"));
+        let lib = types.iter().find(|info| info.name == "Lib").expect("Lib");
+        assert_eq!(lib.package.as_deref(), Some("demo"));
+        let get_name = lib.methods.iter().find(|m| m.name == "getName").unwrap();
+        assert_eq!(get_name.ty, Ty::reference("java.lang.String"));
+        assert!(get_name.params.is_empty());
+        let count = lib.fields.iter().find(|m| m.name == "count").unwrap();
+        assert_eq!(count.ty, Ty::Prim(crate::types::Prim::Int));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn library_types_inherit_members_through_the_model() {
+        let base_info = parse_class(&class_bytes_typed(
+            "demo/Base",
+            Some("java/lang/Object"),
+            &[],
+            &[],
+            &[("run", "()V")],
+        ))
+        .unwrap();
+        let foo_info = parse_class(&class_bytes_typed(
+            "demo/Foo",
+            Some("demo/Base"),
+            &[],
+            &[],
+            &[("own", "()V")],
+        ))
+        .unwrap();
+        let mut model = crate::types::TypeModel::new();
+        model.insert(class_type_info(&base_info).unwrap());
+        model.insert(class_type_info(&foo_info).unwrap());
+
+        let members =
+            crate::types::TypeLookup::members(&model, &Ty::reference("demo.Foo"), Some("demo"));
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+        assert!(names.contains(&"own"), "{names:?}");
+        assert!(
+            names.contains(&"run"),
+            "inherited library member missing: {names:?}"
+        );
     }
 
     /// Minimal STORED (uncompressed) zip writer for tests — std has none.

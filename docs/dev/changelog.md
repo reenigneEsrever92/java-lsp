@@ -6,8 +6,115 @@ tags: [dev, changelog]
 status: draft
 ---
 
+Entries that say "Verified by N tests" quote the whole suite's size at that
+point (the cumulative `cargo test` total), not the number of tests covering the
+named change.
+
+## 2026-09-22
+
+- **Type-aware review follow-ups** — fixes the defects found reviewing the
+  type-aware work. References and rename now identify a member's declaring type
+  by simple name *and* package, so renaming `a.Widget.run` no longer touches
+  `b.Widget.run`; they report a declaration only when `include_declaration`
+  asks, target nothing on a non-terminal import segment, count a
+  fully-qualified use as visibility, and refuse (rather than drop a reference)
+  when a candidate file cannot be read or parsed. A qualified supertype and a
+  nested class-file type (`Map$Entry`) now resolve, and an `implements` list is
+  diagnosed once per unresolved name instead of twice. A call whose argument
+  count matches no overload gets no parameter hint, hints never fall outside
+  the requested range, `rename` rejects restricted identifiers
+  (`var`/`record`/`yield`), the harness no longer prints debug output, and the
+  committed `example/` is back to valid Java with no build artifacts in the
+  change. Verified by `cargo test --all-targets` (157 tests). See
+  [Type-aware review follow-ups](backlog/type-aware-review-followups.md).
+
+- **Generic type-argument inference** — `receiver_type` now binds and substitutes
+  type arguments for calls: a method's own type parameters from its argument
+  types (`List.of(5)` renders `List<Integer>`, primitives boxed) and the
+  receiver's parameters from its own arguments (`List<String> l; l.get(0)`
+  renders `String`), with fields substituted the same way. Calls pick their
+  overload by arity (a new `member_for_call`), which also gives parameter hints
+  the right names, and literals now carry a type. A call that cannot be pinned
+  down keeps the written form; erased class-file signatures stay as they are.
+  Verified by 141 tests and against a real JDK (`: List<Integer>`,
+  `: String`). See
+  [Generic type-argument inference](backlog/generic-type-argument-inference.md).
+- **Separate completions for same-named symbols** — workspace-index completions
+  no longer collapse every symbol that shares a simple name into one item. The
+  dedupe key is now the insert text plus the import the item carries, so typing
+  `Li` offers both `class of java.awt` and `interface of java.util`, each with
+  its own `import` edit, while duplicate entries for one symbol and a local
+  shadowing a same-named field still collapse. Previously the surviving item was
+  arbitrary — accepting `List` inserted `import java.awt.List;`. Verified by 137
+  tests. See
+  [Separate completions for same-named symbols](backlog/same-name-completions.md).
+- **Import-aware type-name resolution** — `resolve_name` now resolves a simple
+  type name through the file's imports (an exact single-type import, then the
+  package, then a wildcard import, then a unique match) and returns a
+  package-qualified reference; `TypeLookup::lookup`/`members`/`member_owner`
+  honour that qualifier, and `receiver_type` qualifies a local's or field's
+  declared type name. This fixes names shared across packages (a real JDK indexes
+  both `java.util.List` and `java.awt.List`), so hover, `.`-completions, and
+  inlay hints work for them — `var x = List.of(3);` now hints. Verified by 136
+  tests. See
+  [Import-aware type-name resolution](backlog/import-aware-type-resolution.md).
+- **Type and parameter inlay hints** — the shell advertises `inlayHintProvider`
+  and `SemanticEngine` gains `inlay_hints` (defaulting to none), answered from
+  the open document's tree plus the type model for the client's requested range
+  only. Three families: variable type hints (a `var` local's initializer is
+  inferred through `receiver_type`, which also types `var` locals in the scope
+  hover and completions read), parameter-name hints at call sites, and the
+  return types of intermediate method-chain links. `Member` now carries
+  parameter names for source-declared methods, so hover signatures include them
+  while class-file members stay name-less and produce no parameter hint.
+  Verified by 128 tests. See
+  [Type and parameter inlay hints](backlog/type-hints.md).
+- **Find references and rename** — `SemanticEngine` gains `references` and
+  `rename` (defaulting to an empty list and `None`), and the shell advertises
+  `referencesProvider`/`renameProvider`. Resolution reuses the type layer —
+  including a member's declaring type from the receiver's type — then searches
+  the workspace's `.java` files (substring-prefiltered, parsed on demand) for
+  occurrences it can attribute with confidence: types only in files that can
+  see them, member accesses only where the receiver resolves the name to the
+  same declaring type, unqualified names only inside the declaring type's span,
+  and locals only when their method declares the name once. `rename` refuses
+  with `null` for an unresolved or ambiguous target, a library declaration, or
+  an invalid identifier. Verified by 120
+  tests. See [Find references and rename](backlog/references-and-rename.md).
+- **Library type signatures from JVM descriptors** — `classfile.rs` now parses
+  each member's descriptor into a type (so a jar/JDK type carries
+  `String getName()`, not a bare name) and records the superclass and
+  interfaces (skipping the implicit `java.lang.Object`), and the JDK's
+  `lib/src.zip` path feeds the model through `collect_type_infos`; library
+  receivers therefore offer inherited members exactly like workspace types, and
+  each jar is read once via the new `jar_outputs`. Costs ~14 MB more peak RSS
+  with a JDK indexed (192 MB vs 178 MB) and ~0.8 s more warm-up. Verified by 113
+  tests. See [JVM member descriptors](backlog/jvm-member-descriptors.md).
+- **Type-aware engine (pure Rust)** — a new `src/types.rs` models declared
+  types, members, and hierarchies, built during warm-up from the source trees
+  (full signatures) over name-only types synthesized from the indexed jars and
+  JDK. It now backs `TreeSitterEngine::hover` (previously hardcoded `None`, now
+  rendering a member's signature, a type declaration, or a local's type),
+  member completions after `.` (the receiver's inferred type, inherited members
+  included, still empty for an uninferrable receiver), and conservative
+  `type X cannot be resolved` warnings that never fire without an indexed JDK or
+  for imported, same-package, or type-parameter names. `SemanticEngine` and the
+  LSP shell are unchanged. Costs ~13 MB more peak RSS with a JDK indexed
+  (178 MB vs 165 MB). Verified by 109 tests; the bench's post-warm-up hover
+  probe now asserts resolved content. See
+  [Type-aware semantic engine](backlog/type-aware-engine.md).
+
 ## 2026-09-09
 
+- **Standard library indexing** — the installed JDK's `java.*`/`javax.*`
+  declarations are indexed during warm-up from `jmods` class files,
+  `lib/src.zip` sources (tree-sitter parsed), or `rt.jar`, discovered via
+  `$JAVA_LSP_JDK`/`$JAVA_HOME`/SDKMAN and read with a streaming ZIP walk;
+  JDK types appear in completions with auto-import edits (none for
+  `java.lang`), stay out of navigation, and a missing JDK is a graceful
+  no-op. Real-JDK baseline (Temurin 25 via src.zip, ~4.2k files): warm-up
+  5.5 s, peak RSS 165 MB, hover RTT during warm-up still ≤ 1.6 ms. Verified
+  by 92 tests. See [Standard library indexing](backlog/jdk-standard-library.md).
 - **Auto-import on completion accept** — the index now records each symbol's
   package (from the source file's `package_declaration` or the jar class's
   internal name), and completion items from other packages, modules, or jars

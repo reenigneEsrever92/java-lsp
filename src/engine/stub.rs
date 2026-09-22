@@ -2,8 +2,8 @@
 //! the real shell uses [`super::TreeSitterEngine`].
 
 use tower_lsp::lsp_types::{
-    CompletionResponse, Diagnostic, DocumentSymbol, FoldingRange, Hover, Location, Position,
-    SemanticTokens, Url,
+    CompletionResponse, Diagnostic, DocumentSymbol, FoldingRange, Hover, InlayHint, Location,
+    Position, Range, SemanticTokens, Url,
 };
 
 use super::SemanticEngine;
@@ -43,5 +43,9 @@ impl SemanticEngine for SyntaxOnlyEngine {
 
     fn semantic_tokens(&self, _uri: &Url) -> Option<SemanticTokens> {
         None
+    }
+
+    fn inlay_hints(&self, _uri: &Url, _range: Range) -> Vec<InlayHint> {
+        Vec::new()
     }
 }

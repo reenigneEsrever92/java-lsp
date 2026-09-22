@@ -11,11 +11,11 @@ use tower_lsp::lsp_types::{
     DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
     FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
     HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    OneOf, SemanticTokenModifier, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, SymbolInformation,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgressOptions,
-    WorkspaceSymbolParams,
+    InlayHint, InlayHintParams, Location, OneOf, ReferenceParams, RenameParams,
+    SemanticTokenModifier, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
+    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
+    ServerCapabilities, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
@@ -104,6 +104,9 @@ impl LanguageServer for JavaLanguageServer {
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
+                references_provider: Some(OneOf::Left(true)),
+                rename_provider: Some(OneOf::Left(true)),
+                inlay_hint_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
                     SemanticTokensOptions {
@@ -224,6 +227,33 @@ impl LanguageServer for JavaLanguageServer {
         Ok(completions)
     }
 
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let include_declaration = params.context.include_declaration;
+        let references = {
+            let engine = self.engine.read().await;
+            engine.references(&uri, position, include_declaration)
+        };
+        // An empty result is a refusal as much as a "none found": report null
+        // rather than claiming the symbol has no occurrences.
+        if references.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(references))
+        }
+    }
+
+    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
+        let uri = params.text_document_position.text_document.uri;
+        let position = params.text_document_position.position;
+        let edit = {
+            let engine = self.engine.read().await;
+            engine.rename(&uri, position, &params.new_name)
+        };
+        Ok(edit)
+    }
+
     async fn document_symbol(
         &self,
         params: DocumentSymbolParams,
@@ -266,5 +296,15 @@ impl LanguageServer for JavaLanguageServer {
             engine.semantic_tokens(&uri)
         };
         Ok(tokens.map(SemanticTokensResult::Tokens))
+    }
+
+    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
+        let uri = params.text_document.uri;
+        let range = params.range;
+        let hints = {
+            let engine = self.engine.read().await;
+            engine.inlay_hints(&uri, range)
+        };
+        Ok(Some(hints))
     }
 }

@@ -59,8 +59,9 @@ All use cases belong to the Java developer.
 | R4 | Completions without type resolution: keywords, locals in scope, workspace index symbols | Functional | high | UC2 |
 | R5 | Workspace symbol index built without blocking the request path; go-to-definition and workspace symbols backed by it | Functional | high | UC3 |
 | R6 | Project open → responsive: the initial scan never blocks text sync or request handling; individual features may be briefly unavailable while warming up | Non-functional | high | UC1 |
-| R7 | Full type-aware semantic engine (javac daemon via GraalVM Native Image vs. pure-Rust type checker — decision deliberately postponed) | Functional | medium | deferred |
-| R8 | Find references, rename, type-aware hover, Maven/Gradle project models | Functional | low | deferred |
+| R7 | Type-aware semantic engine: a pure-Rust type layer resolving declared types, members, and receivers | Functional | medium | v0.3 |
+| R8 | Gradle project model | Functional | low | deferred |
+| R9 | Inlay hints: variable types (including `var` inference), parameter names, and chained-call return types, computed for the requested range | Functional | medium | UC1, R7 |
 
 ## Milestones
 
@@ -76,9 +77,32 @@ statically parsed from `pom.xml`, and the full dependency closure (direct,
 transitive, BOM-imported, parent-inherited) resolved offline from the local
 repository and indexed from their jars so external types show up in
 completions (R8, first slice; see `maven-project-model` in the backlog). The
-type-aware engine decision (R7) is explicitly pushed behind v0.2: its CR
-stays `proposed` until this milestone lands.
+type-aware engine decision (R7) was explicitly pushed behind v0.2; it is
+thereafter settled in v0.3.
 
-**Deferred**: R7 (the engine decision) and the rest of R8 (find references,
-rename, type-aware hover, Gradle, transitive dependency resolution) stay
-listed here so later change requests can pick them up.
+**v0.3 — type-aware engine**: the server resolves declared types instead of
+reasoning about names alone. A pure-Rust type layer (the engine chosen for R7 —
+the javac-daemon option was rejected as reintroducing a Java codebase and
+annotation-processor risk) models types, their members, and their hierarchies,
+and from it hover renders real declarations, completions after `.` offer the
+receiver's members, library types carry real signatures and inherited members
+(`jvm-member-descriptors`), unresolved type names are reported as conservative
+semantic diagnostics (R7), and find references and rename — R8's first slice,
+`references-and-rename` — work for types, members, and file-local symbols,
+refusing rather than guessing. Overload resolution by argument types stays
+deferred; so does Gradle.
+
+**v0.4 — type-aware UX**: the type layer becomes something the developer sees
+while reading, not only on demand. Inlay hints render inferred and declared
+variable types (resolving `var` from its initializer), parameter names at call
+sites, and the return types of intermediate method-chain links, scoped to the
+visible range the client requests (R9; see `type-hints` in the backlog). The
+`var` inference pulled forward for the hints also types `var` locals in the
+scope that hover and completions read. Type arguments are inferred and
+substituted for calls — a method's own type parameters from its arguments and
+the receiver's from its own arguments — so `List.of(5)` renders `List<Integer>`
+and `list.get(0)` its element type
+(`generic-type-argument-inference`).
+
+**Deferred**: Gradle project model support (what remains of R8) stays listed
+here so a later change request can pick it up.

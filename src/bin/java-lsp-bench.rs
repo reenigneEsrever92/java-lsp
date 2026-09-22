@@ -675,6 +675,15 @@ fn run_bench(server: &Path, fixture: &Fixture, args: &Args) -> Report {
     let post_warmup_rtt_ms = ms(post_sent, Some(Instant::now()));
     let _ = post_id;
 
+    // The hover probe must actually resolve: type-aware hover answers the
+    // fixture class name with its declaration, where the type-free engine
+    // returned nothing at all.
+    let hover_value = post["result"]["contents"]["value"].as_str().unwrap_or("");
+    assert!(
+        hover_value.contains(&fixture.class_names[0]),
+        "post-warm-up hover resolved nothing: {post}"
+    );
+
     let memory = read_memory(pid);
 
     // Graceful shutdown, same rules as tests/stdio_smoke.rs.

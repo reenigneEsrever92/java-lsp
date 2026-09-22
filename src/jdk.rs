@@ -39,7 +39,7 @@ pub fn locate_jdk() -> Option<PathBuf> {
 }
 
 /// Serializes tests that mutate/read JDK- and repo-related env vars.
-pub(crate) fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+pub fn env_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
     LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
@@ -96,8 +96,9 @@ fn common_homes() -> Vec<PathBuf> {
 }
 
 /// Parses every standard-library class in the JDK at `home`, grouped per
-/// archive (jmods, src.zip, or rt.jar) so the index can attribute entries.
-pub fn jdk_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>)> {
+/// archive (jmods, src.zip, or rt.jar) so the index can attribute entries. Each
+/// archive also yields the declared types its classes make up.
+pub fn jdk_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types::TypeInfo>)> {
     if home.join("jmods").is_dir() {
         jmod_entries(home)
     } else if let Some(src) = src_zip(home) {
@@ -113,7 +114,7 @@ pub fn jdk_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>)> {
 }
 
 /// Class files from `jmods/*.jmod` (JDK 9+).
-fn jmod_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>)> {
+fn jmod_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types::TypeInfo>)> {
     let mut archives: Vec<PathBuf> = Vec::new();
     let jmods = home.join("jmods");
     if let Ok(entries) = std::fs::read_dir(&jmods) {
@@ -132,10 +133,14 @@ fn jmod_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>)> {
 }
 
 /// Class files from one archive; jmods keep classes under `classes/`.
-fn class_archive_entries(archive: &Path, in_jmod: bool) -> Option<(Url, Vec<SymbolEntry>)> {
+fn class_archive_entries(
+    archive: &Path,
+    in_jmod: bool,
+) -> Option<(Url, Vec<SymbolEntry>, Vec<crate::types::TypeInfo>)> {
     let data = std::fs::read(archive).ok()?;
     let uri = Url::from_file_path(archive).ok()?;
     let mut entries = Vec::new();
+    let mut types = Vec::new();
     let mut classes = 0usize;
     for_each_zip_entry(&data, |name, class_data| {
         if !name.ends_with(".class")
@@ -161,19 +166,22 @@ fn class_archive_entries(archive: &Path, in_jmod: bool) -> Option<(Url, Vec<Symb
             return;
         };
         entries.extend(crate::classfile::class_entries(&uri, &info));
+        if let Some(type_info) = crate::classfile::class_type_info(&info) {
+            types.push(type_info);
+        }
         classes += 1;
     })?;
     if classes == 0 {
         return None;
     }
     tracing::debug!(archive = %archive.display(), classes, "indexed JDK archive");
-    Some((uri, entries))
+    Some((uri, entries, types))
 }
 
 /// Java sources from `lib/src.zip` (JDK installs without jmods, e.g. some
 /// SDKMAN distributions). Entries are `<module>/<pkg>/<Type>.java`; the
 /// leading module directory is dropped.
-fn src_zip_entries(src: &Path) -> Vec<(Url, Vec<SymbolEntry>)> {
+fn src_zip_entries(src: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types::TypeInfo>)> {
     let Ok(data) = std::fs::read(src) else {
         return Vec::new();
     };
@@ -182,6 +190,7 @@ fn src_zip_entries(src: &Path) -> Vec<(Url, Vec<SymbolEntry>)> {
     };
     let mut parser = crate::index::java_parser();
     let mut entries = Vec::new();
+    let mut types = Vec::new();
     let mut files = 0usize;
     for_each_zip_entry(&data, |name, source_data| {
         if !name.ends_with(".java") || name.ends_with("package-info.java") {
@@ -211,12 +220,19 @@ fn src_zip_entries(src: &Path) -> Vec<(Url, Vec<SymbolEntry>)> {
             entry.dependency = true;
         }
         entries.extend(file_entries);
+        // The same tree already parsed for the index also feeds the type model,
+        // so a source-only JDK gets real signatures rather than bare names.
+        types.extend(crate::types::collect_type_infos(
+            Some(&dotted),
+            &tree,
+            &text,
+        ));
         files += 1;
     });
     if files > 0 {
         tracing::debug!(archive = %src.display(), files, "indexed JDK sources");
     }
-    vec![(uri, entries)]
+    vec![(uri, entries, types)]
 }
 
 #[cfg(test)]
@@ -403,6 +419,14 @@ mod tests {
         let string = all.iter().find(|entry| entry.name == "String").unwrap();
         assert_eq!(string.package.as_deref(), Some("java.lang"));
         assert!(string.dependency);
+
+        // The archive's declared types are produced alongside the entries.
+        let types = &entries[0].2;
+        let string_type = types
+            .iter()
+            .find(|info| info.name == "String")
+            .expect("String type");
+        assert_eq!(string_type.package.as_deref(), Some("java.lang"));
     }
 
     #[test]
@@ -436,6 +460,19 @@ mod tests {
             .expect("member");
         assert_eq!(size.package.as_deref(), Some("java.util"));
         assert!(!all.iter().any(|entry| entry.name == "Hidden"));
+
+        // The source archive feeds typed `TypeInfo`s through the same model.
+        let types = &entries[0].2;
+        let list_type = types
+            .iter()
+            .find(|info| info.name == "List")
+            .expect("List type");
+        let size_method = list_type
+            .methods
+            .iter()
+            .find(|member| member.name == "size")
+            .expect("typed size method");
+        assert_eq!(size_method.ty.display(), "int");
     }
 
     #[test]
