@@ -1,7 +1,7 @@
 ---
 type: Architecture
 title: Architecture
-description: Crate layout, the LSP shell and SemanticEngine seam, and the data flow inside java-lsp.
+description: Crate layout, the LSP shell to engine message boundary, and the data flow inside java-lsp.
 tags: [architecture, lsp, rust]
 status: draft
 ---
@@ -9,8 +9,9 @@ status: draft
 # Architecture
 
 java-lsp is a single cargo crate. A workspace split into shell/engine crates is
-deliberately deferred — the `SemanticEngine` trait seam gives the same
-isolation until there is a second binary or a second real backend.
+deliberately deferred — the shell and the engine already meet at a channel
+boundary (commands in, events out), so a future split is a transport change
+rather than a redesign.
 
 ## Layout
 
@@ -28,9 +29,12 @@ src/
   resolve.rs  — static Maven dependency resolution (effective poms, closure)
   classfile.rs— minimal jar (ZIP) + class-file reader for dependency indexing
   jdk.rs      — standard-library indexing: JDK discovery, jmods/src.zip/rt.jar
-  engine/     — SemanticEngine trait (mod.rs), SyntaxOnlyEngine stub (stub.rs),
-                TreeSitterEngine (syntax.rs): parse trees, diagnostics, symbols,
-                folding, semantic tokens, completions, navigation, inlay hints
+  sources.rs  — dependency sources: fetch -sources.jar, extract, index them
+  engine.rs   — the shell <-> engine boundary: Command / EngineEvent /
+                EngineHandle and the dispatcher task that owns the core
+  analysis.rs — the engine core (TreeSitterEngine): parse trees, diagnostics,
+                symbols, folding, semantic tokens, completions, navigation,
+                inlay hints
 tests/
   harness.rs      — drives JavaLanguageServer through tower_lsp::LspService
   stdio_smoke.rs  — drives the real binary over stdio with raw LSP JSON-RPC
@@ -44,41 +48,65 @@ zed-java-lsp/           — Zed extension: Java language + tree-sitter-java gram
 ```mermaid
 graph LR
     C[Editor client] -- LSP over stdio --> S[JavaLanguageServer]
-    S -- open/change/close, queries --> E[SemanticEngine trait]
-    E --> TS[TreeSitterEngine]
+    S -- commands --> EH[EngineHandle]
+    EH --> DISP{{engine.rs dispatcher}}
+    DISP -- mutations, inline --> TS[analysis.rs: TreeSitterEngine]
+    DISP -- queries, spawned --> TS
+    TS -- EngineEvent: diagnostics --> S
     TS -- declarations --> WI[(WorkspaceIndex)]
     TS -- declared types --> TL[(TypeModel)]
     WI -- background warm-up --> P[ProjectModel]
     P -- source roots --> WS[workspace .java files]
     P -- dependency closure --> JV[local repo jars]
     JV -- class files --> WI
-    E -. reference .-> SO[SyntaxOnlyEngine stub]
+    P -- dependency closure --> SR[sources.rs: fetch + extract + parse]
+    SR -- source-backed entries --> WI
+    SR -- real signatures --> TL
     S -- versioned text --> D[(DocumentStore)]
 ```
 
 - **LSP shell** (`server.rs`): implements `tower_lsp::LanguageServer`.
   `initialize` advertises incremental text sync, hover, definition,
-  completions, document symbols, workspace symbols, folding ranges,
-  semantic tokens, references, rename, and inlay hints.
-  `didOpen`/`didChange`/`didClose` update the document store, forward the full
-  text to the engine, and republish the engine's diagnostics. Query handlers
-  dispatch straight through to the engine.
+  completions, signature help, document symbols, workspace symbols, folding
+  ranges, semantic tokens, references, rename, and inlay hints.
+  `didOpen`/`didChange`/`didClose` update the document store and send the
+  matching command; the engine's diagnostics come back as events, which the
+  shell's drain task publishes. Query handlers await the engine handle. That
+  same drain task renders the engine's progress events as
+  `window/workDoneProgress/create` plus `$/progress` — one status-bar item
+  titled `java-lsp`, whose message names the current phase and whose percentage
+  rises during the source download — and its notice events as a single
+  `window/showMessage`. Progress and notices are gated on the client having
+  advertised `window.workDoneProgress` in `initialize`; without it they are
+  dropped silently. A `window/workDoneProgress/cancel` is ignored — the
+  background job is not cancellable.
 - **DocumentStore** (`document.rs`): keeps UTF-8 bytes per URI with the client
   version. Incremental `TextDocumentContentChangeEvent`s are applied in order;
   LSP positions (line + UTF-16 code units) are converted to byte offsets in the
   store — bytes are what tree-sitter consumes, and UTF-16 conversion is the
   only place position semantics are handled on the way in.
-- **SemanticEngine** (`engine/mod.rs`): the seam between the shell and any
-  analysis backend — `open`/`change`/`close` plus `diagnostics`, `hover`,
-  `definition`, `workspace_symbols`, `completions`, `document_symbols`,
-  `folding_ranges`, `semantic_tokens`, `inlay_hints`, and the workspace-index
-  hooks `set_workspace_root`, `index_ready`, `indexed_symbols`, all synchronous,
-  `Send + Sync`. `references`, `rename`, and `inlay_hints` default to an empty
-  result, so a backend without them stays a valid conformance reference. Engines
-  without an index get the trait defaults (no-op root, always ready). The
-  `SyntaxOnlyEngine` stub (`engine/stub.rs`) is kept as the trait's minimal
-  conformance reference; the shell runs the real backend:
-- **TreeSitterEngine** (`engine/syntax.rs`): parses each open document with
+- **Engine boundary** (`engine.rs`): the shell never touches the core directly.
+  It holds an `EngineHandle` (cheap, cloneable) and sends a `Command` per LSP
+  handler — `SetWorkspaceRoot`, `Open`/`Change`/`Close`, and one variant per
+  query, each carrying a `oneshot` reply — to a single dispatcher task that owns
+  the core. The dispatcher applies mutations and orchestration **inline, in
+  arrival order** (the one place ordering matters: an edit must land before the
+  query the client sends at the new cursor) and hands read-only queries to
+  **spawned tasks**, so a slow `references` never delays typing — the
+  concurrency the old read-locked handle gave, made explicit. `EngineEvent` is
+  the reverse channel the previous `&self` trait could not express:
+  `Diagnostics { uri, version, diagnostics }`, emitted after an applied
+  open/change (and an empty one after a close), and — from the background
+  warm-up — `Progress(ProgressUpdate)` (begin/update/end with a phase message, a
+  count, and an optional download percentage) and `Message { level, text }`. The
+  shell owns a drain task that
+  turns each into a client notification (the events channel is unbounded, so a
+  slow client can never stall the engine). The warm-up reports through a small
+  cloneable `Reporter` — a typed wrapper over the same event sender — which is
+  detached (a no-op) for inline scans and unit tests. A dropped reply — the
+  engine task
+  gone — yields the empty result rather than an error. The core itself:
+- **Engine core** (`analysis.rs`, `TreeSitterEngine`): parses each open document with
   `tree-sitter-java` and keeps one tree (plus the text) per URI. Parse errors
   (`ERROR`/missing nodes) become error diagnostics, so squiggles appear on
   broken code and clear on fix. Declaration nodes become hierarchical
@@ -93,8 +121,12 @@ graph LR
   cursor from the open document's tree — the innermost enclosing
   method/constructor's parameters and locals plus the enclosing type's fields
   (nameable unqualified, so no wrong membership is claimed); and workspace
-  index symbols matched by `query_prefix` on the simple name, with members
-  labeled `Container.name` but inserted/filtered under their simple name.
+  index symbols matched by `query_prefix` on the simple name. A method is
+  offered as one item per overload (its declaring type resolved in the type
+  layer), labelled with its full signature and inserted under its bare name
+  followed by `(` so accepting it opens the argument list; a field keeps its
+  `Container.name` label and a type its plain name, and a method whose
+  overloads cannot be resolved in the model falls back to the plain name.
   Symbols that share a simple name but are imported differently stay separate
   items — each carrying its own import edit and labeled with its owner
   (`class of java.awt` alongside `interface of java.util`) — while entries for
@@ -103,14 +135,22 @@ graph LR
   lock, so while the workspace scan is warming up completions simply contribute
   whatever is indexed so far — partial, never blocking (R6). Member access is
   answered from the type layer (see the `types.rs` bullet): the receiver's type
-  is inferred and its members are offered with their signatures as `detail`
-  (inherited members included for workspace types), while an uninferrable
-  receiver still returns an empty list, claiming nothing a type-free engine
+  is inferred and each of its members is offered — every overload of a method
+  keeping its own item, labelled with the full signature and inserting `name(`,
+  fields keeping their name and their type in `detail` (inherited members
+  included for workspace types) — while an uninferrable receiver still returns
+  an empty list, claiming nothing a type-free engine
   cannot verify. The receiver of a `.` is normally the tree's member access, but
   an incomplete `receiver.` at the end of a line can parse the dot into the next
   token (a following `var` line reads `gson.var` as a scoped type identifier);
   then the receiver is recovered from the source as the expression ending at the
   last non-whitespace byte before the dot, so the same members are offered.
+  **Signature help** serves `textDocument/signatureHelp` from the same type
+  layer: for the call the cursor sits in it offers the callee's overloads,
+  rendered with their declared parameters, and marks the argument the cursor is
+  in as `activeParameter`, returning nothing when the callee or the receiver's
+  type cannot be resolved. Constructors are not modelled, so `new T(...)`
+  answers nothing.
   Auto-import: every index-sourced item whose symbol lives outside the open
   file's package carries an `additionalTextEdits` inserting
   `import <fqcn>;` (after the last import, else after the `package`
@@ -129,7 +169,13 @@ graph LR
   targets); otherwise an exact-name lookup over declaration entries is
   narrowed by the node kind at the cursor — a `type_identifier` restricts to
   type declarations, a method-invocation or field-access name to methods and
-  fields. A single candidate — or several sharing one file (method overloads,
+  fields. A member call is resolved further: the receiver's declaring type and
+  the call's argument types select the overload (types first, then arity),
+  landing `x.add(1)` on `add(int)` rather than the first same-named
+  declaration, and falling back to the name-only answer when the receiver or an
+  argument cannot be pinned down. Workspace declarations and source-backed library declarations (see
+  the dependency-sources bullet) both qualify; a class-file jar declaration does
+  not, since its location is not openable. A single candidate — or several sharing one file (method overloads,
   same-file repeats), resolved to the first by position — is an answer;
   anything spread across multiple files returns no location rather than a
   wrong one (no result beats a wrong result). `workspace_symbols` maps
@@ -140,10 +186,13 @@ graph LR
   never block (R6). **Hover** resolves the symbol under the cursor through the
   type layer and renders its declaration as Markdown — a member's signature, a
   type's declaration, or a local's declared type — returning nothing when the
-  symbol is unresolved or ambiguous. Documented v1 limitations: `definition`
-  is still a pure name lookup with no receiver-type resolution, so `x.foo()`
-  may hit a same- or cross-file declaration of `foo` by name or return nothing;
-  and scanned-file ranges reflect the last disk scan, not a live watcher.
+  symbol is unresolved or ambiguous. Documented v1 limitations: a bare name is
+  still a pure lookup with no receiver-type resolution (a member call is
+  resolved through its receiver and arguments, above), so an unqualified `foo`
+  may hit a same- or cross-file declaration by name or return nothing; overload
+  selection covers only the assignability relation's conversions and refuses
+  when they are inconclusive; and scanned-file ranges reflect the last disk
+  scan, not a live watcher.
   **References and rename** resolve the symbol under the cursor the way hover
   does — a member's declaring type coming from the receiver's type, identified
   by simple name *and* package so a same-named type elsewhere is never touched —
@@ -154,7 +203,12 @@ graph LR
   member access only where the receiver's type resolves the name back to the
   same declaring type, an unqualified member name only inside the declaring
   type's own span, and a local only inside its method and only when that method
-  declares the name once. A declaration is reported only when
+  declares the name once. An overloaded method is narrowed to the selected
+  overload: an occurrence counts only when its call's argument types accept that
+  overload's parameters (a method reference, with no argument list, is left
+  out), and only the selected declaration is reported. `rename` deliberately
+  stays name-group-wide — it renames every overload of the name, never one
+  overload that could leave a call site behind. A declaration is reported only when
   `include_declaration` asks for it: the search skips declaration names, and the
   index (or, for a local, its own recorded location) supplies them. A cursor on
   a non-terminal segment of an import path targets nothing. `rename` builds one
@@ -211,7 +265,10 @@ graph LR
   inferred from its arguments (a method's own type parameters and the
   receiver's, with primitives boxed) and substituted into the result, while a
   call the layer cannot pin down keeps the written form; overloads are chosen by
-  arity at a call site and by name alone elsewhere; and the implicit
+  arity at a call site and by name alone elsewhere, and an `assignable` relation
+  (identity, primitive widening, boxing/unboxing, `null` to a reference,
+  subtyping through the hierarchy, arrays, erasure) with `member_for_arguments`
+  lets navigation pick the overload a call's argument types select; and the implicit
   `java.lang.Object` is not recorded as a supertype (matching source-extracted
   types), so its members never appear in a `.`-completion listing. They do
   resolve, though, as a fallback when the hierarchy walk finds nothing — so an
@@ -222,10 +279,11 @@ graph LR
   checks a bare simple type name in a declaration, `new`, a cast, `extends`, or
   `implements` only, and treats a name the model knows in *any* package as
   resolved, so it under-reports rather than risk a false positive on a name it
-  cannot fully reason about. Overload resolution by argument
-  types, lambdas, casts, and static-import member resolution
-  remain follow-up work (R7 remainder, R8).
-- **Inlay hints** (`engine/syntax.rs`, R9): computed on demand for the range
+  cannot fully reason about. Overload selection by argument types is now
+  available to definition and find-references (see the type layer's
+  `assignable` relation); full Java overload resolution, lambdas, casts, and
+  static-import member resolution remain follow-up work (R7 remainder, R8).
+- **Inlay hints** (`analysis.rs`, R9): computed on demand for the range
   the client requests — the tree walk is pruned to that range, so cost scales
   with the visible text rather than the file. Three families: variable type
   hints (`: Type` after a local or field name), parameter name hints at a call
@@ -251,7 +309,7 @@ graph LR
   computed while the model is still warming simply appears on the client's next
   request (R6).
 - **WorkspaceIndex** (`index.rs`): a workspace-wide, in-memory index of Java
-  declarations and imports, owned by `TreeSitterEngine`. Entries are flat
+  declarations and imports, owned by the engine core (`TreeSitterEngine`). Entries are flat
   `SymbolEntry`s (name, kind, package, enclosing-type container chain,
   ranges, `dependency` flag) — no trees, no text — so memory stays
   proportional to workspace size. A source record's header components are
@@ -272,13 +330,17 @@ graph LR
   wins), anything else drops its entries. `index_ready()` flips when warm-up
   completes so index-backed features can report themselves briefly
   unavailable during warm-up instead of blocking; completions consume the
-  index via `query_prefix` (see the `TreeSitterEngine` bullet above), and
+  index via `query_prefix` (see the engine-core bullet above), and
   go-to-definition and `workspace/symbol` are backed by the same two lookups
   — `query_name` for exact-name definition targets, `query_prefix` for
   workspace symbols — with dependency-jar entries filtered out of both (see
   the project-model bullet). Known v1 limitations: there is no file watcher,
   so out-of-editor disk changes are picked up on close re-reads only, and a
-  scanned file's indexed ranges reflect the last disk scan.
+  scanned file's indexed ranges reflect the last disk scan. Extracted dependency
+  sources (see the dependency-sources bullet) are indexed as ordinary `.java`
+  files under the cache, but their entries carry `library_source`;
+  `source_files()` — the candidate set for references and rename — excludes
+  them, so a search never reads the cache and a rename never edits it.
 - **Maven project model** (`project.rs` + `resolve.rs` + `classfile.rs`):
   the warm-up builds a model of the workspace before scanning it. POM
   discovery walks the root (hidden dirs, `target/`, `build/` skipped) and
@@ -306,8 +368,10 @@ graph LR
   the superclass and interfaces), producing
   index entries flagged `dependency: true`: offered in completions with the
   usual `Container.name` labels, but excluded from definition and
-  `workspace/symbol`, since jar locations cannot be opened by an editor (no
-  result beats a wrong result). Known v1 limitations: no profile activation,
+  `workspace/symbol`, since a class-file jar location cannot be opened by an
+  editor (no result beats a wrong result); a dependency whose sources were
+  indexed instead carries source-backed entries that definition *does* admit
+  (see the dependency-sources bullet). Known v1 limitations: no profile activation,
   no plugin-contributed roots or dependencies, no transitive version-range
   handling, `-SNAPSHOT` metadata is ignored (the local file is used as-is),
   and dependency scopes are ignored at indexing time (test-scope types may
@@ -333,11 +397,43 @@ graph LR
   warm-up ≈ 5.5 s and peak RSS ≈ 165 MB in release — both on the background
   task; hover RTT during warm-up stayed ≤ 1.6 ms (R6 holds; see the bench
   baseline in the changelog).
+- **Dependency sources** (`sources.rs`): after the workspace and class-file jars
+  are indexed and `ready` has flipped, each resolved artifact that has a jar has
+  its sources fetched — reusing an existing `<a>-<v>-sources.jar` in the local
+  repository, otherwise downloading it from `$JAVA_LSP_MAVEN_CENTRAL_URL`
+  (default `https://repo1.maven.org/maven2`) into the repository at Maven's
+  standard path, with the published `.sha1` verified when present. Downloads run
+  on the runtime with bounded concurrency (a semaphore caps at 8); extraction
+  and parsing run on the blocking pool, so the request path is never involved
+  (R6). Each sources jar is unpacked under `$JAVA_LSP_SOURCES_CACHE` (default
+  `$XDG_CACHE_HOME/java-lsp/sources`, else `~/.cache/java-lsp/sources`), its
+  `.java` entries parsed by the same tree-sitter extractor the JDK's `src.zip`
+  uses, and indexed as source-backed dependency entries (real ranges) while the
+  artifact's class-file entries are dropped first, so two declarations of one
+  type never coexist and make `definition` ambiguous. The source-derived types
+  overlay the class-derived ones (`TypeModel::insert` replaces by
+  `(name, package, kind, nested)`), so hover, `.`-completion, and inlay hints
+  gain real signatures and parameter names, and `definition` resolves a library
+  declaration to its extracted source — an ordinary openable `file://` URI.
+  `references` and `rename` are unchanged for libraries: `source_files()` omits
+  the cache, so neither reads nor edits it. A second log line
+  (`library sources indexed`) reports the pass. On by default;
+  `$JAVA_LSP_OFFLINE` (any non-empty value) disables all network work. An
+  unreachable repository, an artifact with no published sources, or a checksum
+  mismatch each degrades to the class-file entries with a warning; artifacts not
+  on the configured repository are skipped, with no credential or
+  `settings.xml` mirror handling in v1.
 
 ## Decisions and constraints
 
 - **`tower-lsp` over stdio** — ergonomics first (decision recorded in
   `requirements.md`); revisit if it blocks cancellation or backpressure control.
+- **Shell/engine boundary is message-based** (`engine.rs`) — the shell sends
+  `Command`s and drains `EngineEvent`s over `tokio` channels instead of holding a
+  locked `dyn` backend. A dispatcher serializes mutations for ordering while
+  queries run concurrently (preserving R6); a strict single-task actor was
+  rejected because it would serialize every request behind the slowest one
+  (`message-based-engine`).
 - **Process lifecycle**: `shutdown`/`exit` stop the service (further requests
   are rejected with `ExitedError`); the process itself terminates when the
   client closes stdin (EOF), which is tower-lsp's transport semantics and what

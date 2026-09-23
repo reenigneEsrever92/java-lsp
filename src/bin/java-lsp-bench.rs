@@ -373,6 +373,8 @@ impl Server {
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .env("RUST_LOG", "java_lsp=info")
+            // Keep the baseline deterministic: no dependency-source downloads.
+            .env("JAVA_LSP_OFFLINE", "1")
             .spawn()
             .unwrap_or_else(|e| panic!("failed to spawn {}: {e}", binary.display()));
         let stdin = Some(child.stdin.take().expect("child stdin"));

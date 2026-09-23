@@ -10,6 +10,52 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-09-23
+
+- **Argument-aware overload resolution for navigation** — go-to-definition and
+  find-references now select the overload a call targets from its argument types
+  (arity when the types are inconclusive): a new `assignable` relation in the
+  type layer plus `member_for_arguments` narrow a callee's overloads, and a
+  reference is attributed only when its call accepts the selected overload's
+  parameters. `rename` stays name-group-wide. Verified by
+  `cargo test --all-targets` (208 tests). See
+  [Argument-type overload resolution for navigation](backlog/overload-navigation.md).
+
+- **Warm-up and source-fetch progress** — the server now reports the background
+  warm-up to the client: one work-done progress item (`window/workDoneProgress/
+  create` + `$/progress`) titled `java-lsp` whose message names each phase with
+  counts (`Indexed N source files`, `Indexed N dependency jars`, `Indexed N JDK
+  classes`, `Fetching N dependency sources` with a rising percentage), plus a
+  single `window/showMessage` notice when `JAVA_LSP_OFFLINE` disables source
+  fetching on a workspace that has dependencies. Gated on the client's
+  `window.workDoneProgress` capability; emitted through a new `Reporter` and the
+  `Progress`/`Message` engine events. Verified by `cargo test --all-targets`
+  (198 tests). See
+  [Warm-up and source-fetch progress reporting](backlog/warmup-progress-reporting.md).
+
+- **Message-based engine boundary** — the shell and the engine now meet at a
+  `tokio` channel boundary (`src/engine.rs`: `Command`, `EngineEvent`,
+  `EngineHandle`, and a dispatcher task) instead of a read-locked
+  `Box<dyn SemanticEngine>` trait. Mutations are applied inline in arrival
+  order while read-only queries run on spawned tasks, and diagnostics arrive as
+  `EngineEvent`s the shell's drain task publishes. The `SemanticEngine` trait,
+  `SyntaxOnlyEngine`, and `src/engine/` are gone; the analysis core moved to
+  `src/analysis.rs` unchanged. Verified by `cargo test --all-targets` (193
+  tests). See [Message-based engine boundary](backlog/message-based-engine.md).
+
+- **Maven dependency sources** — the server now fetches each resolved
+  dependency's `<a>-<v>-sources.jar` from a Maven repository (Maven Central by
+  default; `JAVA_LSP_MAVEN_CENTRAL_URL` overrides, `JAVA_LSP_OFFLINE=1` opts
+  out), writes it into the local Maven repository, extracts it under
+  `JAVA_LSP_SOURCES_CACHE` (default `~/.cache/java-lsp/sources`), and indexes
+  the Java sources — so hover and `.`-completion carry real signatures and
+  parameter names and **go-to-definition opens the extracted source file**. A
+  new `library_source` entry flag admits those declarations to `definition`
+  while `WorkspaceIndex::source_files` excludes the cache, so references and
+  rename never read or edit it. Verified by `cargo test --all-targets` (193
+  tests). See
+  [Maven source download and library navigation](backlog/maven-source-indexing.md).
+
 ## 2026-09-22
 
 - **Dot receiver recovery and wider `var` inference** — an incomplete

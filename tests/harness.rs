@@ -1,6 +1,6 @@
 //! Drives the server over JSON-RPC with `LspService` — no editor, no stdio.
 
-use java_lsp::engine::SemanticEngine;
+use java_lsp::engine::EngineHandle;
 use java_lsp::index::IndexKind;
 use java_lsp::server::JavaLanguageServer;
 use serde_json::{json, Value};
@@ -57,10 +57,12 @@ async fn initialize(service: &mut LspService<JavaLanguageServer>) -> Value {
 }
 
 /// Holds the JDK environment lock and restores `JAVA_LSP_JDK` on drop, so
-/// scan-driven tests neither race each other nor leak their JDK setting.
+/// scan-driven tests neither race each other nor leak their JDK setting. Also
+/// forces `JAVA_LSP_OFFLINE`, so no test ever fetches dependency sources.
 struct JdkEnv {
     _lock: std::sync::MutexGuard<'static, ()>,
     previous: Option<std::ffi::OsString>,
+    previous_offline: Option<std::ffi::OsString>,
 }
 
 impl JdkEnv {
@@ -73,9 +75,12 @@ impl JdkEnv {
         let lock = java_lsp::jdk::env_lock();
         let previous = std::env::var_os("JAVA_LSP_JDK");
         std::env::set_var("JAVA_LSP_JDK", value);
+        let previous_offline = std::env::var_os("JAVA_LSP_OFFLINE");
+        std::env::set_var("JAVA_LSP_OFFLINE", "1");
         JdkEnv {
             _lock: lock,
             previous,
+            previous_offline,
         }
     }
 }
@@ -85,6 +90,10 @@ impl Drop for JdkEnv {
         match &self.previous {
             Some(value) => std::env::set_var("JAVA_LSP_JDK", value),
             None => std::env::remove_var("JAVA_LSP_JDK"),
+        }
+        match &self.previous_offline {
+            Some(value) => std::env::set_var("JAVA_LSP_OFFLINE", value),
+            None => std::env::remove_var("JAVA_LSP_OFFLINE"),
         }
     }
 }
@@ -128,6 +137,10 @@ async fn initialize_advertises_incremental_sync_and_language_capabilities() {
         .as_array()
         .unwrap()
         .contains(&json!(".")));
+    assert!(capabilities["signatureHelpProvider"]["triggerCharacters"]
+        .as_array()
+        .unwrap()
+        .contains(&json!("(")));
     assert_eq!(capabilities["documentSymbolProvider"], true);
     assert_eq!(capabilities["workspaceSymbolProvider"], true);
     assert_eq!(capabilities["referencesProvider"], true);
@@ -191,7 +204,7 @@ async fn did_open_and_incremental_did_change_update_the_store() {
 }
 
 #[tokio::test]
-async fn stub_engine_answers_queries_empty() {
+async fn queries_on_an_unopened_document_answer_empty() {
     let mut service = service();
     initialize(&mut service).await;
 
@@ -207,7 +220,10 @@ async fn stub_engine_answers_queries_empty() {
     )
     .await
     .expect("hover must respond");
-    assert!(hover.is_null(), "stub hover must be null, got {hover}");
+    assert!(
+        hover.is_null(),
+        "hover on an unopened document must be null, got {hover}"
+    );
 
     let completions = respond(
         &mut service,
@@ -221,7 +237,10 @@ async fn stub_engine_answers_queries_empty() {
     )
     .await
     .expect("completion must respond");
-    assert!(completions.is_null(), "stub completions must be null");
+    assert!(
+        completions.is_null(),
+        "completions on an unopened document must be null"
+    );
 }
 
 #[tokio::test]
@@ -353,6 +372,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
     // Serializes env-var mutation across scan-driven tests.
     let _env = java_lsp::jdk::env_lock();
     std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
     // Fixture project on disk, so the scan has something to find.
     let root = std::env::temp_dir().join(format!(
         "java-lsp-harness-{}-{}",
@@ -435,7 +455,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
                 .any(|e| e.name == "Greet" && e.kind == IndexKind::Class)
     })
     .await;
-    let entries = engine.read().await.indexed_symbols();
+    let entries = engine.indexed_symbols().await;
     assert!(entries.iter().any(|e| e.name == "getName"
         && e.kind == IndexKind::Method
         && e.container == vec!["Greet".to_string()]));
@@ -466,7 +486,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
             .any(|e| e.name == "Renamed" && e.kind == IndexKind::Class)
     })
     .await;
-    let entries = engine.read().await.indexed_symbols();
+    let entries = engine.indexed_symbols().await;
     assert!(!entries.iter().any(|e| e.name == "Sample"), "{entries:?}");
 
     // Closing a file outside the workspace root drops its entries.
@@ -528,6 +548,8 @@ async fn maven_project_roots_and_dependency_jars_feed_the_index() {
     // A fake JDK here would slow the scan; opt out — JDK indexing is covered
     // by its own test.
     std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    // Never fetch dependency sources: the fixture's repository is synthetic.
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
     // Fixture: a two-level Maven project plus a fake local repository
     // containing one dependency whose jar we build by hand.
     let root = temp_dir("maven-fixture");
@@ -684,9 +706,9 @@ package com.example;\n\npublic class App {\n    private Lib lib;\n\n    public S
         .as_array()
         .unwrap()
         .iter()
-        .find(|item| item["label"] == "Lib.getName")
+        .find(|item| item["filterText"] == "getName")
         .expect("dependency method offered");
-    assert_eq!(get_name["insertText"], "getName");
+    assert_eq!(get_name["insertText"], "getName(");
     assert_eq!(get_name["kind"], 2); // CompletionItemKind::METHOD
                                      // Auto-import: the item adds the dependency type's import; with no
                                      // imports in the file it goes right after the package statement
@@ -792,6 +814,232 @@ package com.example;\n\npublic class App {\n    private Lib lib;\n\n    public S
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// A tiny HTTP server over fixed routes, so a sources download can be driven
+/// end to end without touching the real network.
+struct SourceServer {
+    address: std::net::SocketAddr,
+}
+
+impl SourceServer {
+    fn start(routes: std::collections::HashMap<String, Vec<u8>>) -> SourceServer {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let routes = routes.clone();
+                std::thread::spawn(move || {
+                    let Ok(clone) = stream.try_clone() else {
+                        return;
+                    };
+                    let mut stream = stream;
+                    let mut reader = BufReader::new(clone);
+                    let mut request_line = String::new();
+                    if reader.read_line(&mut request_line).is_err() {
+                        return;
+                    }
+                    loop {
+                        let mut line = String::new();
+                        match reader.read_line(&mut line) {
+                            Ok(0) => break,
+                            Ok(_) if line == "\r\n" || line == "\n" => break,
+                            Ok(_) => {}
+                            Err(_) => break,
+                        }
+                    }
+                    let path = request_line.split_whitespace().nth(1).unwrap_or("/");
+                    let response = match routes.get(path) {
+                        Some(body) => {
+                            let mut out = format!(
+                                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                body.len()
+                            )
+                            .into_bytes();
+                            out.extend_from_slice(body);
+                            out
+                        }
+                        None => b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                            .to_vec(),
+                    };
+                    let _ = stream.write_all(&response);
+                    let _ = stream.flush();
+                });
+            }
+        });
+        SourceServer { address }
+    }
+
+    fn base_url(&self) -> String {
+        format!("http://{}", self.address)
+    }
+}
+
+/// The headline path: a dependency's sources are downloaded from a repository,
+/// extracted, indexed, and then reachable by go-to-definition.
+#[tokio::test]
+async fn library_sources_are_fetched_and_definition_reaches_them() {
+    // Serializes env-var mutation across scan-driven tests.
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    // This is the one harness test that must be online: unset the offline
+    // switch and point the fetch at a local server.
+    std::env::remove_var("JAVA_LSP_OFFLINE");
+
+    let root = temp_dir("sources-workspace");
+    let repo = temp_dir("sources-repo");
+    let cache = temp_dir("sources-cache");
+    let write_file = |path: std::path::PathBuf, content: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    };
+    let _maven = EnvVar::set("MAVEN_REPO", &repo);
+    let _cache = EnvVar::set("JAVA_LSP_SOURCES_CACHE", &cache);
+
+    write_file(
+        root.join("pom.xml"),
+        "<project><groupId>demo</groupId><artifactId>root</artifactId><version>1.0</version><packaging>pom</packaging><modules><module>app</module></modules></project>",
+    );
+    write_file(
+        root.join("app").join("pom.xml"),
+        "<project><artifactId>app</artifactId><parent><groupId>demo</groupId><artifactId>root</artifactId><version>1.0</version></parent><dependencies><dependency><groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version></dependency></dependencies></project>",
+    );
+    let app_source = "package com.example;\n\npublic class App {\n    private Lib lib;\n}\n";
+    write_file(
+        root.join("app")
+            .join("src")
+            .join("main")
+            .join("java")
+            .join("com")
+            .join("example")
+            .join("App.java"),
+        app_source,
+    );
+
+    // The dependency's class jar is present locally; only its sources are
+    // missing and must be fetched.
+    let lib_dir = repo.join("com").join("example").join("lib").join("1.0");
+    std::fs::create_dir_all(&lib_dir).unwrap();
+    write_file(
+        lib_dir.join("lib-1.0.pom"),
+        "<project><groupId>com.example</groupId><artifactId>lib</artifactId><version>1.0</version></project>",
+    );
+    let lib_class = test_class_bytes(
+        "com/example/lib/Lib",
+        0x0021,
+        Some("java/lang/Object"),
+        &[],
+        &["getName"],
+    );
+    std::fs::write(
+        lib_dir.join("lib-1.0.jar"),
+        test_stored_zip(&[("com/example/lib/Lib.class", &lib_class)]),
+    )
+    .unwrap();
+
+    // The repository serves the sources jar for the dependency.
+    let lib_source = b"package com.example.lib;\n\npublic class Lib {\n    public String getName() {\n        return null;\n    }\n}\n";
+    let mut routes = std::collections::HashMap::new();
+    routes.insert(
+        "/com/example/lib/1.0/lib-1.0-sources.jar".to_string(),
+        test_stored_zip(&[("com/example/lib/Lib.java", lib_source)]),
+    );
+    let server = SourceServer::start(routes);
+    let _central = EnvVar::set("JAVA_LSP_MAVEN_CENTRAL_URL", server.base_url());
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while socket.next().await.is_some() {}
+    });
+    let root_uri = Url::from_file_path(&root).unwrap();
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": root_uri.as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |entries, _| {
+        entries.iter().any(|e| e.name == "Lib" && e.library_source)
+    })
+    .await;
+
+    // The jar landed in the repository and the source was extracted.
+    let extracted = cache
+        .join("com.example")
+        .join("lib")
+        .join("1.0")
+        .join("com")
+        .join("example")
+        .join("lib")
+        .join("Lib.java");
+    assert!(lib_dir.join("lib-1.0-sources.jar").is_file());
+    assert!(extracted.is_file());
+
+    let app_url = app_uri(&root);
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": app_url,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": app_source,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    // Go-to-definition on `Lib` opens the extracted source.
+    let (line, character) = position_in(app_source, "Lib lib;");
+    let definition = respond(
+        &mut service,
+        Request::build("textDocument/definition")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": app_url },
+                "position": { "line": line, "character": character },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("definition must respond");
+    assert_eq!(
+        definition["uri"],
+        json!(Url::from_file_path(&extracted).unwrap().as_str())
+    );
+
+    // The cache is not a workspace source: workspace symbols stay source-only.
+    let symbols = respond(
+        &mut service,
+        Request::build("workspace/symbol")
+            .id(Id::Number(3))
+            .params(json!({ "query": "Lib" }))
+            .finish(),
+    )
+    .await
+    .expect("workspace/symbol must respond");
+    assert!(
+        symbols.as_array().map_or(true, |items| items.is_empty()),
+        "library sources must not appear in workspace symbols, got {symbols}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&repo);
+    let _ = std::fs::remove_dir_all(&cache);
 }
 
 #[tokio::test]
@@ -963,6 +1211,7 @@ class Main {\n    List names;\n    String greeting;\n}\n",
 async fn inlay_hints_resolve_an_imported_name_shared_across_packages() {
     let _env = java_lsp::jdk::env_lock();
     std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
 
     // Two `List` types in different packages make the simple name ambiguous, so
     // only a resolved import can pin `List.of(3)` down.
@@ -1326,15 +1575,13 @@ fn test_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 async fn wait_for_index(
-    engine: &tokio::sync::RwLock<Box<dyn SemanticEngine>>,
+    engine: &EngineHandle,
     mut pred: impl FnMut(&[java_lsp::index::SymbolEntry], bool) -> bool,
 ) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let guard = engine.read().await;
-        let entries = guard.indexed_symbols();
-        let ready = guard.index_ready();
-        drop(guard);
+        let entries = engine.indexed_symbols().await;
+        let ready = engine.index_ready().await;
         if pred(&entries, ready) {
             return;
         }
@@ -1430,6 +1677,7 @@ async fn hover_and_member_completion_use_the_receiver_type() {
     // machine-JDK indexing (covered by its own test).
     let _env = java_lsp::jdk::env_lock();
     std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
     let root = std::env::temp_dir().join(format!(
         "java-lsp-harness-{}-{}",
         std::process::id(),
@@ -1527,7 +1775,10 @@ async fn hover_and_member_completion_use_the_receiver_type() {
         .iter()
         .filter_map(|item| item["label"].as_str())
         .collect();
-    assert!(labels.contains(&"getSize"), "{labels:?}");
+    assert!(
+        labels.iter().any(|label| label.starts_with("int getSize")),
+        "{labels:?}"
+    );
     assert!(labels.contains(&"size"), "{labels:?}");
 }
 
@@ -1535,6 +1786,7 @@ async fn hover_and_member_completion_use_the_receiver_type() {
 async fn references_and_rename_span_the_workspace() {
     let _env = java_lsp::jdk::env_lock();
     std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
     let root = std::env::temp_dir().join(format!(
         "java-lsp-harness-{}-{}",
         std::process::id(),
@@ -1656,6 +1908,7 @@ async fn completion_offers_keywords_locals_and_workspace_symbols() {
     // machine-JDK indexing (covered by its own test).
     let _env = java_lsp::jdk::env_lock();
     std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
     // Fixture project so the workspace index has symbols to offer.
     let root = std::env::temp_dir().join(format!(
         "java-lsp-harness-{}-{}",
@@ -1854,6 +2107,107 @@ async fn completion_without_workspace_root_still_serves_syntax_sources() {
             .any(|i| i["label"].as_str().is_some_and(|label| label.contains('.'))),
         "no container-prefixed members without a workspace, got {items:?}"
     );
+}
+
+#[tokio::test]
+async fn signature_help_lists_a_callees_overloads() {
+    let mut service = service();
+    initialize(&mut service).await;
+
+    let text = "\
+class Calc {
+    int add(int a) { return a; }
+    int add(int a, int b) { return a + b; }
+    void use() {
+        add(1, 2);
+    }
+}
+";
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": HELLO_URI,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    // The cursor sits at the start of the second argument.
+    let (line, character) = position_in(text, "1, 2");
+    let help = respond(
+        &mut service,
+        Request::build("textDocument/signatureHelp")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": HELLO_URI },
+                "position": { "line": line, "character": character + 3 },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("signatureHelp must respond");
+
+    let signatures = help["signatures"].as_array().unwrap();
+    let labels: Vec<&str> = signatures
+        .iter()
+        .filter_map(|signature| signature["label"].as_str())
+        .collect();
+    assert!(labels.contains(&"int add(int a)"), "{help}");
+    assert!(labels.contains(&"int add(int a, int b)"), "{help}");
+    assert_eq!(signatures[0]["activeParameter"], 1, "{help}");
+}
+
+#[tokio::test]
+async fn definition_respects_the_callees_overloads() {
+    let mut service = service();
+    initialize(&mut service).await;
+
+    let text = "\
+class Calc {
+    int add(int a) { return a; }
+    int add(String s) { return 0; }
+    void use() {
+        add(\"x\");
+    }
+}
+";
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": HELLO_URI,
+                    "languageId": "java",
+                    "version": 1,
+                    "text": text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    // Go-to-definition on `add("x")` selects the `String` overload on line 2,
+    // not the first-declared `int` overload on line 1.
+    let (line, character) = position_in(text, "add(\"x\")");
+    let definition = respond(
+        &mut service,
+        Request::build("textDocument/definition")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": HELLO_URI },
+                "position": { "line": line, "character": character + 1 },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("definition must respond");
+    assert_eq!(definition["range"]["start"]["line"], 2, "{definition}");
 }
 
 /// Line/character of the first occurrence of `needle` (ASCII fixtures only,
@@ -2129,4 +2483,138 @@ async fn shutdown_and_exit_complete_the_lifecycle() {
         after_exit.is_err(),
         "the service must stop being ready after exit, got {after_exit:?}"
     );
+}
+
+/// A workspace fixture for the progress tests: one file, no Maven, no JDK.
+fn progress_fixture(name: &str) -> std::path::PathBuf {
+    let root = temp_dir(name);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Greet.java"),
+        "package demo;\n\npublic class Greet {\n}\n",
+    )
+    .unwrap();
+    root
+}
+
+#[tokio::test]
+async fn warmup_progress_is_reported_when_the_client_supports_it() {
+    use futures::StreamExt;
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
+
+    let root = progress_fixture("progress");
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let root_uri = Url::from_file_path(&root).unwrap();
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({
+                "capabilities": { "window": { "workDoneProgress": true } },
+                "rootUri": root_uri.as_str(),
+            }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    // Collect the server's messages until the progress item has begun and ended.
+    let mut created = false;
+    let mut begin: Option<Value> = None;
+    let mut reports = 0usize;
+    let mut ended = false;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while std::time::Instant::now() < deadline && !(created && begin.is_some() && ended) {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(500), socket.next()).await;
+        let Ok(Some(request)) = next else { continue };
+        match request.method() {
+            "window/workDoneProgress/create" => {
+                assert_eq!(
+                    request.params().map(|params| params["token"].clone()),
+                    Some(json!("java-lsp/warm-up")),
+                    "expected the well-known progress token"
+                );
+                created = true;
+            }
+            "$/progress" => {
+                let params = request.params().cloned().unwrap_or(Value::Null);
+                match params["value"]["kind"].as_str() {
+                    Some("begin") => begin = Some(params["value"].clone()),
+                    Some("report") => reports += 1,
+                    Some("end") => ended = true,
+                    other => panic!("unexpected progress kind: {other:?} ({params})"),
+                }
+            }
+            other => panic!("unexpected server message: {other}"),
+        }
+    }
+
+    assert!(created, "expected a window/workDoneProgress/create request");
+    let begin = begin.expect("expected a $/progress begin");
+    assert_eq!(begin["title"], "java-lsp");
+    assert!(
+        begin["message"]
+            .as_str()
+            .is_some_and(|text| !text.is_empty()),
+        "the begin must name the phase, got {begin}"
+    );
+    assert!(reports >= 1, "expected at least one report update");
+    assert!(ended, "expected a $/progress end");
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+#[tokio::test]
+async fn progress_is_not_sent_without_the_client_capability() {
+    use futures::StreamExt;
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
+
+    let root = progress_fixture("no-progress");
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let root_uri = Url::from_file_path(&root).unwrap();
+    // No `window.workDoneProgress`: progress must be suppressed entirely.
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": root_uri.as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    // Wait for the warm-up to actually finish, so the check is not vacuous.
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |_, ready| ready).await;
+
+    // Then drain for a bounded window: nothing progress-like may appear.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(100), socket.next()).await;
+        if let Ok(Some(request)) = next {
+            assert!(
+                !matches!(
+                    request.method(),
+                    "$/progress" | "window/workDoneProgress/create"
+                ),
+                "progress must not be sent without the capability: {request:?}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
 }

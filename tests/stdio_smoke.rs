@@ -17,6 +17,7 @@ struct Server {
 impl Server {
     fn start() -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_java-lsp"))
+            .env("JAVA_LSP_OFFLINE", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -163,7 +164,7 @@ fn binary_completes_the_lifecycle_over_stdio() {
     );
     assert_eq!(diags["params"]["version"], 2, "{diags}");
 
-    // Queries respond from the stub engine: null result.
+    // Queries on a document that was never opened: null result.
     let hover = server.request(
         2,
         "textDocument/hover",

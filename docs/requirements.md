@@ -26,7 +26,8 @@ All use cases belong to the Java developer.
   language keywords, locals in scope, and symbols from the workspace index.
 - **UC3 — Navigate the workspace.** Jump to declarations via
   go-to-definition backed by the symbol index (declarations, imports, and
-  unambiguous references), and query workspace symbols.
+  unambiguous references) — including into a dependency's fetched sources —
+  and query workspace symbols.
 - **UC4 — See syntax diagnostics.** When a file has parse errors, they are
   reported as diagnostics on open and on edit.
 
@@ -42,9 +43,14 @@ All use cases belong to the Java developer.
 - **`tree-sitter` + `tree-sitter-java`** — syntax layer: incremental parsing
   with error recovery. Alternative considered: a hand-written parser; deferred
   until the pure-Rust semantic work needs a lossless tree.
-- **In-memory workspace index, no storage, no external services.** Deployment:
-  native binaries built with cargo. A second native binary (analysis daemon) is
-  a possible future shape, not built now.
+- **In-memory workspace index, with a disk cache for library sources.** The
+  index itself is in memory and holds no storage; dependency *sources* are
+  fetched from a Maven repository (Maven Central by default) on by default,
+  written into the local Maven repository, and extracted under
+  `$JAVA_LSP_SOURCES_CACHE` (default `~/.cache/java-lsp/sources`).
+  `$JAVA_LSP_OFFLINE` disables all network work. Deployment: native binaries
+  built with cargo. A second native binary (analysis daemon) is a possible
+  future shape, not built now.
 - **Constraints**: no JVM at runtime; performance — especially project
   open → responsive — is a standing general concern (no fixed numeric targets
   were agreed); stdio transport only, so any LSP client works.
@@ -62,6 +68,7 @@ All use cases belong to the Java developer.
 | R7 | Type-aware semantic engine: a pure-Rust type layer resolving declared types, members, and receivers | Functional | medium | v0.3 |
 | R8 | Gradle project model | Functional | low | deferred |
 | R9 | Inlay hints: variable types (including `var` inference), parameter names, and chained-call return types, computed for the requested range | Functional | medium | UC1, R7 |
+| R10 | Dependency sources fetched and indexed; go-to-definition opens library declarations | Functional | medium | UC3 |
 
 ## Milestones
 
@@ -86,13 +93,17 @@ the javac-daemon option was rejected as reintroducing a Java codebase and
 annotation-processor risk) models types, their members, and their hierarchies —
 a source record's components modelled as the accessors a client calls, and
 indexed at the header — and from it hover renders real declarations, completions
-after `.` offer the receiver's members, library types carry real signatures and
+after `.` offer the receiver's members, one item per overload with its full
+signature and a signature-help request that follows the cursor's argument,
+library types carry real signatures and
 inherited members
 (`jvm-member-descriptors`), unresolved type names are reported as conservative
 semantic diagnostics (R7), and find references and rename — R8's first slice,
 `references-and-rename` — work for types, members, and file-local symbols,
-refusing rather than guessing. Overload resolution by argument types stays
-deferred; so does Gradle.
+refusing rather than guessing, and definition and find-references select a
+call's overload from its argument types (arity when the types are
+inconclusive). Full Java overload resolution, lambdas, and casts stay deferred;
+so does Gradle.
 
 **v0.4 — type-aware UX**: the type layer becomes something the developer sees
 while reading, not only on demand. Inlay hints render inferred and declared
@@ -110,6 +121,17 @@ substituted for calls — a method's own type parameters from its arguments and
 the receiver's from its own arguments — so `List.of(5)` renders `List<Integer>`
 and `list.get(0)` its element type
 (`generic-type-argument-inference`).
+
+**v0.5 — library sources**: dependencies stop being opaque. Beyond the class
+files it already indexes, the server fetches each resolved artifact's
+`-sources.jar` from Maven Central (writing it into the local repository and
+extracting it into a cache) and indexes the Java sources, so hover and
+completions carry real signatures and parameter names and **go-to-definition
+opens a library declaration** instead of answering nothing. On by default, with
+`JAVA_LSP_OFFLINE` to opt out; an artifact without published sources or an
+unreachable repository degrades to the class-file behavior (R10; see
+`maven-source-indexing` in the backlog). `references` and `rename` stay
+workspace-only — the cache is never searched or edited.
 
 **Deferred**: Gradle project model support (what remains of R8) stays listed
 here so a later change request can pick it up.

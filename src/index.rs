@@ -14,8 +14,9 @@ use std::sync::{Arc, RwLock};
 use tower_lsp::lsp_types::{Range, Url};
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::engine::syntax::lsp_range;
-use crate::resolve::{resolve_closure, Resolver};
+use crate::analysis::lsp_range;
+use crate::engine::{MessageLevel, Reporter};
+use crate::resolve::{resolve_closure, Artifact, Resolver};
 
 /// What kind of declaration an indexed entry is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -48,6 +49,11 @@ pub struct SymbolEntry {
     /// True for entries from dependency jars: offered in completions, but
     /// filtered out of navigation (jar locations are not openable).
     pub dependency: bool,
+    /// True for dependency entries backed by a real extracted source file in
+    /// the java-lsp cache. `dependency` still marks them library-sourced (so
+    /// completions offer them and rename refuses them), but unlike a class-file
+    /// entry their location *is* openable, so `definition` admits them.
+    pub library_source: bool,
 }
 
 #[derive(Debug, Default)]
@@ -192,18 +198,22 @@ impl WorkspaceIndex {
         }
     }
 
-    /// The workspace's `.java` source files (jar and JDK archive URIs are
-    /// excluded), sorted — the candidate set for a references or rename search,
-    /// requiring no second directory walk.
+    /// The workspace's own `.java` source files, sorted — the candidate set for
+    /// a references or rename search, requiring no second directory walk. Jar and
+    /// JDK archive URIs are excluded, and so are extracted library sources (whose
+    /// entries are all `library_source`): a references search must never read the
+    /// cache and a rename must never rewrite it.
     pub fn source_files(&self) -> Vec<Url> {
         let Ok(state) = self.state.read() else {
             return Vec::new();
         };
         let mut files: Vec<Url> = state
             .files
-            .keys()
-            .filter(|uri| uri.path().ends_with(".java"))
-            .cloned()
+            .iter()
+            .filter(|(uri, entries)| {
+                uri.path().ends_with(".java") && entries.iter().all(|entry| !entry.library_source)
+            })
+            .map(|(uri, _)| uri.clone())
             .collect();
         files.sort();
         files
@@ -341,6 +351,7 @@ fn collect_entries(
                 full_range: lsp_range(text, node),
                 selection_range: lsp_range(text, &target),
                 dependency: false,
+                library_source: false,
             });
         }
         _ => {}
@@ -402,6 +413,7 @@ fn entry(
         full_range: lsp_range(text, node),
         selection_range: lsp_range(text, name),
         dependency: false,
+        library_source: false,
     }
 }
 
@@ -419,11 +431,78 @@ fn import_name(node: &Node, text: &str) -> String {
 /// root when no `pom.xml` exists), resolves each module's dependency closure
 /// against the local repository, and indexes the resolved jars — all off the
 /// request path; flips the warm flag at the end.
+///
+/// The synchronous entry point: everything but the library-source pass. With no
+/// async runtime (tests) this is the whole warm-up.
 pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
+    let _ = scan_workspace_core(root, index, &Reporter::default());
+}
+
+/// What one synchronous warm-up pass produced.
+struct ScanOutcome {
+    /// Resolved dependency coordinates that have a jar.
+    artifacts: Vec<Artifact>,
+    files: usize,
+    jars: usize,
+    jdk_classes: usize,
+}
+
+/// The async warm-up the engine runs on the runtime: the synchronous core off
+/// the blocking pool, then the library-source pass (a no-op when downloads are
+/// disabled), which upgrades the index and the type model in place. Reports
+/// progress through `reporter`.
+pub async fn scan_workspace_async(root: Url, index: WorkspaceIndex, reporter: Reporter) {
+    let core_index = index.clone();
+    let core_reporter = reporter.clone();
+    let outcome = match tokio::task::spawn_blocking(move || {
+        scan_workspace_core(root, core_index, &core_reporter)
+    })
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => {
+            index.set_ready();
+            reporter.end(None);
+            return;
+        }
+    };
+
+    if let Some(text) = offline_notice(outcome.artifacts.len()) {
+        reporter.message(MessageLevel::Info, text);
+    }
+
+    crate::sources::index_sources(index, outcome.artifacts, reporter.clone()).await;
+    reporter.end(Some(format!(
+        "Indexed {} files, {} dependency jars, {} JDK classes",
+        outcome.files, outcome.jars, outcome.jdk_classes
+    )));
+}
+
+/// The notice to show when dependency sources will not be fetched: only when
+/// `JAVA_LSP_OFFLINE` is set *and* the workspace actually resolved a dependency.
+fn offline_notice(artifact_count: usize) -> Option<String> {
+    (crate::sources::offline() && artifact_count > 0).then(|| {
+        "Dependency sources are disabled (JAVA_LSP_OFFLINE is set): \
+         go-to-definition into library code is unavailable."
+            .to_string()
+    })
+}
+
+/// The synchronous core of the warm-up: model, source scan, class-file jars,
+/// and the JDK. Flips `ready` at the same point it always has, and returns the
+/// resolved dependency coordinates that have a jar — the candidates for the
+/// library-source pass.
+fn scan_workspace_core(root: Url, index: WorkspaceIndex, reporter: &Reporter) -> ScanOutcome {
     let start = std::time::Instant::now();
+    reporter.begin("java-lsp", "Indexing workspace");
     let Some(root_path) = root.to_file_path().ok() else {
         index.set_ready();
-        return;
+        return ScanOutcome {
+            artifacts: Vec::new(),
+            files: 0,
+            jars: 0,
+            jdk_classes: 0,
+        };
     };
 
     let mut resolver = Resolver::new(local_repository());
@@ -457,18 +536,26 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
             indexed += 1;
         }
     }
+    reporter.update(format!("Indexed {indexed} source files"), None);
 
     // Dependency jars: resolution is pom-level; a jar present in the local
-    // repository is indexed even when its pom went missing mid-flight.
+    // repository is indexed even when its pom went missing mid-flight. The
+    // resolved coordinates that have a jar are also the candidates for the
+    // library-source pass.
     let mut jars = 0usize;
+    let mut artifacts: Vec<Artifact> = Vec::new();
+    let mut seen_artifacts: std::collections::HashSet<Artifact> = Default::default();
     for module in &model.modules {
         let Some(effective) = &module.effective else {
             continue;
         };
-        for (group, artifact, version) in resolve_closure(effective, &mut resolver) {
-            let jar_path = resolver.jar_path(&group, &artifact, &version);
+        for (group, artifact_id, version) in resolve_closure(effective, &mut resolver) {
+            let jar_path = resolver.jar_path(&group, &artifact_id, &version);
             if !jar_path.is_file() {
                 continue;
+            }
+            if seen_artifacts.insert((group.clone(), artifact_id.clone(), version.clone())) {
+                artifacts.push((group.clone(), artifact_id.clone(), version.clone()));
             }
             if let Some((entries, infos)) = crate::classfile::jar_outputs(&jar_path) {
                 if let Some(jar_uri) = Url::from_file_path(&jar_path).ok() {
@@ -479,6 +566,7 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
             }
         }
     }
+    reporter.update(format!("Indexed {jars} dependency jars"), None);
 
     // The standard library: same treatment as dependency jars (offered in
     // completions, filtered from navigation); a missing JDK is a no-op.
@@ -492,6 +580,7 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
     } else {
         tracing::info!("no usable JDK found; standard library not indexed");
     }
+    reporter.update(format!("Indexed {jdk_classes} JDK classes"), None);
 
     index.set_types(Arc::new(types));
     index.set_ready();
@@ -504,10 +593,16 @@ pub fn scan_workspace(root: Url, index: WorkspaceIndex) {
         elapsed_ms = start.elapsed().as_millis() as u64,
         "workspace index warm-up complete"
     );
+    ScanOutcome {
+        artifacts,
+        files: indexed,
+        jars,
+        jdk_classes,
+    }
 }
 
 /// The local Maven repository: `$MAVEN_REPO` if set, else `~/.m2/repository`.
-fn local_repository() -> PathBuf {
+pub(crate) fn local_repository() -> PathBuf {
     if let Ok(override_path) = std::env::var("MAVEN_REPO") {
         return PathBuf::from(override_path);
     }
@@ -572,6 +667,7 @@ mod tests {
             full_range: Range::new(position, Position::new(line, 1)),
             selection_range: Range::new(position, Position::new(line, 1)),
             dependency: false,
+            library_source: false,
             uri: uri("file:///src/A.java"),
         }
     }
@@ -641,6 +737,40 @@ mod tests {
         index.upsert_file(&java, Vec::new());
         index.upsert_file(&jar, Vec::new());
         assert_eq!(index.source_files(), vec![java]);
+    }
+
+    #[test]
+    fn source_files_excludes_extracted_library_sources() {
+        let index = WorkspaceIndex::new();
+        let workspace = uri("file:///src/Widget.java");
+        index.upsert_file(&workspace, vec![sample_entry("Widget", 0)]);
+
+        // An extracted dependency source is a `.java` file too, but a
+        // references search or a rename must never touch it.
+        let cache = uri("file:///cache/demo/lib/1.0/demo/Thing.java");
+        let mut entry = sample_entry("Thing", 0);
+        entry.uri = cache.clone();
+        entry.dependency = true;
+        entry.library_source = true;
+        index.upsert_file(&cache, vec![entry]);
+
+        assert_eq!(index.source_files(), vec![workspace]);
+    }
+
+    #[test]
+    fn offline_notice_only_when_offline_with_dependencies() {
+        let _env = crate::jdk::env_lock();
+        std::env::remove_var("JAVA_LSP_OFFLINE");
+        assert!(offline_notice(3).is_none());
+
+        std::env::set_var("JAVA_LSP_OFFLINE", "1");
+        assert!(
+            offline_notice(0).is_none(),
+            "nothing to fetch, nothing to say"
+        );
+        let notice = offline_notice(2).expect("a workspace with dependencies is worth a notice");
+        assert!(notice.contains("JAVA_LSP_OFFLINE"), "{notice}");
+        std::env::remove_var("JAVA_LSP_OFFLINE");
     }
 
     #[test]

@@ -1,41 +1,92 @@
 //! The LSP shell: editor-facing handlers that delegate all analysis to the
-//! `SemanticEngine` behind the trait seam.
+//! engine over its command/event boundary ([`crate::engine`]).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, RwLock};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    CompletionOptions, CompletionParams, CompletionResponse, Diagnostic,
-    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
-    DocumentSymbolParams, DocumentSymbolResponse, FoldingRange, FoldingRangeParams,
-    FoldingRangeProviderCapability, GotoDefinitionParams, GotoDefinitionResponse, Hover,
-    HoverParams, HoverProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    InlayHint, InlayHintParams, Location, OneOf, ReferenceParams, RenameParams,
+    notification::Progress, request::WorkDoneProgressCreate, CompletionOptions, CompletionParams,
+    CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
+    FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
+    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
+    InitializeResult, InitializedParams, InlayHint, InlayHintParams, Location, MessageType,
+    NumberOrString, OneOf, ProgressParams, ProgressParamsValue, ReferenceParams, RenameParams,
     SemanticTokenModifier, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
     SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-    WorkDoneProgressOptions, WorkspaceEdit, WorkspaceSymbolParams,
+    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgress,
+    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    WorkDoneProgressOptions, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
 
 use crate::document::DocumentStore;
-use crate::engine::{SemanticEngine, TreeSitterEngine};
+use crate::engine::{self, EngineEvent, EngineHandle, MessageLevel, ProgressUpdate};
+
+/// The single background job's progress token.
+const PROGRESS_TOKEN: &str = "java-lsp/warm-up";
 
 /// The legend for the semantic tokens the engine emits; keep in sync with
-/// `engine::syntax::SEMANTIC_TOKEN_TYPES`.
+/// `analysis::SEMANTIC_TOKEN_TYPES`.
 fn semantic_token_legend() -> SemanticTokensLegend {
     SemanticTokensLegend {
-        token_types: crate::engine::syntax::SEMANTIC_TOKEN_TYPES.to_vec(),
+        token_types: crate::analysis::SEMANTIC_TOKEN_TYPES.to_vec(),
         token_modifiers: Vec::<SemanticTokenModifier>::new(),
     }
 }
 
+/// Asks the client to create the progress item, once. Fire-and-forget: the
+/// response is ignored so a client that never replies cannot block the drain
+/// task, and the request still precedes the first `$/progress` on the same
+/// ordered transport.
+fn create_progress(client: &Client, token: NumberOrString) {
+    let client = client.clone();
+    tokio::spawn(async move {
+        let _ = client
+            .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams { token })
+            .await;
+    });
+}
+
+/// Sends one `$/progress` notification for the background job.
+async fn send_progress(client: &Client, token: NumberOrString, update: ProgressUpdate) {
+    let value = match update {
+        ProgressUpdate::Begin { title, message } => {
+            WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                title,
+                cancellable: Some(false),
+                message: Some(message),
+                percentage: None,
+            })
+        }
+        ProgressUpdate::Update {
+            message,
+            percentage,
+        } => WorkDoneProgress::Report(WorkDoneProgressReport {
+            cancellable: Some(false),
+            message: Some(message),
+            percentage,
+        }),
+        ProgressUpdate::End { message } => WorkDoneProgress::End(WorkDoneProgressEnd { message }),
+    };
+    let _ = client
+        .send_notification::<Progress>(ProgressParams {
+            token,
+            value: ProgressParamsValue::WorkDone(value),
+        })
+        .await;
+}
+
 pub struct JavaLanguageServer {
-    client: Client,
     documents: Arc<RwLock<DocumentStore>>,
-    engine: Arc<RwLock<Box<dyn SemanticEngine>>>,
+    engine: EngineHandle,
     workspace_root: Mutex<Option<Url>>,
+    /// Whether the client advertised `window.workDoneProgress`, read in
+    /// `initialize`; progress and notices are dropped when it is false.
+    progress: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for JavaLanguageServer {
@@ -46,11 +97,52 @@ impl std::fmt::Debug for JavaLanguageServer {
 
 impl JavaLanguageServer {
     pub fn new(client: Client) -> Self {
+        // The engine pushes events; this task turns each into a client
+        // notification. Unbounded, so a slow client can never stall the engine.
+        let progress = Arc::new(AtomicBool::new(false));
+        let (events, mut incoming_events) = mpsc::unbounded_channel();
+        let publishing = client.clone();
+        let supported = progress.clone();
+        tokio::spawn(async move {
+            // One background job at a time, so one progress token.
+            let token = NumberOrString::String(PROGRESS_TOKEN.to_string());
+            let mut created = false;
+            while let Some(event) = incoming_events.recv().await {
+                match event {
+                    EngineEvent::Diagnostics {
+                        uri,
+                        version,
+                        diagnostics,
+                    } => {
+                        publishing
+                            .publish_diagnostics(uri, diagnostics, version)
+                            .await
+                    }
+                    EngineEvent::Progress(update) => {
+                        if !supported.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        if !created {
+                            created = true;
+                            create_progress(&publishing, token.clone());
+                        }
+                        send_progress(&publishing, token.clone(), update).await;
+                    }
+                    EngineEvent::Message { level, text } => {
+                        let kind = match level {
+                            MessageLevel::Info => MessageType::INFO,
+                            MessageLevel::Warning => MessageType::WARNING,
+                        };
+                        publishing.show_message(kind, text).await;
+                    }
+                }
+            }
+        });
         Self {
-            client,
             documents: Arc::new(RwLock::new(DocumentStore::default())),
-            engine: Arc::new(RwLock::new(Box::new(TreeSitterEngine::new()))),
+            engine: engine::spawn(events),
             workspace_root: Mutex::new(None),
+            progress,
         }
     }
 
@@ -59,19 +151,9 @@ impl JavaLanguageServer {
         Arc::clone(&self.documents)
     }
 
-    /// The engine behind the seam, shared with tests (and later, other tasks).
-    pub fn engine(&self) -> Arc<RwLock<Box<dyn SemanticEngine>>> {
-        Arc::clone(&self.engine)
-    }
-
-    async fn publish_engine_diagnostics(&self, uri: Url, version: Option<i32>) {
-        let diagnostics: Vec<Diagnostic> = {
-            let engine = self.engine.read().await;
-            engine.diagnostics(&uri)
-        };
-        self.client
-            .publish_diagnostics(uri, diagnostics, version)
-            .await;
+    /// A handle to the engine task, shared with tests.
+    pub fn engine(&self) -> EngineHandle {
+        self.engine.clone()
     }
 }
 
@@ -79,6 +161,12 @@ impl JavaLanguageServer {
 impl LanguageServer for JavaLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("initializing java-lsp");
+        let progress_supported = params
+            .capabilities
+            .window
+            .and_then(|window| window.work_done_progress)
+            .unwrap_or(false);
+        self.progress.store(progress_supported, Ordering::Relaxed);
         let root = params.root_uri.or_else(|| {
             params
                 .workspace_folders
@@ -101,6 +189,11 @@ impl LanguageServer for JavaLanguageServer {
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string()]),
                     ..CompletionOptions::default()
+                }),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
+                    retrigger_characters: None,
+                    work_done_progress_options: WorkDoneProgressOptions::default(),
                 }),
                 document_symbol_provider: Some(OneOf::Left(true)),
                 workspace_symbol_provider: Some(OneOf::Left(true)),
@@ -132,8 +225,7 @@ impl LanguageServer for JavaLanguageServer {
             .ok()
             .and_then(|slot| slot.clone());
         if let Some(root) = root {
-            let engine = self.engine.read().await;
-            engine.set_workspace_root(&root);
+            self.engine.set_workspace_root(root).await;
         }
     }
 
@@ -151,11 +243,8 @@ impl LanguageServer for JavaLanguageServer {
             let mut docs = self.documents.write().await;
             docs.open(uri.clone(), version, &text);
         }
-        {
-            let engine = self.engine.read().await;
-            engine.open(&uri, &text);
-        }
-        self.publish_engine_diagnostics(uri, Some(version)).await;
+        // Diagnostics follow as an engine event; the shell need not ask.
+        self.engine.open(uri, text, version).await;
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -172,11 +261,7 @@ impl LanguageServer for JavaLanguageServer {
                 .map(|doc| String::from_utf8_lossy(&doc.bytes).into_owned())
         };
         let Some(text) = text else { return };
-        {
-            let engine = self.engine.read().await;
-            engine.change(&uri, &text);
-        }
-        self.publish_engine_diagnostics(uri, Some(version)).await;
+        self.engine.change(uri, text, version).await;
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -186,22 +271,14 @@ impl LanguageServer for JavaLanguageServer {
             let mut docs = self.documents.write().await;
             docs.close(&uri);
         }
-        {
-            let engine = self.engine.read().await;
-            engine.close(&uri);
-        }
-        // The document is gone; clear any published diagnostics.
-        self.client.publish_diagnostics(uri, Vec::new(), None).await;
+        // Closing clears the published diagnostics through the engine event.
+        self.engine.close(uri).await;
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let hover = {
-            let engine = self.engine.read().await;
-            engine.hover(&uri, position)
-        };
-        Ok(hover)
+        Ok(self.engine.hover(uri, position).await)
     }
 
     async fn goto_definition(
@@ -210,31 +287,27 @@ impl LanguageServer for JavaLanguageServer {
     ) -> Result<Option<GotoDefinitionResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let definition = {
-            let engine = self.engine.read().await;
-            engine.definition(&uri, position)
-        };
-        Ok(definition.map(GotoDefinitionResponse::Scalar))
+        Ok(self
+            .engine
+            .definition(uri, position)
+            .await
+            .map(GotoDefinitionResponse::Scalar))
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let completions = {
-            let engine = self.engine.read().await;
-            engine.completions(&uri, position)
-        };
-        Ok(completions)
+        Ok(self.engine.completions(uri, position).await)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
-        let references = {
-            let engine = self.engine.read().await;
-            engine.references(&uri, position, include_declaration)
-        };
+        let references = self
+            .engine
+            .references(uri, position, include_declaration)
+            .await;
         // An empty result is a refusal as much as a "none found": report null
         // rather than claiming the symbol has no occurrences.
         if references.is_empty() {
@@ -247,11 +320,7 @@ impl LanguageServer for JavaLanguageServer {
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        let edit = {
-            let engine = self.engine.read().await;
-            engine.rename(&uri, position, &params.new_name)
-        };
-        Ok(edit)
+        Ok(self.engine.rename(uri, position, params.new_name).await)
     }
 
     async fn document_symbol(
@@ -259,31 +328,23 @@ impl LanguageServer for JavaLanguageServer {
         params: DocumentSymbolParams,
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
-        let symbols = {
-            let engine = self.engine.read().await;
-            engine.document_symbols(&uri)
-        };
-        Ok(symbols.map(DocumentSymbolResponse::Nested))
+        Ok(self
+            .engine
+            .document_symbols(uri)
+            .await
+            .map(DocumentSymbolResponse::Nested))
     }
 
     async fn symbol(
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
-        let symbols = {
-            let engine = self.engine.read().await;
-            engine.workspace_symbols(&params.query)
-        };
-        Ok(Some(symbols))
+        Ok(Some(self.engine.workspace_symbols(params.query).await))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri;
-        let ranges = {
-            let engine = self.engine.read().await;
-            engine.folding_ranges(&uri)
-        };
-        Ok(ranges)
+        Ok(self.engine.folding_ranges(uri).await)
     }
 
     async fn semantic_tokens_full(
@@ -291,20 +352,22 @@ impl LanguageServer for JavaLanguageServer {
         params: SemanticTokensParams,
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
-        let tokens = {
-            let engine = self.engine.read().await;
-            engine.semantic_tokens(&uri)
-        };
-        Ok(tokens.map(SemanticTokensResult::Tokens))
+        Ok(self
+            .engine
+            .semantic_tokens(uri)
+            .await
+            .map(SemanticTokensResult::Tokens))
     }
 
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let range = params.range;
-        let hints = {
-            let engine = self.engine.read().await;
-            engine.inlay_hints(&uri, range)
-        };
-        Ok(Some(hints))
+        Ok(Some(self.engine.inlay_hints(uri, range).await))
+    }
+
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        Ok(self.engine.signature_help(uri, position).await)
     }
 }

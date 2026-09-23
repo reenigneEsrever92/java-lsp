@@ -528,8 +528,27 @@ pub trait TypeLookup {
 
     /// The members of `ty`, including inherited ones. Supertype names resolve
     /// with the subtype's own package as context; cycles are guarded and the
-    /// first declaration of a name wins.
+    /// first declaration of a name wins. Same-named overloads collapse to the
+    /// first — see [`TypeLookup::members_with_overloads`] to keep them apart.
     fn members(&self, ty: &Ty, package: Option<&str>) -> Vec<Member> {
+        let mut out = Vec::new();
+        let mut seen: HashSet<(String, bool)> = HashSet::new();
+        for member in self.members_with_overloads(ty, package) {
+            let is_method = member.kind == IndexKind::Method;
+            if seen.insert((member.name.clone(), is_method)) {
+                out.push(member);
+            }
+        }
+        out
+    }
+
+    /// The members of `ty`, including inherited ones, with same-named overloads
+    /// kept separate. Unlike [`TypeLookup::members`] — which collapses a name to
+    /// a single member for typing — this deduplicates by name, kind, and
+    /// parameter types, so an override still collapses but genuinely distinct
+    /// overloads remain. Supertype resolution and the cycle guard match
+    /// `members`.
+    fn members_with_overloads(&self, ty: &Ty, package: Option<&str>) -> Vec<Member> {
         if matches!(ty, Ty::Array(_)) {
             return Vec::new();
         }
@@ -541,7 +560,7 @@ pub trait TypeLookup {
         let root_name = root.name.clone();
         let root_context = root.package.clone();
         let mut out = Vec::new();
-        let mut seen: HashSet<(String, bool)> = HashSet::new();
+        let mut seen: HashSet<(String, bool, String)> = HashSet::new();
         let mut visited: HashSet<String> = HashSet::new();
         let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
         queue.push_back((root_name, root_context));
@@ -554,7 +573,8 @@ pub trait TypeLookup {
             };
             for member in info.members() {
                 let is_method = member.kind == IndexKind::Method;
-                if seen.insert((member.name.clone(), is_method)) {
+                let key = (member.name.clone(), is_method, params_key(&member.params));
+                if seen.insert(key) {
                     out.push(member.clone());
                 }
             }
@@ -575,6 +595,15 @@ pub trait TypeLookup {
         }
         out
     }
+}
+
+/// A stable key for a member's parameter types, for overload deduplication.
+fn params_key(params: &[Param]) -> String {
+    params
+        .iter()
+        .map(|param| param.ty.display())
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl TypeLookup for TypeModel {
@@ -853,7 +882,7 @@ fn method_type_params(method: &Node, text: &str) -> Vec<String> {
     out
 }
 
-fn parameter_list(method: &Node, text: &str) -> Vec<Param> {
+pub(crate) fn parameter_list(method: &Node, text: &str) -> Vec<Param> {
     let Some(parameters) = method.child_by_field_name("parameters") else {
         return Vec::new();
     };
@@ -1569,6 +1598,243 @@ pub fn member_for_call(
     }
 }
 
+/// True when a value of type `from` is accepted where `to` is expected, by the
+/// conversions Java applies at a call — a conservative approximation covering
+/// identity, primitive widening, boxing/unboxing, `null`, subtyping through the
+/// model's hierarchy, arrays, and generics by erasure. Anything undecidable (an
+/// `Unknown` on either side) is `false`, so an unconfirmable candidate is never
+/// preferred over a determinate one.
+pub fn assignable(from: &Ty, to: &Ty, model: &dyn TypeLookup, package: Option<&str>) -> bool {
+    if from == to {
+        return true;
+    }
+    // A type-variable parameter accepts any argument (its bound is not
+    // modelled).
+    if matches!(to, Ty::Var(_)) {
+        return true;
+    }
+    if from == &Ty::Unknown || to == &Ty::Unknown {
+        return false;
+    }
+    if from == &Ty::Null {
+        return matches!(to, Ty::Ref { .. } | Ty::Array(_) | Ty::Var(_));
+    }
+    match (from, to) {
+        (Ty::Prim(a), Ty::Prim(b)) => widens(*a, *b),
+        (Ty::Prim(a), Ty::Ref { name, .. }) => boxed_name(*a) == simple(name),
+        (Ty::Ref { name, .. }, Ty::Prim(b)) => {
+            unboxed_prim(name).is_some_and(|prim| prim == *b || widens(prim, *b))
+        }
+        (Ty::Ref { .. }, Ty::Ref { .. }) => ref_assignable(from, to, model, package),
+        (Ty::Array(element), Ty::Array(target)) => assignable(element, target, model, package),
+        (Ty::Array(_), Ty::Ref { name, .. }) => {
+            matches!(simple(name), "Object" | "Cloneable" | "Serializable")
+        }
+        _ => false,
+    }
+}
+
+/// A primitive's widening conversions (its own type is handled by equality).
+fn widens(from: Prim, to: Prim) -> bool {
+    use Prim::*;
+    match (from, to) {
+        (Byte, Short | Int | Long | Float | Double) => true,
+        (Short, Int | Long | Float | Double) => true,
+        (Char, Int | Long | Float | Double) => true,
+        (Int, Long | Float | Double) => true,
+        (Long, Float | Double) => true,
+        (Float, Double) => true,
+        _ => false,
+    }
+}
+
+/// The wrapper class a primitive boxes into.
+fn boxed_name(prim: Prim) -> &'static str {
+    match prim {
+        Prim::Boolean => "Boolean",
+        Prim::Byte => "Byte",
+        Prim::Short => "Short",
+        Prim::Int => "Integer",
+        Prim::Long => "Long",
+        Prim::Char => "Character",
+        Prim::Float => "Float",
+        Prim::Double => "Double",
+    }
+}
+
+/// The primitive a wrapper class unboxes to.
+fn unboxed_prim(name: &str) -> Option<Prim> {
+    Some(match simple(name) {
+        "Boolean" => Prim::Boolean,
+        "Byte" => Prim::Byte,
+        "Short" => Prim::Short,
+        "Integer" => Prim::Int,
+        "Long" => Prim::Long,
+        "Character" => Prim::Char,
+        "Float" => Prim::Float,
+        "Double" => Prim::Double,
+        _ => return None,
+    })
+}
+
+/// A type name's simple (last) segment.
+fn simple(name: &str) -> &str {
+    name.rsplit(['.', '$']).next().unwrap_or(name)
+}
+
+/// Reference-to-reference assignability: erasure (same simple name), then the
+/// implicit `Object`, then a subtype walk over the model's hierarchy.
+fn ref_assignable(from: &Ty, to: &Ty, model: &dyn TypeLookup, package: Option<&str>) -> bool {
+    let (
+        Ty::Ref {
+            name: from_name, ..
+        },
+        Ty::Ref { name: to_name, .. },
+    ) = (from, to)
+    else {
+        return false;
+    };
+    let to_simple = simple(to_name);
+    if to_simple == "Object" || simple(from_name) == to_simple {
+        return true;
+    }
+    subtype_of(from, to_simple, model, package)
+}
+
+/// Whether `from` names `target` or a subtype of it, walking the model's
+/// supertypes breadth-first and cycle-guarded.
+fn subtype_of(from: &Ty, target: &str, model: &dyn TypeLookup, package: Option<&str>) -> bool {
+    let Some(root) = model.lookup(from, package) else {
+        return false;
+    };
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
+    queue.push_back((root.name.clone(), root.package.clone()));
+    while let Some((name, context)) = queue.pop_front() {
+        if name == target {
+            return true;
+        }
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = model.find_unique(&name, context.as_deref()) else {
+            continue;
+        };
+        let super_context = info.package.clone().or(context);
+        for supertype in &info.supertypes {
+            if let Some(super_simple) = supertype.simple_name() {
+                if super_simple == target {
+                    return true;
+                }
+            }
+            if supertype.qualified_package().is_some() {
+                if let Some(resolved) = model.lookup(supertype, None) {
+                    queue.push_back((resolved.name.clone(), resolved.package.clone()));
+                }
+            } else if let Some(super_simple) = supertype.simple_name() {
+                queue.push_back((super_simple.to_string(), super_context.clone()));
+            }
+        }
+    }
+    false
+}
+
+/// The overload of `name` a call with these argument types most likely targets:
+/// same-arity candidates first, then those whose parameter types each accept
+/// the argument's type. A single applicable candidate wins; several are narrowed
+/// to the most specific, or refused when ambiguous. When the types are
+/// inconclusive (no candidate applies, e.g. an argument type could not be
+/// inferred) it falls back to the arity-level [`member_for_call`], and thus to
+/// the name-only [`member_of`] when the arity matches nothing either.
+pub fn member_for_arguments(
+    ty: &Ty,
+    name: &str,
+    args: &[Ty],
+    model: &dyn TypeLookup,
+    package: Option<&str>,
+) -> Option<Member> {
+    let mut candidates: Vec<Member> = match model.lookup(ty, package) {
+        Some(info) => info
+            .methods
+            .iter()
+            .filter(|member| member.name == name)
+            .cloned()
+            .collect(),
+        None => Vec::new(),
+    };
+    if candidates.is_empty() {
+        candidates = model
+            .members(ty, package)
+            .into_iter()
+            .filter(|member| member.name == name && member.kind == IndexKind::Method)
+            .collect();
+    }
+    if candidates.is_empty() && inherits_object(ty) {
+        candidates = object_members(model, package, name)
+            .into_iter()
+            .filter(|member| member.kind == IndexKind::Method)
+            .collect();
+    }
+    let arity: Vec<Member> = candidates
+        .into_iter()
+        .filter(|member| member.params.len() == args.len())
+        .collect();
+    if arity.is_empty() {
+        return member_for_call(ty, name, args.len(), model, package);
+    }
+    let applicable: Vec<Member> = arity
+        .iter()
+        .filter(|member| {
+            member
+                .params
+                .iter()
+                .zip(args)
+                .all(|(param, arg)| assignable(arg, &param.ty, model, package))
+        })
+        .cloned()
+        .collect();
+    match applicable.len() {
+        0 => member_for_call(ty, name, args.len(), model, package),
+        1 => applicable.into_iter().next(),
+        _ => most_specific(&applicable, model, package),
+    }
+}
+
+/// The single applicable overload more specific than every other — its
+/// parameters are assignable to each rival's. `None` when two incomparable
+/// overloads tie, or when two share the same parameters.
+fn most_specific(
+    applicable: &[Member],
+    model: &dyn TypeLookup,
+    package: Option<&str>,
+) -> Option<Member> {
+    let mut best: Option<&Member> = None;
+    for candidate in applicable {
+        let more_specific = applicable.iter().all(|other| {
+            candidate.params.len() == other.params.len()
+                && candidate
+                    .params
+                    .iter()
+                    .zip(&other.params)
+                    .all(|(mine, theirs)| assignable(&mine.ty, &theirs.ty, model, package))
+        });
+        if !more_specific {
+            continue;
+        }
+        match best {
+            None => best = Some(candidate),
+            Some(existing)
+                if existing
+                    .params
+                    .iter()
+                    .map(|p| &p.ty)
+                    .eq(candidate.params.iter().map(|p| &p.ty)) => {}
+            Some(_) => return None,
+        }
+    }
+    best.cloned()
+}
+
 /// The argument expressions of a call node, comments excluded.
 fn call_arguments<'a>(node: &Node<'a>) -> Vec<Node<'a>> {
     let Some(arguments) = node.child_by_field_name("arguments") else {
@@ -2111,6 +2377,110 @@ record Point(int x, int y) {
         assert_eq!(
             resolved.member.map(|member| member.kind),
             Some(IndexKind::Field)
+        );
+    }
+
+    #[test]
+    fn assignable_covers_the_common_conversions() {
+        let mut model = TypeModel::new();
+        model.insert(TypeInfo::new("Base".to_string(), None, IndexKind::Class));
+        let mut derived = TypeInfo::new("Derived".to_string(), None, IndexKind::Class);
+        derived.supertypes.push(Ty::reference("Base"));
+        model.insert(derived);
+        let int = Ty::Prim(Prim::Int);
+        let long = Ty::Prim(Prim::Long);
+        assert!(assignable(&int, &long, &model, None), "int widens to long");
+        assert!(
+            !assignable(&long, &int, &model, None),
+            "long does not narrow"
+        );
+        assert!(
+            assignable(&int, &Ty::reference("Integer"), &model, None),
+            "boxing"
+        );
+        assert!(
+            assignable(&Ty::reference("Integer"), &int, &model, None),
+            "unboxing"
+        );
+        assert!(
+            assignable(&Ty::Null, &Ty::reference("Base"), &model, None),
+            "null to reference"
+        );
+        assert!(
+            assignable(
+                &Ty::reference("Derived"),
+                &Ty::reference("Base"),
+                &model,
+                None
+            ),
+            "subtype"
+        );
+        assert!(
+            !assignable(
+                &Ty::reference("Base"),
+                &Ty::reference("Derived"),
+                &model,
+                None
+            ),
+            "supertype is not assignable to subtype"
+        );
+        assert!(
+            !assignable(&Ty::Unknown, &int, &model, None),
+            "an unknown argument type is not confirmed"
+        );
+    }
+
+    #[test]
+    fn member_for_arguments_prefers_the_type_matching_overload() {
+        let mut model = TypeModel::new();
+        let mut calc = TypeInfo::new("Calc".to_string(), None, IndexKind::Class);
+        calc.methods.push(Member {
+            name: "add".to_string(),
+            kind: IndexKind::Method,
+            ty: Ty::Prim(Prim::Int),
+            params: vec![Param::unnamed(Ty::Prim(Prim::Int))],
+            type_params: Vec::new(),
+            is_static: false,
+        });
+        calc.methods.push(Member {
+            name: "add".to_string(),
+            kind: IndexKind::Method,
+            ty: Ty::reference("String"),
+            params: vec![Param::unnamed(Ty::reference("String"))],
+            type_params: Vec::new(),
+            is_static: false,
+        });
+        model.insert(calc);
+        let ty = Ty::reference("Calc");
+
+        let picked = member_for_arguments(&ty, "add", &[Ty::Prim(Prim::Int)], &model, None)
+            .expect("the int overload");
+        assert_eq!(picked.ty, Ty::Prim(Prim::Int));
+        let picked = member_for_arguments(&ty, "add", &[Ty::reference("String")], &model, None)
+            .expect("the String overload");
+        assert_eq!(picked.ty, Ty::reference("String"));
+
+        // An unknown argument type cannot be confirmed, so arity alone decides;
+        // two same-arity overloads disagreeing on return type refuse.
+        assert!(member_for_arguments(&ty, "add", &[Ty::Unknown], &model, None).is_none());
+    }
+
+    #[test]
+    fn members_with_overloads_keeps_overloads_apart() {
+        let text = "\
+class Calc {
+    int add(int a) { return a; }
+    int add(int a, int b) { return a + b; }
+}
+";
+        let model = model_of(text);
+        let ty = Ty::reference("Calc");
+        let overloads = model.members_with_overloads(&ty, None);
+        assert_eq!(overloads.len(), 2, "{overloads:?}");
+        assert_eq!(
+            model.members(&ty, None).len(),
+            1,
+            "members still collapses a name to one member"
         );
     }
 
@@ -2874,6 +3244,7 @@ class C {
             full_range: zero,
             selection_range: zero,
             dependency: true,
+            library_source: false,
         }
     }
 }

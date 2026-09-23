@@ -120,6 +120,7 @@ pub fn class_entries(jar_url: &Url, info: &ClassInfo) -> Vec<SymbolEntry> {
         full_range: zero,
         selection_range: zero,
         dependency: true,
+        library_source: false,
     }];
     for method in &info.methods {
         out.push(SymbolEntry {
@@ -135,6 +136,7 @@ pub fn class_entries(jar_url: &Url, info: &ClassInfo) -> Vec<SymbolEntry> {
             full_range: zero,
             selection_range: zero,
             dependency: true,
+            library_source: false,
         });
     }
     for field in &info.fields {
@@ -151,6 +153,7 @@ pub fn class_entries(jar_url: &Url, info: &ClassInfo) -> Vec<SymbolEntry> {
             full_range: zero,
             selection_range: zero,
             dependency: true,
+            library_source: false,
         });
     }
     out

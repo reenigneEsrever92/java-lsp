@@ -1,8 +1,12 @@
-//! Tree-sitter backed engine: one Java syntax tree per open document, feeding
-//! parse-error diagnostics, document symbols, folding ranges, and semantic
-//! tokens, plus a workspace-wide symbol index ([`WorkspaceIndex`]) warmed by
-//! a background scan and answering go-to-definition and workspace-symbol
-//! queries.
+//! Tree-sitter backed engine core: one Java syntax tree per open document,
+//! feeding parse-error diagnostics, document symbols, folding ranges, and
+//! semantic tokens, plus a workspace-wide symbol index ([`WorkspaceIndex`])
+//! warmed by a background scan and answering go-to-definition and
+//! workspace-symbol queries.
+//!
+//! A concrete, synchronous, `Send + Sync` type: the shell reaches it through
+//! [`crate::engine`], which owns it and exchanges commands and events with the
+//! LSP layer.
 //!
 //! Trees are rebuilt from the full document text on every `open`/`change`.
 //! The engine never reparses other documents, so an edit reparses exactly one
@@ -17,13 +21,15 @@ use tower_lsp::lsp_types::{
     CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic, DiagnosticSeverity,
     DocumentSymbol, FoldingRange, FoldingRangeKind, Hover, HoverContents, InlayHint, InlayHintKind,
     InlayHintLabel, Location, MarkupContent, MarkupKind, Position, Range, SemanticToken,
-    SemanticTokenType, SemanticTokens, SymbolInformation, SymbolKind, TextEdit, Url, WorkspaceEdit,
+    SemanticTokenType, SemanticTokens, SignatureHelp, SignatureInformation, SymbolInformation,
+    SymbolKind, TextEdit, Url, WorkspaceEdit,
 };
 use tree_sitter::{Node, Parser, Tree};
 
-use super::SemanticEngine;
+use crate::engine::Reporter;
 use crate::index::{
-    extract_entries, java_parser, scan_workspace, IndexKind, SymbolEntry, WorkspaceIndex,
+    extract_entries, java_parser, scan_workspace, scan_workspace_async, IndexKind, SymbolEntry,
+    WorkspaceIndex,
 };
 use crate::types::{self, Member, Ty, TypeLookup, TypeModel, TypeQuery};
 
@@ -68,6 +74,9 @@ pub struct TreeSitterEngine {
     documents: Mutex<HashMap<Url, ParsedDocument>>,
     index: WorkspaceIndex,
     workspace_root: Mutex<Option<Url>>,
+    /// Where the background warm-up reports progress; detached (a no-op) until
+    /// the shell installs one.
+    reporter: Mutex<Reporter>,
 }
 
 impl TreeSitterEngine {
@@ -77,6 +86,14 @@ impl TreeSitterEngine {
             documents: Mutex::new(HashMap::new()),
             index: WorkspaceIndex::new(),
             workspace_root: Mutex::new(None),
+            reporter: Mutex::new(Reporter::default()),
+        }
+    }
+
+    /// Installs the reporter the background warm-up reports through.
+    pub fn set_reporter(&self, reporter: Reporter) {
+        if let Ok(mut slot) = self.reporter.lock() {
+            *slot = reporter;
         }
     }
 
@@ -163,7 +180,9 @@ impl TreeSitterEngine {
         let ty = types::receiver_type(&object, text, &scope, &query);
         let mut items = Vec::new();
         let mut seen = HashSet::new();
-        for member in query.members(&ty, scope.package.as_deref()) {
+        // Overloads stay separate: each method is its own item, labelled with its
+        // full signature, so `add(int)` and `add(int, int)` can be told apart.
+        for member in query.members_with_overloads(&ty, scope.package.as_deref()) {
             if static_only && !member.is_static {
                 continue;
             }
@@ -171,20 +190,32 @@ impl TreeSitterEngine {
                 continue;
             }
             let is_method = member.kind == IndexKind::Method;
-            if !seen.insert((member.name.clone(), is_method)) {
-                continue;
+            if is_method {
+                if !seen.insert(member.signature()) {
+                    continue;
+                }
+                items.push(CompletionItem {
+                    label: member.signature(),
+                    kind: Some(CompletionItemKind::METHOD),
+                    filter_text: Some(member.name.clone()),
+                    insert_text: Some(format!("{}(", member.name)),
+                    sort_text: Some(format!("0{}", member.signature())),
+                    ..Default::default()
+                });
+            } else {
+                if !seen.insert(member.name.clone()) {
+                    continue;
+                }
+                items.push(CompletionItem {
+                    label: member.name.clone(),
+                    kind: Some(CompletionItemKind::FIELD),
+                    detail: Some(member.signature()),
+                    filter_text: Some(member.name.clone()),
+                    insert_text: Some(member.name.clone()),
+                    sort_text: Some(format!("0{}", member.name)),
+                    ..Default::default()
+                });
             }
-            items.push(CompletionItem {
-                label: member.name.clone(),
-                kind: Some(if is_method {
-                    CompletionItemKind::METHOD
-                } else {
-                    CompletionItemKind::FIELD
-                }),
-                detail: Some(member.signature()),
-                sort_text: Some(format!("0{}", member.name)),
-                ..Default::default()
-            });
         }
         items
     }
@@ -264,11 +295,14 @@ impl TreeSitterEngine {
                         if let Some(object) = parent.child_by_field_name("object") {
                             let receiver = types::receiver_type(&object, text, &scope, &query);
                             return self.member_target(
+                                uri,
+                                document,
                                 &name,
                                 IndexKind::Field,
                                 &receiver,
                                 &query,
                                 scope.package.as_deref(),
+                                None,
                             );
                         }
                     }
@@ -286,12 +320,16 @@ impl TreeSitterEngine {
                                 .map(Ty::reference)
                                 .unwrap_or(Ty::Unknown),
                         };
+                        let args = call_argument_types(&parent, text, &scope, &query);
                         return self.member_target(
+                            uri,
+                            document,
                             &name,
                             IndexKind::Method,
                             &receiver,
                             &query,
                             scope.package.as_deref(),
+                            Some(&args),
                         );
                     }
                 }
@@ -311,12 +349,20 @@ impl TreeSitterEngine {
                 .clone()
                 .map(Ty::reference)
                 .unwrap_or(Ty::Unknown);
+            // An unqualified call carries its arguments on the enclosing node.
+            let args = node
+                .parent()
+                .filter(|parent| parent.kind() == "method_invocation")
+                .map(|parent| call_argument_types(&parent, text, &scope, &query));
             return self.member_target(
+                uri,
+                document,
                 &name,
                 member.kind,
                 &receiver,
                 &query,
                 scope.package.as_deref(),
+                args.as_deref(),
             );
         }
         local_target(uri, node, &name, text)
@@ -369,18 +415,25 @@ impl TreeSitterEngine {
             local_span: None,
             declarations: vec![entry],
             local_declaration: None,
+            overload: None,
+            overload_declaration: None,
         })
     }
 
     /// A member as a target: the receiver's type must resolve the name to the
-    /// type that declares it, and that type must be a workspace source.
+    /// type that declares it, and that type must be a workspace source. When a
+    /// call's argument types are supplied, they select the overload, and its
+    /// declaration is located for `definition`/`include_declaration`.
     fn member_target(
         &self,
+        uri: &Url,
+        document: &ParsedDocument,
         name: &str,
         kind: IndexKind,
         receiver: &Ty,
         model: &dyn TypeLookup,
         package: Option<&str>,
+        args: Option<&[Ty]>,
     ) -> Option<Target> {
         let owner = types::member_owner(receiver, name, model, package)?;
         // A member of a library type cannot be renamed: refuse.
@@ -399,6 +452,25 @@ impl TreeSitterEngine {
             owner.package.as_deref(),
             &self.index,
         );
+        let mut overload = None;
+        let mut overload_declaration = None;
+        // Narrowing only matters when the name is genuinely overloaded; a lone
+        // declaration keeps the name-based behaviour (and, for a record
+        // component accessor, its bare-name uses).
+        if is_method && declarations.len() > 1 {
+            if let Some(args) = args {
+                if let Some(member) =
+                    types::member_for_arguments(receiver, name, args, model, package)
+                {
+                    let params: Vec<Ty> =
+                        member.params.iter().map(|param| param.ty.clone()).collect();
+                    overload_declaration = self
+                        .match_declaration(&declarations, &params, uri, document)
+                        .map(|(_, location)| location);
+                    overload = Some(params);
+                }
+            }
+        }
         Some(Target {
             name: name.to_string(),
             kind: if is_method {
@@ -411,7 +483,53 @@ impl TreeSitterEngine {
             local_span: None,
             declarations,
             local_declaration: None,
+            overload,
+            overload_declaration,
         })
+    }
+
+    /// The declaration entry that declares exactly `params`, with its location,
+    /// read from the requested document or the entry's file on disk.
+    fn match_declaration(
+        &self,
+        declarations: &[SymbolEntry],
+        params: &[Ty],
+        requested: &Url,
+        requested_doc: &ParsedDocument,
+    ) -> Option<(SymbolEntry, Location)> {
+        declarations.iter().find_map(|entry| {
+            let entry_params = self.entry_method_params(entry, requested, requested_doc)?;
+            (entry_params.as_slice() == params).then(|| {
+                (
+                    entry.clone(),
+                    Location {
+                        uri: entry.uri.clone(),
+                        range: entry.selection_range,
+                    },
+                )
+            })
+        })
+    }
+
+    /// The parameter types the declaration `entry` actually declares, read from
+    /// the requested document when the entry lives in it, else from disk.
+    fn entry_method_params(
+        &self,
+        entry: &SymbolEntry,
+        requested: &Url,
+        requested_doc: &ParsedDocument,
+    ) -> Option<Vec<Ty>> {
+        if entry.uri == *requested {
+            return method_params_in(
+                &requested_doc.tree,
+                &requested_doc.text,
+                entry.selection_range,
+            );
+        }
+        let path = entry.uri.to_file_path().ok()?;
+        let text = std::fs::read_to_string(path).ok()?;
+        let tree = self.parser.lock().ok()?.parse(text.as_bytes(), None)?;
+        method_params_in(&tree, &text, entry.selection_range)
     }
 
     /// Every occurrence of `target` across the workspace sources, with whether
@@ -564,16 +682,16 @@ impl Default for TreeSitterEngine {
     }
 }
 
-impl SemanticEngine for TreeSitterEngine {
-    fn open(&self, uri: &Url, text: &str) {
+impl TreeSitterEngine {
+    pub fn open(&self, uri: &Url, text: &str) {
         self.store_tree(uri, text);
     }
 
-    fn change(&self, uri: &Url, text: &str) {
+    pub fn change(&self, uri: &Url, text: &str) {
         self.store_tree(uri, text);
     }
 
-    fn close(&self, uri: &Url) {
+    pub fn close(&self, uri: &Url) {
         if let Ok(mut documents) = self.documents.lock() {
             documents.remove(uri);
         }
@@ -582,7 +700,7 @@ impl SemanticEngine for TreeSitterEngine {
         }
     }
 
-    fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
+    pub fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
         let Some(documents) = self.documents.lock().ok() else {
             return Vec::new();
         };
@@ -600,7 +718,7 @@ impl SemanticEngine for TreeSitterEngine {
         diagnostics
     }
 
-    fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
+    pub fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
         let documents = self.documents.lock().ok()?;
         let document = documents.get(uri)?;
         let text = &document.text;
@@ -625,7 +743,7 @@ impl SemanticEngine for TreeSitterEngine {
         })
     }
 
-    fn definition(&self, uri: &Url, position: Position) -> Option<Location> {
+    pub fn definition(&self, uri: &Url, position: Position) -> Option<Location> {
         let documents = self.documents.lock().ok()?;
         let document = documents.get(uri)?;
         let text = &document.text;
@@ -659,7 +777,7 @@ impl SemanticEngine for TreeSitterEngine {
                     .index
                     .query_name(simple)
                     .into_iter()
-                    .filter(|entry| !entry.dependency)
+                    .filter(|entry| !entry.dependency || entry.library_source)
                     .filter(|entry| {
                         if is_static {
                             entry.kind != IndexKind::Import
@@ -679,7 +797,7 @@ impl SemanticEngine for TreeSitterEngine {
             .index
             .query_name(word)
             .into_iter()
-            .filter(|entry| !entry.dependency)
+            .filter(|entry| !entry.dependency || entry.library_source)
             .filter(|entry| entry.kind != IndexKind::Import)
             .filter(|entry| match name_constraint(&node) {
                 NameConstraint::Type => is_type_kind(entry.kind),
@@ -689,10 +807,68 @@ impl SemanticEngine for TreeSitterEngine {
                 NameConstraint::Any => true,
             })
             .collect();
+        // A member call: the receiver's declaring type and the call's argument
+        // types select the overload, so `x.add(1)` lands on `add(int)`.
+        if let Some(location) = self.call_definition(uri, document, &node, word) {
+            return Some(location);
+        }
         unique_location(candidates)
     }
 
-    fn references(
+    /// The declaration a member call's receiver and argument types select, or
+    /// `None` when the cursor is not a call or the overload cannot be pinned
+    /// down (the caller then falls back to the name-only lookup).
+    fn call_definition(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        node: &Node,
+        name: &str,
+    ) -> Option<Location> {
+        let text = &document.text;
+        let parent = node.parent()?;
+        if parent.kind() != "method_invocation"
+            || !parent
+                .child_by_field_name("name")
+                .is_some_and(|named| named.id() == node.id())
+        {
+            return None;
+        }
+        let local = local_model(document);
+        let workspace = self.index.type_model();
+        let empty = TypeModel::new();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &local);
+        let scope = types::scope_at(*node, text, &document.tree, &query);
+        let receiver = match parent.child_by_field_name("object") {
+            Some(object) => types::receiver_type(&object, text, &scope, &query),
+            None => scope
+                .enclosing_type
+                .clone()
+                .map(Ty::reference)
+                .unwrap_or(Ty::Unknown),
+        };
+        let owner = types::member_owner(&receiver, name, &query, scope.package.as_deref())?;
+        let args = call_argument_types(&parent, text, &scope, &query);
+        let member =
+            types::member_for_arguments(&receiver, name, &args, &query, scope.package.as_deref())?;
+        let params: Vec<Ty> = member.params.iter().map(|param| param.ty.clone()).collect();
+        let candidates: Vec<SymbolEntry> = self
+            .index
+            .query_name(name)
+            .into_iter()
+            .filter(|entry| !entry.dependency || entry.library_source)
+            .filter(|entry| entry.kind == IndexKind::Method)
+            .filter(|entry| {
+                entry.container.last().map(String::as_str) == Some(owner.name.as_str())
+                    && entry.package == owner.package
+            })
+            .collect();
+        self.match_declaration(&candidates, &params, uri, document)
+            .map(|(_, location)| location)
+    }
+
+    pub fn references(
         &self,
         uri: &Url,
         position: Position,
@@ -715,11 +891,15 @@ impl SemanticEngine for TreeSitterEngine {
         locations
     }
 
-    fn rename(&self, uri: &Url, position: Position, new_name: &str) -> Option<WorkspaceEdit> {
+    pub fn rename(&self, uri: &Url, position: Position, new_name: &str) -> Option<WorkspaceEdit> {
         if !is_valid_identifier(new_name) {
             return None;
         }
-        let (target, text) = self.name_target(uri, position)?;
+        let (mut target, text) = self.name_target(uri, position)?;
+        // Rename stays name-group-wide: it renames every overload of the name,
+        // never a single overload (which could leave a call site behind).
+        target.overload = None;
+        target.overload_declaration = None;
         let (mut locations, complete) = self.collect_occurrences(&target, uri, &text);
         // A destructive edit must not be built from a search that could not read
         // every candidate: refuse rather than silently drop a reference.
@@ -744,7 +924,7 @@ impl SemanticEngine for TreeSitterEngine {
         })
     }
 
-    fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
+    pub fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
         self.index
             .query_prefix(query)
             .into_iter()
@@ -767,7 +947,7 @@ impl SemanticEngine for TreeSitterEngine {
             .collect()
     }
 
-    fn completions(&self, uri: &Url, position: Position) -> Option<CompletionResponse> {
+    pub fn completions(&self, uri: &Url, position: Position) -> Option<CompletionResponse> {
         let documents = self.documents.lock().ok()?;
         let document = documents.get(uri)?;
         let offset = byte_offset(&document.text, position);
@@ -798,6 +978,7 @@ impl SemanticEngine for TreeSitterEngine {
                     (*keyword).to_string(),
                     (*keyword).to_string(),
                     (*keyword).to_string(),
+                    (*keyword).to_string(),
                     CompletionItemKind::KEYWORD,
                     None,
                     format!("0{keyword}"),
@@ -824,6 +1005,7 @@ impl SemanticEngine for TreeSitterEngine {
                     &mut seen,
                     name.name.clone(),
                     name.name.clone(),
+                    name.name.clone(),
                     name.name,
                     name.kind,
                     Some(name.detail),
@@ -844,6 +1026,13 @@ impl SemanticEngine for TreeSitterEngine {
         let imports = collect_imports(&document.tree.root_node(), &document.text);
         let entries = self.index.query_prefix(prefix);
         let ambiguous = ambiguous_names(&entries);
+        // A type model layered with the open buffer, so a method's overloads
+        // reflect unsaved edits.
+        let local = local_model(document);
+        let workspace = self.index.type_model();
+        let empty = TypeModel::new();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &local);
         for entry in entries {
             let Some(kind) = completion_kind(entry.kind) else {
                 continue;
@@ -851,22 +1040,17 @@ impl SemanticEngine for TreeSitterEngine {
             let name = entry.name.clone();
             let sort_text = format!("2{name}");
             let container = entry.container.join(".");
-            let (label, detail) = if matches!(entry.kind, IndexKind::Method | IndexKind::Field) {
-                if container.is_empty() {
-                    (name.clone(), kind_word(entry.kind).to_string())
-                } else {
-                    (
-                        format!("{container}.{name}"),
-                        format!("{} of {container}", kind_word(entry.kind)),
-                    )
-                }
+            let base_detail = if matches!(entry.kind, IndexKind::Method | IndexKind::Field)
+                && !container.is_empty()
+            {
+                format!("{} of {container}", kind_word(entry.kind))
             } else {
-                (name.clone(), kind_word(entry.kind).to_string())
+                kind_word(entry.kind).to_string()
             };
             let detail = if ambiguous.contains(&name) {
                 format!("{} of {}", kind_word(entry.kind), qualified_owner(&entry))
             } else {
-                detail
+                base_detail
             };
             let additional_edits = import_edit(
                 uri,
@@ -876,6 +1060,40 @@ impl SemanticEngine for TreeSitterEngine {
                 &imports,
                 &self.index,
             );
+            // A method's overloads are offered individually, with their real
+            // signatures, when the type model can name the declaring type.
+            if entry.kind == IndexKind::Method {
+                if let Some(overloads) = model_overloads(&query, &entry) {
+                    for member in overloads {
+                        // Same signature + same import is a duplicate; the same
+                        // signature in another package is a different symbol.
+                        let key = match additional_edits.first() {
+                            Some(edit) => format!("{}|{}", member.signature(), edit.new_text),
+                            None => member.signature(),
+                        };
+                        offer(
+                            &mut items,
+                            &mut seen,
+                            key,
+                            member.signature(),
+                            member.name.clone(),
+                            format!("{}(", member.name),
+                            CompletionItemKind::METHOD,
+                            Some(detail.clone()),
+                            format!("2{}", member.signature()),
+                            additional_edits.clone(),
+                        );
+                    }
+                    continue;
+                }
+            }
+            let label = if matches!(entry.kind, IndexKind::Method | IndexKind::Field)
+                && !container.is_empty()
+            {
+                format!("{container}.{name}")
+            } else {
+                name.clone()
+            };
             // Same name + same import is a duplicate; same name with a
             // different import is a different symbol and stays separate.
             let key = match additional_edits.first() {
@@ -887,6 +1105,7 @@ impl SemanticEngine for TreeSitterEngine {
                 &mut seen,
                 key,
                 label,
+                name.clone(),
                 name,
                 kind,
                 Some(detail),
@@ -898,7 +1117,7 @@ impl SemanticEngine for TreeSitterEngine {
         Some(CompletionResponse::Array(items))
     }
 
-    fn document_symbols(&self, uri: &Url) -> Option<Vec<DocumentSymbol>> {
+    pub fn document_symbols(&self, uri: &Url) -> Option<Vec<DocumentSymbol>> {
         let documents = self.documents.lock().ok()?;
         let document = documents.get(uri)?;
         let mut symbols = Vec::new();
@@ -906,7 +1125,7 @@ impl SemanticEngine for TreeSitterEngine {
         Some(symbols)
     }
 
-    fn folding_ranges(&self, uri: &Url) -> Option<Vec<FoldingRange>> {
+    pub fn folding_ranges(&self, uri: &Url) -> Option<Vec<FoldingRange>> {
         let documents = self.documents.lock().ok()?;
         let document = documents.get(uri)?;
         let mut ranges = Vec::new();
@@ -920,7 +1139,7 @@ impl SemanticEngine for TreeSitterEngine {
         Some(ranges)
     }
 
-    fn semantic_tokens(&self, uri: &Url) -> Option<SemanticTokens> {
+    pub fn semantic_tokens(&self, uri: &Url) -> Option<SemanticTokens> {
         let documents = self.documents.lock().ok()?;
         let document = documents.get(uri)?;
         let mut raw = Vec::new();
@@ -953,7 +1172,7 @@ impl SemanticEngine for TreeSitterEngine {
         })
     }
 
-    fn inlay_hints(&self, uri: &Url, range: Range) -> Vec<InlayHint> {
+    pub fn inlay_hints(&self, uri: &Url, range: Range) -> Vec<InlayHint> {
         let Ok(documents) = self.documents.lock() else {
             return Vec::new();
         };
@@ -989,27 +1208,102 @@ impl SemanticEngine for TreeSitterEngine {
         hints
     }
 
-    fn set_workspace_root(&self, root: &Url) {
+    /// Signature help for the call the cursor sits in: the callee's overloads
+    /// rendered with their declared parameters, and the active parameter taken
+    /// from the cursor's position among the arguments. `None` when there is no
+    /// enclosing call or the callee cannot be resolved; constructors are not
+    /// modelled, so `new T(...)` answers nothing.
+    pub fn signature_help(&self, uri: &Url, position: Position) -> Option<SignatureHelp> {
+        let documents = self.documents.lock().ok()?;
+        let document = documents.get(uri)?;
+        let text = &document.text;
+        let offset = byte_offset(text, position);
+        let call = enclosing_call(&document.tree, offset)?;
+        let name_node = call.child_by_field_name("name")?;
+        let name = &text[name_node.byte_range()];
+
+        let local = local_model(document);
+        let workspace = self.index.type_model();
+        let empty = TypeModel::new();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &local);
+        let scope = types::scope_at(name_node, text, &document.tree, &query);
+
+        let (receiver, static_only) = match call.child_by_field_name("object") {
+            Some(object) => {
+                let static_only = matches!(object.kind(), "identifier" | "type_identifier")
+                    && types::resolve_name(&text[object.byte_range()], &scope, &query)
+                        .map(|resolved| resolved.is_type)
+                        .unwrap_or(false);
+                (
+                    types::receiver_type(&object, text, &scope, &query),
+                    static_only,
+                )
+            }
+            None => (
+                scope
+                    .enclosing_type
+                    .clone()
+                    .map(Ty::reference)
+                    .unwrap_or(Ty::Unknown),
+                false,
+            ),
+        };
+
+        let overloads: Vec<Member> = query
+            .members_with_overloads(&receiver, scope.package.as_deref())
+            .into_iter()
+            .filter(|member| member.kind == IndexKind::Method && member.name == name)
+            .filter(|member| !static_only || member.is_static)
+            .collect();
+        if overloads.is_empty() {
+            return None;
+        }
+        let active = active_parameter(call, offset);
+        let signatures = overloads
+            .iter()
+            .map(|member| SignatureInformation {
+                label: member.signature(),
+                documentation: None,
+                parameters: None,
+                active_parameter: Some(active),
+            })
+            .collect();
+        Some(SignatureHelp {
+            signatures,
+            active_signature: Some(0),
+            active_parameter: None,
+        })
+    }
+
+    pub fn set_workspace_root(&self, root: &Url) {
         if let Ok(mut slot) = self.workspace_root.lock() {
             *slot = Some(root.clone());
         }
         let index = self.index.clone();
         let root = root.clone();
-        // Off the request path: spawned onto the blocking pool when a runtime
-        // is available (always true for the shell), inline otherwise.
+        let reporter = self
+            .reporter
+            .lock()
+            .map(|reporter| reporter.clone())
+            .unwrap_or_default();
+        // Off the request path: spawned onto the runtime when one is available
+        // (always true for the shell), inline otherwise. The runtime path also
+        // fetches dependency sources; without a runtime (tests) the sync core
+        // runs and the source pass is skipped.
         match tokio::runtime::Handle::try_current() {
             Ok(handle) => {
-                handle.spawn_blocking(move || scan_workspace(root, index));
+                handle.spawn(scan_workspace_async(root, index, reporter));
             }
             Err(_) => scan_workspace(root, index),
         }
     }
 
-    fn index_ready(&self) -> bool {
+    pub fn index_ready(&self) -> bool {
         self.index.ready()
     }
 
-    fn indexed_symbols(&self) -> Vec<crate::index::SymbolEntry> {
+    pub fn indexed_symbols(&self) -> Vec<crate::index::SymbolEntry> {
         self.index.all_symbols()
     }
 }
@@ -1065,6 +1359,12 @@ struct Target {
     declarations: Vec<SymbolEntry>,
     /// A local's or parameter's own declaration, which the index does not hold.
     local_declaration: Option<Location>,
+    /// For a method, the selected overload's parameter types, so occurrences are
+    /// attributed to the right overload; `None` when the overload could not be
+    /// pinned down or the target is not a method.
+    overload: Option<Vec<Ty>>,
+    /// The selected overload's declaration, when it could be located.
+    overload_declaration: Option<Location>,
 }
 
 /// The workspace type declared with `name` in `package`, or `None` when it is a
@@ -1183,6 +1483,8 @@ fn declaration_target(
                 local_span: None,
                 declarations: vec![entry],
                 local_declaration: None,
+                overload: None,
+                overload_declaration: None,
             })
         }
         "method_declaration" => {
@@ -1191,6 +1493,24 @@ fn declaration_target(
             workspace_type_entry(&owner, package, index)?;
             let declarations =
                 member_declarations(&name, IndexKind::Method, &owner, package, index);
+            // The declaration under the cursor is this specific overload.
+            let range = lsp_range(text, &node);
+            let (overload, overload_declaration) = if declarations.len() > 1 {
+                let params: Vec<Ty> = types::parameter_list(parent, text)
+                    .into_iter()
+                    .map(|param| param.ty)
+                    .collect();
+                let declaration = declarations
+                    .iter()
+                    .find(|entry| entry.selection_range == range)
+                    .map(|entry| Location {
+                        uri: entry.uri.clone(),
+                        range: entry.selection_range,
+                    });
+                (Some(params), declaration)
+            } else {
+                (None, None)
+            };
             Some(Target {
                 name,
                 kind: TargetKind::Method,
@@ -1199,6 +1519,8 @@ fn declaration_target(
                 local_span: None,
                 declarations,
                 local_declaration: None,
+                overload,
+                overload_declaration,
             })
         }
         "variable_declarator" => {
@@ -1218,6 +1540,8 @@ fn declaration_target(
                         local_span: None,
                         declarations,
                         local_declaration: None,
+                        overload: None,
+                        overload_declaration: None,
                     })
                 }
                 "local_variable_declaration" => local_target(uri, node, &name, text),
@@ -1257,6 +1581,8 @@ fn local_target(uri: &Url, node: Node, name: &str, text: &str) -> Option<Target>
         local_span: Some((method.start_byte(), method.end_byte())),
         declarations: Vec::new(),
         local_declaration,
+        overload: None,
+        overload_declaration: None,
     })
 }
 
@@ -1478,6 +1804,73 @@ fn is_member_access_name(node: &Node) -> bool {
     }
 }
 
+/// The inferred types of a method invocation's arguments, comments excluded.
+fn call_argument_types(
+    call: &Node,
+    text: &str,
+    scope: &types::Scope,
+    model: &dyn TypeLookup,
+) -> Vec<Ty> {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .filter(|child| !is_comment_node(child.kind()))
+        .map(|child| types::receiver_type(&child, text, scope, model))
+        .collect()
+}
+
+/// The parameter types of the `method_declaration` whose name sits at
+/// `selection` in `tree`, read from the declaration's own parameter list.
+fn method_params_in(tree: &Tree, text: &str, selection: Range) -> Option<Vec<Ty>> {
+    let offset = byte_offset(text, selection.start);
+    let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "method_declaration" {
+            return Some(
+                types::parameter_list(&candidate, text)
+                    .into_iter()
+                    .map(|param| param.ty)
+                    .collect(),
+            );
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// Whether an occurrence's call arguments accept the selected overload's
+/// parameters. With no overload selected every occurrence qualifies; a method
+/// reference or a bare name has no argument list and does not.
+fn occurrence_matches_overload(
+    node: &Node,
+    text: &str,
+    tree: &Tree,
+    model: &dyn TypeLookup,
+    package: Option<&str>,
+    overload: &Option<Vec<Ty>>,
+) -> bool {
+    let Some(params) = overload else {
+        return true;
+    };
+    let Some(parent) = node.parent() else {
+        return false;
+    };
+    if parent.kind() != "method_invocation" {
+        return false;
+    }
+    let scope = types::scope_at(*node, text, tree, model);
+    let actual = call_argument_types(&parent, text, &scope, model);
+    actual.len() == params.len()
+        && actual
+            .iter()
+            .zip(params)
+            .all(|(arg, param)| types::assignable(arg, param, model, package))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn collect_member_nodes(
     node: &Node,
@@ -1498,9 +1891,12 @@ fn collect_member_nodes(
         let include = if is_member_access_name(node) {
             member_access_matches(node, text, tree, target, model, package)
         } else {
-            // Unqualified uses count only inside the declaring type's own span.
-            owner_span
-                .is_some_and(|(start, end)| node.start_byte() >= start && node.end_byte() <= end)
+            // Unqualified uses count only inside the declaring type's own span,
+            // and only when they are calls that accept the selected overload.
+            occurrence_matches_overload(node, text, tree, model, package, &target.overload)
+                && owner_span.is_some_and(|(start, end)| {
+                    node.start_byte() >= start && node.end_byte() <= end
+                })
         };
         if include {
             push_location(node, text, uri, out, seen);
@@ -1533,7 +1929,9 @@ fn member_access_matches(
     let receiver = types::receiver_type(&object, text, &scope, model);
     match types::member_owner(&receiver, &target.name, model, package) {
         Some(owner) => {
-            owner.package == target.package && Some(owner.name.as_str()) == target.owner.as_deref()
+            owner.package == target.package
+                && Some(owner.name.as_str()) == target.owner.as_deref()
+                && occurrence_matches_overload(node, text, tree, model, package, &target.overload)
         }
         None => false,
     }
@@ -1609,6 +2007,14 @@ fn add_declarations(target: &Target, locations: &mut Vec<Location>) {
     };
     if let Some(location) = &target.local_declaration {
         add(location.clone());
+    }
+    if target.overload.is_some() {
+        // Only the selected overload's declaration, never a sibling's. A rename
+        // clears the overload, so it falls through to every declaration below.
+        if let Some(location) = &target.overload_declaration {
+            add(location.clone());
+        }
+        return;
     }
     for entry in &target.declarations {
         add(Location {
@@ -1850,6 +2256,44 @@ fn node_has_modifier(node: &Node, text: &str, modifier: &str) -> bool {
 }
 
 /// The expression a `.` at `offset` is applied to, if any.
+/// The innermost `method_invocation` whose argument list contains `offset`.
+fn enclosing_call(tree: &Tree, offset: usize) -> Option<Node<'_>> {
+    let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "method_invocation" {
+            if let Some(arguments) = candidate.child_by_field_name("arguments") {
+                if arguments.start_byte() <= offset && offset <= arguments.end_byte() {
+                    return Some(candidate);
+                }
+            }
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// The index of the argument the cursor sits in: the number of argument nodes
+/// ending before the cursor, clamped to the last argument.
+fn active_parameter(call: Node, offset: usize) -> u32 {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return 0;
+    };
+    let mut cursor = arguments.walk();
+    let mut index = 0u32;
+    let mut count = 0u32;
+    for argument in arguments.named_children(&mut cursor) {
+        if is_comment_node(argument.kind()) {
+            continue;
+        }
+        count += 1;
+        if argument.end_byte() <= offset {
+            index += 1;
+        }
+    }
+    index.min(count.saturating_sub(1))
+}
+
 fn receiver_before_dot<'a>(tree: &'a Tree, text: &str, offset: usize) -> Option<Node<'a>> {
     if offset == 0 {
         return None;
@@ -3086,6 +3530,23 @@ fn completion_kind(kind: IndexKind) -> Option<CompletionItemKind> {
     }
 }
 
+/// The declared overloads of a method entry, resolved through the type model by
+/// the entry's owning type. `None` when the model cannot name that type, so the
+/// caller falls back to a single name-only item.
+fn model_overloads(model: &dyn TypeLookup, entry: &SymbolEntry) -> Option<Vec<Member>> {
+    let owner = entry.container.last()?;
+    let info = model
+        .find_in_package(owner, entry.package.as_deref())
+        .or_else(|| model.find_unique(owner, entry.package.as_deref()))?;
+    let overloads: Vec<Member> = info
+        .methods
+        .iter()
+        .filter(|member| member.name == entry.name)
+        .cloned()
+        .collect();
+    (!overloads.is_empty()).then_some(overloads)
+}
+
 /// `IndexKind` → `SymbolKind` for workspace symbols; `Import` entries are not
 /// workspace symbols and contribute nothing (sibling of `completion_kind`).
 fn symbol_kind(kind: IndexKind) -> Option<SymbolKind> {
@@ -3120,6 +3581,7 @@ fn offer(
     seen: &mut HashSet<String>,
     key: String,
     label: String,
+    filter_text: String,
     insert_text: String,
     kind: CompletionItemKind,
     detail: Option<String>,
@@ -3133,7 +3595,7 @@ fn offer(
         label,
         kind: Some(kind),
         detail,
-        filter_text: Some(insert_text.clone()),
+        filter_text: Some(filter_text),
         insert_text: Some(insert_text),
         sort_text: Some(sort_text),
         additional_text_edits: (!additional_edits.is_empty()).then_some(additional_edits),
@@ -3525,6 +3987,53 @@ public class Widget {
     }
 
     #[test]
+    fn definition_reaches_extracted_library_sources() {
+        let text = "class Use {\n    Gson gson;\n}\n";
+        let engine = engine_with(text);
+        let cache_uri = Url::parse(
+            "file:///home/u/.cache/java-lsp/sources/com.google.code.gson/gson/2.10.1/com/google/gson/Gson.java",
+        )
+        .unwrap();
+        let range = Range::new(Position::new(30, 13), Position::new(30, 17));
+        let library_entry = SymbolEntry {
+            uri: cache_uri.clone(),
+            name: "Gson".to_string(),
+            kind: IndexKind::Class,
+            package: Some("com.google.gson".to_string()),
+            container: Vec::new(),
+            full_range: range,
+            selection_range: range,
+            dependency: true,
+            library_source: true,
+        };
+        engine.index.upsert_file(&cache_uri, vec![library_entry]);
+
+        // An extracted source is a location the editor can open.
+        let location =
+            location_at(&engine, text, "Gson gson", 2).expect("a library source must resolve");
+        assert_eq!(location.uri, cache_uri);
+        assert_eq!(location.range, range);
+
+        // A plain class-file entry (no openable source) is still refused.
+        let jar_uri = Url::parse("file:///repo/lib-1.0.jar").unwrap();
+        let jar_entry = SymbolEntry {
+            uri: jar_uri.clone(),
+            name: "JarOnly".to_string(),
+            kind: IndexKind::Class,
+            package: Some("demo".to_string()),
+            container: Vec::new(),
+            full_range: range,
+            selection_range: range,
+            dependency: true,
+            library_source: false,
+        };
+        let jar_text = "class Use {\n    JarOnly x;\n}\n";
+        let jar_engine = engine_with(jar_text);
+        jar_engine.index.upsert_file(&jar_uri, vec![jar_entry]);
+        assert!(location_at(&jar_engine, jar_text, "JarOnly x", 2).is_none());
+    }
+
+    #[test]
     fn definition_resolves_same_file_declarations() {
         let text = "\
 class Widget {
@@ -3620,7 +4129,7 @@ class Use {
     }
 
     #[test]
-    fn definition_collapses_same_uri_overloads_to_the_first() {
+    fn definition_selects_the_overload_matching_the_arguments() {
         let text = "\
 class Calc {
     int add(int a) { return a; }
@@ -3630,7 +4139,57 @@ class Calc {
 ";
         let engine = engine_with(text);
         let location = location_at(&engine, text, "= add", 3).expect("overloads must resolve");
-        assert_eq!(location.range, range_of(text, "add"));
+        // The two-argument call selects the two-argument overload on line 2, not
+        // the first-declared one on line 1.
+        assert_eq!(
+            location.range.start.line, 2,
+            "expected the (int, int) overload: {location:?}"
+        );
+        assert_eq!(
+            location.range.end.character - location.range.start.character,
+            3,
+            "the location names `add`: {location:?}"
+        );
+    }
+
+    #[test]
+    fn references_report_only_the_selected_overloads_calls() {
+        let text = "\
+class Calc {
+    int add(int a) { return a; }
+    int add(String s) { return 0; }
+    void use() {
+        add(1);
+        add(\"x\");
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("add(1)").unwrap() + 1; // inside `add`
+        let references = engine.references(&uri(), lsp_position(text, offset), true);
+        // The `add(int)` declaration (line 1) and its one call (line 4) — never
+        // the `add(String)` declaration or its call.
+        let lines: Vec<u32> = references
+            .iter()
+            .map(|location| location.range.start.line)
+            .collect();
+        assert_eq!(lines, [1, 4], "{references:?}");
+    }
+
+    #[test]
+    fn definition_falls_back_to_arity_when_argument_types_are_unknown() {
+        let text = "\
+class Calc {
+    int add(int a) { return a; }
+    int add(int a, int b) { return a + b; }
+    int total = add(unknown, 2);
+}
+";
+        let engine = engine_with(text);
+        let location = location_at(&engine, text, "= add", 3).expect("arity still decides");
+        // The first argument's type is unknown, so the two-argument overload is
+        // still selected by arity.
+        assert_eq!(location.range.start.line, 2, "{location:?}");
     }
 
     #[test]
@@ -3841,17 +4400,17 @@ class Main {
         assert_eq!(local.detail.as_deref(), Some("local"));
         assert_eq!(local.sort_text.as_deref(), Some("1sum"));
 
-        // The workspace member carries its container as the label but stays
-        // unqualified to type and filter.
+        // The workspace method is offered as its overload(s), labelled with the
+        // signature but still filtered and inserted by its bare name.
         let method = items
             .iter()
-            .find(|i| i.insert_text.as_deref() == Some("sumIt"))
+            .find(|i| i.insert_text.as_deref() == Some("sumIt("))
             .unwrap();
-        assert_eq!(method.label, "summer.sumIt");
+        assert_eq!(method.label, "void sumIt()");
         assert_eq!(method.filter_text.as_deref(), Some("sumIt"));
         assert_eq!(method.kind, Some(CompletionItemKind::METHOD));
         assert_eq!(method.detail.as_deref(), Some("method of summer"));
-        assert_eq!(method.sort_text.as_deref(), Some("2sumIt"));
+        assert_eq!(method.sort_text.as_deref(), Some("2void sumIt()"));
 
         // Types keep their plain name and class kind.
         let class = items
@@ -3981,14 +4540,94 @@ class Use {
             Some(CompletionResponse::Array(items)) => {
                 let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
                 assert!(names.contains(&"size"), "{names:?}");
-                assert!(names.contains(&"run"), "{names:?}");
+                assert!(names.iter().any(|n| n.starts_with("void run")), "{names:?}");
                 assert!(
-                    names.contains(&"inherited"),
+                    names.iter().any(|n| n.starts_with("void inherited")),
                     "inherited member missing: {names:?}"
                 );
             }
             other => panic!("expected member items, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn member_completions_list_each_overload_with_its_signature() {
+        let text = "\
+class Calc {
+    int add(int a) { return a; }
+    int add(int a, int b) { return a + b; }
+}
+class Use {
+    void m() {
+        Calc c = null;
+        c.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("c.\n").unwrap() + "c.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(labels.contains(&"int add(int a)"), "{labels:?}");
+                assert!(labels.contains(&"int add(int a, int b)"), "{labels:?}");
+                let item = items
+                    .iter()
+                    .find(|item| item.label == "int add(int a, int b)")
+                    .unwrap();
+                assert_eq!(item.kind, Some(CompletionItemKind::METHOD));
+                assert_eq!(item.insert_text.as_deref(), Some("add("));
+                assert_eq!(item.filter_text.as_deref(), Some("add"));
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signature_help_lists_overloads_and_tracks_the_active_parameter() {
+        let text = "\
+class Calc {
+    int add(int a) { return a; }
+    int add(int a, int b) { return a + b; }
+    void use() {
+        add(1, 2);
+    }
+}
+";
+        let engine = engine_with(text);
+        // The cursor sits in the second argument.
+        let offset = text.find("1, ").unwrap() + "1, ".len();
+        let help = engine
+            .signature_help(&uri(), lsp_position(text, offset))
+            .expect("signature help for a call");
+        let labels: Vec<&str> = help
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect();
+        assert!(labels.contains(&"int add(int a)"), "{labels:?}");
+        assert!(labels.contains(&"int add(int a, int b)"), "{labels:?}");
+        assert_eq!(
+            help.signatures[0].active_parameter,
+            Some(1),
+            "the cursor is in the second argument"
+        );
+    }
+
+    #[test]
+    fn signature_help_is_none_without_a_resolvable_callee() {
+        let text = "\
+class Use {
+    void m() {
+        unknown(1);
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("unknown(1)").unwrap() + "unknown(".len();
+        assert!(engine
+            .signature_help(&uri(), lsp_position(text, offset))
+            .is_none());
     }
 
     #[test]
@@ -4007,12 +4646,15 @@ class Use {
         match engine.completions(&uri(), lsp_position(text, offset)) {
             Some(CompletionResponse::Array(items)) => {
                 let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
-                assert!(names.contains(&"x"), "{names:?}");
-                assert!(names.contains(&"y"), "{names:?}");
+                assert!(names.contains(&"int x()"), "{names:?}");
+                assert!(names.contains(&"int y()"), "{names:?}");
                 // The component is the accessor `x()`, not a private field.
-                let x = items.iter().find(|item| item.label == "x").expect("x");
+                let x = items
+                    .iter()
+                    .find(|item| item.insert_text.as_deref() == Some("x("))
+                    .expect("x");
                 assert_eq!(x.kind, Some(CompletionItemKind::METHOD));
-                assert_eq!(x.detail.as_deref(), Some("int x()"));
+                assert_eq!(x.label, "int x()");
             }
             other => panic!("expected member items, got {other:?}"),
         }
@@ -4023,7 +4665,7 @@ class Use {
         match engine_with(&narrowed).completions(&uri(), lsp_position(&narrowed, offset)) {
             Some(CompletionResponse::Array(items)) => {
                 let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
-                assert_eq!(names, ["y"], "{names:?}");
+                assert_eq!(names, ["int y()"], "{names:?}");
             }
             other => panic!("expected member items, got {other:?}"),
         }
@@ -4065,7 +4707,10 @@ class Use {
                 Some(CompletionResponse::Array(items)) => {
                     let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
                     assert!(names.contains(&"size"), "{following}: {names:?}");
-                    assert!(names.contains(&"run"), "{following}: {names:?}");
+                    assert!(
+                        names.iter().any(|n| n.starts_with("void run")),
+                        "{following}: {names:?}"
+                    );
                 }
                 other => panic!("expected member items for {following}, got {other:?}"),
             }
@@ -4215,8 +4860,11 @@ class Use {
         match engine.completions(&uri(), lsp_position(text, offset)) {
             Some(CompletionResponse::Array(items)) => {
                 let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
-                assert!(names.contains(&"length"), "{names:?}");
-                assert!(!names.contains(&"toString"), "{names:?}");
+                assert!(
+                    names.iter().any(|n| n.starts_with("int length")),
+                    "{names:?}"
+                );
+                assert!(!names.iter().any(|n| n.contains("toString")), "{names:?}");
             }
             other => panic!("expected member items, got {other:?}"),
         }
@@ -4240,8 +4888,8 @@ class Use {
         match engine.completions(&uri(), lsp_position(text, offset)) {
             Some(CompletionResponse::Array(items)) => {
                 let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
-                assert!(names.contains(&"size"), "{names:?}");
-                assert!(names.contains(&"doubled"), "{names:?}");
+                assert!(names.contains(&"int size()"), "{names:?}");
+                assert!(names.contains(&"int doubled()"), "{names:?}");
             }
             other => panic!("expected member items, got {other:?}"),
         }
@@ -4646,6 +5294,7 @@ class Sample {
             full_range: zero,
             selection_range: zero,
             dependency: true,
+            library_source: false,
         }
     }
 

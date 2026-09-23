@@ -26,3 +26,8 @@ Change requests live here as `<slug>.md`. Each request has a `kind`
 | [type-aware-review-followups](type-aware-review-followups.md) | bug | high | done |
 | [record-members](record-members.md) | bug | high | done |
 | [dot-completion-and-var-inference](dot-completion-and-var-inference.md) | bug | high | done |
+| [maven-source-indexing](maven-source-indexing.md) | feature | high | done |
+| [message-based-engine](message-based-engine.md) | refactor | high | done |
+| [warmup-progress-reporting](warmup-progress-reporting.md) | improvement | medium | done |
+| [overload-completions](overload-completions.md) | feature | high | done |
+| [overload-navigation](overload-navigation.md) | feature | medium | done |
