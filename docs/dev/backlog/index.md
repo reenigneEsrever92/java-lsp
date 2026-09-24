@@ -31,3 +31,4 @@ Change requests live here as `<slug>.md`. Each request has a `kind`
 | [warmup-progress-reporting](warmup-progress-reporting.md) | improvement | medium | done |
 | [overload-completions](overload-completions.md) | feature | high | done |
 | [overload-navigation](overload-navigation.md) | feature | medium | done |
+| [float-literals-and-overload-hints](float-literals-and-overload-hints.md) | bug | high | done |

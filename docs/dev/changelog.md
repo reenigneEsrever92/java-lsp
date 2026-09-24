@@ -12,6 +12,24 @@ named change.
 
 ## 2026-09-23
 
+- **Float literals and parameter hints honour overloads** — a floating literal
+  is now typed by its suffix (`5.0f` is `float`, `5.0` is `double`), so
+  `data.test(5.0f)` selects the `float` (or widening `double`) overload instead
+  of falling back to the first same-arity one; and inlay parameter hints select
+  the callee from the argument types, emitting no hint rather than a wrong name
+  when the overload cannot be pinned down. Verified by
+  `cargo test --all-targets` (213 tests). See
+  [Float literals and parameter hints ignore overload resolution](backlog/float-literals-and-overload-hints.md).
+
+- **Overload-aware completions and signature help** — method completions list
+  each overload of a method as its own item, labelled with the full signature and
+  inserting `name(`, in both `.`-member completion and the workspace-index
+  source; the shell advertises `signatureHelpProvider` and serves
+  `textDocument/signatureHelp` from the type layer, marking the argument the
+  cursor is in as `activeParameter`. Verified by `cargo test --all-targets`
+  (203 tests). See
+  [Overload-aware completions and signature help](backlog/overload-completions.md).
+
 - **Argument-aware overload resolution for navigation** — go-to-definition and
   find-references now select the overload a call targets from its argument types
   (arity when the types are inconclusive): a new `assignable` relation in the

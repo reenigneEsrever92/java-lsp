@@ -2525,19 +2525,24 @@ fn parameter_hints(
             .map(Ty::reference)
             .unwrap_or(Ty::Unknown),
     };
-    // Match the overload by arity, so the names shown belong to the call's
-    // actual shape (`List.of(3)` is `of(E e1)`, not the parameterless overload).
-    let Some(member) = types::member_for_call(
+    // Select the callee from the argument types, so an overloaded method's
+    // names are the ones the call actually targets. A single same-arity
+    // candidate is still used, but an overload the layer cannot pin down (a
+    // type it could not infer among several same-arity candidates) yields no
+    // hint rather than a wrong name.
+    let argument_types: Vec<Ty> = call_arguments
+        .iter()
+        .map(|argument| types::receiver_type(argument, text, &scope, model))
+        .collect();
+    let Some(member) = types::member_for_arguments_confirmed(
         &receiver,
         &text[name.byte_range()],
-        call_arguments.len(),
+        &argument_types,
         model,
         scope.package.as_deref(),
     ) else {
         return;
     };
-    // Only the arity-matched overload's names are trustworthy; a call whose
-    // count matches no overload yields no hint rather than a wrong name.
     if member.params.len() != call_arguments.len() {
         return;
     }
@@ -4193,6 +4198,62 @@ class Calc {
     }
 
     #[test]
+    fn navigation_honors_overloaded_argument_types_for_float_arguments() {
+        let text = "\
+record Data(int number) {
+    void test() {}
+    void test(int count) {}
+    void test(double number) {}
+}
+class Use {
+    void m() {
+        Data data = new Data(1);
+        data.test(5.0f);
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("data.test(5.0f)").unwrap() + 6;
+
+        // Definition lands on the `double` overload (line 3), not `int` (line 2).
+        let location = location_at(&engine, text, "data.test(5.0f)", 6).expect("a target");
+        assert_eq!(
+            location.range.start.line, 3,
+            "expected the double overload: {location:?}"
+        );
+
+        // References report the `double` declaration and its call only.
+        let references = engine.references(&uri(), lsp_position(text, offset), true);
+        let lines: Vec<u32> = references
+            .iter()
+            .map(|location| location.range.start.line)
+            .collect();
+        assert_eq!(lines, [3, 8], "{references:?}");
+
+        // References on the `int` declaration never include the `double` call.
+        let int_decl = lsp_position(text, text.find("test(int count)").unwrap());
+        let int_refs = engine.references(&uri(), int_decl, false);
+        assert!(int_refs.is_empty(), "no (int) calls here: {int_refs:?}");
+
+        // References on the `double` declaration include its one call.
+        let double_decl = lsp_position(text, text.find("test(double number)").unwrap());
+        let double_refs = engine.references(&uri(), double_decl, false);
+        let decl_lines: Vec<u32> = double_refs
+            .iter()
+            .map(|location| location.range.start.line)
+            .collect();
+        assert_eq!(decl_lines, [8], "{double_refs:?}");
+
+        // The parameter hint names the `double` overload's parameter.
+        let hints = hints_in(&engine, full_range(text));
+        let argument = lsp_position(text, text.find("5.0f").unwrap());
+        assert!(
+            hints.contains(&(argument, "number:".to_string())),
+            "expected `number:` on the argument: {hints:?}"
+        );
+    }
+
+    #[test]
     fn definition_of_wildcard_jdk_and_unindexed_names_is_none() {
         let text = "\
 import java.util.*;
@@ -4628,6 +4689,75 @@ class Use {
         assert!(engine
             .signature_help(&uri(), lsp_position(text, offset))
             .is_none());
+    }
+
+    #[test]
+    fn hints_and_navigation_honor_float_and_int_overloads() {
+        let text = "\
+record Data(int number) {
+    void test() {}
+    void test(int count) {}
+    void test(float number) {}
+}
+class Use {
+    void m() {
+        Data data = new Data(1);
+        data.test(5);
+        data.test(5.0f);
+    }
+}
+";
+        let engine = engine_with(text);
+
+        // The float call selects test(float) (line 3); the int call test(int)
+        // (line 2).
+        let float_offset = text.find("data.test(5.0f)").unwrap() + 6;
+        let location = engine
+            .definition(&uri(), lsp_position(text, float_offset))
+            .expect("a target");
+        assert_eq!(location.range.start.line, 3, "{location:?}");
+        let int_offset = text.find("data.test(5)").unwrap() + 6;
+        let location = engine
+            .definition(&uri(), lsp_position(text, int_offset))
+            .expect("a target");
+        assert_eq!(location.range.start.line, 2, "{location:?}");
+
+        // Each hint names its own call's overload parameter.
+        let hints = hints_in(&engine, full_range(text));
+        let float_argument = lsp_position(text, text.find("5.0f").unwrap());
+        assert!(
+            hints.contains(&(float_argument, "number:".to_string())),
+            "{hints:?}"
+        );
+        let int_argument = lsp_position(
+            text,
+            text.find("data.test(5)").unwrap() + "data.test(".len(),
+        );
+        assert!(
+            hints.contains(&(int_argument, "count:".to_string())),
+            "{hints:?}"
+        );
+    }
+
+    #[test]
+    fn parameter_hints_are_withheld_when_the_overload_is_unpinned() {
+        let text = "\
+class Sample {
+    void run(int amount) {}
+    void run(double total) {}
+    void m() {
+        run(unknown);
+    }
+}
+";
+        let engine = engine_with(text);
+        let hints = hints_in(&engine, full_range(text));
+        assert!(
+            !hints
+                .iter()
+                .any(|(_, label)| label == "amount:" || label == "total:"),
+            "no parameter name for an unpinned overload: {hints:?}"
+        );
     }
 
     #[test]

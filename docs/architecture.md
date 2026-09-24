@@ -264,11 +264,14 @@ graph LR
   name is shared across packages still resolves; a call's type arguments are
   inferred from its arguments (a method's own type parameters and the
   receiver's, with primitives boxed) and substituted into the result, while a
-  call the layer cannot pin down keeps the written form; overloads are chosen by
-  arity at a call site and by name alone elsewhere, and an `assignable` relation
-  (identity, primitive widening, boxing/unboxing, `null` to a reference,
-  subtyping through the hierarchy, arrays, erasure) with `member_for_arguments`
-  lets navigation pick the overload a call's argument types select; and the implicit
+  call the layer cannot pin down keeps the written form; a floating literal is
+  `float` when written with an `f`/`F` suffix and `double` otherwise; overloads
+  are chosen by argument types where an `assignable` relation (identity,
+  primitive widening, boxing/unboxing, `null` to a reference, subtyping through
+  the hierarchy, arrays, erasure) decides, by arity when a single candidate
+  shares it, and by name alone elsewhere — `member_for_arguments` for the loose
+  navigation answer and `member_for_arguments_confirmed` for callers that must
+  not name the wrong overload (inlay hints); and the implicit
   `java.lang.Object` is not recorded as a supertype (matching source-extracted
   types), so its members never appear in a `.`-completion listing. They do
   resolve, though, as a fallback when the hierarchy walk finds nothing — so an
@@ -280,7 +283,8 @@ graph LR
   `implements` only, and treats a name the model knows in *any* package as
   resolved, so it under-reports rather than risk a false positive on a name it
   cannot fully reason about. Overload selection by argument types is now
-  available to definition and find-references (see the type layer's
+  available to definition, find-references, completions, and inlay hints (see
+  the type layer's
   `assignable` relation); full Java overload resolution, lambdas, casts, and
   static-import member resolution remain follow-up work (R7 remainder, R8).
 - **Inlay hints** (`analysis.rs`, R9): computed on demand for the range
@@ -297,11 +301,13 @@ graph LR
   enhanced-for binding written `var` shows its iterable's element type the same
   way. Parameter names
   come from the type model: source-declared methods keep them (each `Member`
-  parameter carries a name and a type) and the overload matching the call's
-  arity is chosen, so class-file members — every jar/JDK method
+  parameter carries a name and a type) and the overload is selected from the
+  call's argument types — arity only when a single candidate shares it — so
+  class-file members — every jar/JDK method
   indexed from bytecode — have name-less parameters and therefore produce no
-  parameter hint, and a call whose argument count matches no overload gets no
-  parameter hint rather than the wrong names. Conservative as everywhere: an
+  parameter hint, and a call whose overload cannot be pinned down (its argument
+  types inconclusive among several same-arity candidates, or an argument count
+  matching no overload) gets no parameter hint rather than the wrong names. Conservative as everywhere: an
   unresolved type or callee yields no hint, and only hints whose position lies
   inside the requested range are returned, so a node straddling the range
   boundary cannot leak a hint outside it. No `inlayHint/resolve` and no

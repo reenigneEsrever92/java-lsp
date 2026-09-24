@@ -915,6 +915,18 @@ fn integer_literal_type(node: &Node, text: &str) -> Ty {
     }
 }
 
+/// A floating literal's type: `float` when written with an `f`/`F` suffix, else
+/// `double`. The suffix must not be read as a hex digit, so only the final
+/// character is checked.
+fn floating_literal_type(node: &Node, text: &str) -> Ty {
+    let literal = &text[node.byte_range()];
+    if literal.ends_with('f') || literal.ends_with('F') {
+        Ty::Prim(Prim::Float)
+    } else {
+        Ty::Prim(Prim::Double)
+    }
+}
+
 /// The declared name of a `formal_parameter`/`spread_parameter`. A spread
 /// parameter has no `name` field; its `variable_declarator` carries it.
 fn parameter_name(parameter: &Node, text: &str) -> Option<String> {
@@ -1739,20 +1751,15 @@ fn subtype_of(from: &Ty, target: &str, model: &dyn TypeLookup, package: Option<&
     false
 }
 
-/// The overload of `name` a call with these argument types most likely targets:
-/// same-arity candidates first, then those whose parameter types each accept
-/// the argument's type. A single applicable candidate wins; several are narrowed
-/// to the most specific, or refused when ambiguous. When the types are
-/// inconclusive (no candidate applies, e.g. an argument type could not be
-/// inferred) it falls back to the arity-level [`member_for_call`], and thus to
-/// the name-only [`member_of`] when the arity matches nothing either.
-pub fn member_for_arguments(
+/// The same-named methods of `ty` — its own declarations first, then inherited
+/// ones, then `java.lang.Object`'s — the candidate set a call-site lookup
+/// narrows.
+fn call_candidates(
     ty: &Ty,
     name: &str,
-    args: &[Ty],
     model: &dyn TypeLookup,
     package: Option<&str>,
-) -> Option<Member> {
+) -> Vec<Member> {
     let mut candidates: Vec<Member> = match model.lookup(ty, package) {
         Some(info) => info
             .methods
@@ -1775,12 +1782,28 @@ pub fn member_for_arguments(
             .filter(|member| member.kind == IndexKind::Method)
             .collect();
     }
-    let arity: Vec<Member> = candidates
+    candidates
+}
+
+/// The overload of `name` a call with these argument types selects, but only
+/// when the answer is unambiguous: a single type-applicable candidate, or a
+/// single same-arity candidate. Several same-arity candidates whose argument
+/// types are inconclusive yield `None`, so a caller that must not name the
+/// wrong overload (an inlay hint) can refuse. [`member_for_arguments`] adds the
+/// looser arity fallback for navigation.
+pub fn member_for_arguments_confirmed(
+    ty: &Ty,
+    name: &str,
+    args: &[Ty],
+    model: &dyn TypeLookup,
+    package: Option<&str>,
+) -> Option<Member> {
+    let arity: Vec<Member> = call_candidates(ty, name, model, package)
         .into_iter()
         .filter(|member| member.params.len() == args.len())
         .collect();
     if arity.is_empty() {
-        return member_for_call(ty, name, args.len(), model, package);
+        return None;
     }
     let applicable: Vec<Member> = arity
         .iter()
@@ -1794,10 +1817,27 @@ pub fn member_for_arguments(
         .cloned()
         .collect();
     match applicable.len() {
-        0 => member_for_call(ty, name, args.len(), model, package),
+        0 if arity.len() == 1 => arity.into_iter().next(),
+        0 => None,
         1 => applicable.into_iter().next(),
         _ => most_specific(&applicable, model, package),
     }
+}
+
+/// The overload of `name` a call with these argument types most likely targets:
+/// the confirmed answer, or — when the types are inconclusive — the arity-level
+/// [`member_for_call`] (and thus the name-only [`member_of`] when the arity
+/// matches nothing either). Navigation accepts this looser fallback; hints do
+/// not.
+pub fn member_for_arguments(
+    ty: &Ty,
+    name: &str,
+    args: &[Ty],
+    model: &dyn TypeLookup,
+    package: Option<&str>,
+) -> Option<Member> {
+    member_for_arguments_confirmed(ty, name, args, model, package)
+        .or_else(|| member_for_call(ty, name, args.len(), model, package))
 }
 
 /// The single applicable overload more specific than every other — its
@@ -2143,7 +2183,9 @@ fn receiver_type_unqualified(node: &Node, text: &str, scope: &Scope, model: &dyn
         | "hex_integer_literal"
         | "octal_integer_literal"
         | "binary_integer_literal" => integer_literal_type(node, text),
-        "decimal_floating_point_literal" | "hex_floating_point_literal" => Ty::Prim(Prim::Double),
+        "decimal_floating_point_literal" | "hex_floating_point_literal" => {
+            floating_literal_type(node, text)
+        }
         "character_literal" => Ty::Prim(Prim::Char),
         "true" | "false" => Ty::Prim(Prim::Boolean),
         "null_literal" => Ty::Null,
@@ -2463,6 +2505,54 @@ record Point(int x, int y) {
         // An unknown argument type cannot be confirmed, so arity alone decides;
         // two same-arity overloads disagreeing on return type refuse.
         assert!(member_for_arguments(&ty, "add", &[Ty::Unknown], &model, None).is_none());
+    }
+
+    #[test]
+    fn floating_literals_take_their_suffix_type() {
+        let text = "class Sample { void m() { float a = 2.5f; double b = 3.5; } }";
+        let tree = parse(text);
+        let model = TypeModel::new();
+        let scope = Scope::default();
+        let float_literal = node_in(&tree, text, "2.5f");
+        let double_literal = node_in(&tree, text, "3.5");
+        assert_eq!(
+            receiver_type(&float_literal, text, &scope, &model),
+            Ty::Prim(Prim::Float)
+        );
+        assert_eq!(
+            receiver_type(&double_literal, text, &scope, &model),
+            Ty::Prim(Prim::Double)
+        );
+    }
+
+    #[test]
+    fn confirmed_selection_refuses_an_unpinned_overload() {
+        let mut model = TypeModel::new();
+        let mut calc = TypeInfo::new("Calc".to_string(), None, IndexKind::Class);
+        for param in [Ty::Prim(Prim::Int), Ty::Prim(Prim::Double)] {
+            calc.methods.push(Member {
+                name: "add".to_string(),
+                kind: IndexKind::Method,
+                ty: Ty::Void,
+                params: vec![Param::unnamed(param)],
+                type_params: Vec::new(),
+                is_static: false,
+            });
+        }
+        model.insert(calc);
+        let ty = Ty::reference("Calc");
+
+        // A float widens to double, so `add(double)` is the single answer.
+        let picked =
+            member_for_arguments_confirmed(&ty, "add", &[Ty::Prim(Prim::Float)], &model, None)
+                .expect("float widens to double");
+        assert_eq!(picked.ty, Ty::Void);
+        assert_eq!(picked.params[0].ty, Ty::Prim(Prim::Double));
+
+        // An unknown argument leaves two same-arity candidates inconclusive:
+        // nothing is confirmed, though navigation's looser lookup still guesses.
+        assert!(member_for_arguments_confirmed(&ty, "add", &[Ty::Unknown], &model, None).is_none());
+        assert!(member_for_arguments(&ty, "add", &[Ty::Unknown], &model, None).is_some());
     }
 
     #[test]
