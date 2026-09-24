@@ -39,10 +39,12 @@ declared-type model built during warm-up:
   range the client requests.
 - **Diagnostics** — parse errors from tree-sitter plus type-aware unresolved
   symbols (types, members, identifiers, imports) reported as errors, each with a
-  quick fix: add the missing import, change to a near member, or create a
-  class/interface/method stub. Gated on the model vouching for `java.lang` and
-  the file parsing cleanly, so a missing JDK never becomes a wall of false
-  positives.
+  quick fix: add the missing import, change to a near member, or create the
+  missing symbol — a class/interface/enum/record (with the file scaffolded), a
+  method or field with its signature inferred from the usage (in the enclosing
+  type or a workspace receiver's type), or a local variable. Gated on the model
+  vouching for `java.lang` and the file parsing cleanly, so a missing JDK never
+  becomes a wall of false positives.
 - **Project model** — statically parsed Maven `pom.xml` (multi-module, `<build>`
   overrides), offline dependency resolution from the local repository, and
   indexing of dependency jars, the installed JDK's `java.*`/`javax.*`, and (by

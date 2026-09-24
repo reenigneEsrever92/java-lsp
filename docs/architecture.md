@@ -297,14 +297,22 @@ graph LR
   static-import member resolution remain follow-up work (R7 remainder, R8).
   Each semantic diagnostic carries a `code` (`unresolved-type`,
   `unresolved-member`, `unresolved-symbol`, `unresolved-import`) and `data`
-  (the symbol name and its importable candidates), which the shell's code-action
-  handler turns into a quick fix: one "Add import" per candidate (from
-  `import_edit`), a "Change to `x`" rename for a near member, or a
-  "Create class/interface/method" stub. The create-type fix builds a `CreateFile`
+  (`{ name, fixes: [...] }`), which the shell's code-action handler turns into
+  quick fixes: one "Add import" per candidate (from `import_edit`), a "Change to
+  `x`" rename for a near member, or create-symbol stubs. The create-type fix
+  offers four actions (class / interface / enum / record), each a `CreateFile`
   resource operation plus a `TextDocumentEdit` for a new file under the source
-  root of the file's own package, and is offered only when the client
-  advertises `workspace.workspaceEdit.resourceOperations` including `CreateFile`
-  (read in `initialize` and forwarded to the engine).
+  root of the file's own package, offered only when the client advertises
+  `workspace.workspaceEdit.resourceOperations` including `CreateFile` (read in
+  `initialize` and forwarded to the engine). A created method, field, or local
+  takes its signature from the usage — parameter types from the call's
+  arguments (names from bare identifiers), the return type from the
+  assignment/declaration/`return` context, the local's or field's type from its
+  initializer — falling back to `Object`/`void`. An unresolved member on a
+  *workspace* receiver type offers "Create method/field in `T`", which inserts
+  the stub into `T`'s file (the open buffer, else disk) as an unversioned
+  `changes` edit; a jar/JDK receiver offers nothing, since its source is not the
+  user's to edit.
 - **Inlay hints** (`analysis.rs`, R9): computed on demand for the range
   the client requests — the tree walk is pruned to that range, so cost scales
   with the visible text rather than the file. Three families: variable type

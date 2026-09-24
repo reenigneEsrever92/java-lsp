@@ -33,3 +33,4 @@ Change requests live here as `<slug>.md`. Each request has a `kind`
 | [overload-navigation](overload-navigation.md) | feature | medium | done |
 | [float-literals-and-overload-hints](float-literals-and-overload-hints.md) | bug | high | done |
 | [unresolved-symbol-diagnostics](unresolved-symbol-diagnostics.md) | feature | high | done |
+| [create-stub-quick-fixes](create-stub-quick-fixes.md) | feature | medium | done |

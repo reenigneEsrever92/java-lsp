@@ -755,6 +755,12 @@ impl TreeSitterEngine {
         let Some(document) = documents.get(uri) else {
             return Vec::new();
         };
+        // The type model, for inferring created signatures from the usage.
+        let local = local_model(document);
+        let workspace = self.index.type_model();
+        let empty = TypeModel::new();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &local);
         let mut actions = Vec::new();
         for diagnostic in diagnostics {
             if diagnostic.source.as_deref() != Some("java-lsp") {
@@ -763,18 +769,43 @@ impl TreeSitterEngine {
             let Some(data) = diagnostic.data.as_ref() else {
                 continue;
             };
-            match data.get("fix").and_then(|value| value.as_str()) {
-                Some(FIX_ADD_IMPORT) => {
-                    self.add_import_actions(uri, document, diagnostic, data, &mut actions)
+            let name = data
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            let Some(fixes) = data.get("fixes").and_then(|value| value.as_array()) else {
+                continue;
+            };
+            for fix in fixes {
+                match fix.get("fix").and_then(|value| value.as_str()) {
+                    Some(FIX_ADD_IMPORT) => {
+                        self.add_import_actions(uri, document, diagnostic, fix, &mut actions)
+                    }
+                    Some(FIX_RENAME) => {
+                        self.rename_member_action(uri, diagnostic, fix, &mut actions)
+                    }
+                    Some(FIX_CREATE_TYPE) => {
+                        self.create_type_actions(uri, document, diagnostic, name, &mut actions)
+                    }
+                    Some(FIX_CREATE_SYMBOL) => self.create_symbol_actions(
+                        uri,
+                        document,
+                        diagnostic,
+                        name,
+                        &query,
+                        &mut actions,
+                    ),
+                    Some(FIX_CREATE_RECEIVER_MEMBER) => self.create_receiver_member_action(
+                        uri,
+                        document,
+                        diagnostic,
+                        name,
+                        fix,
+                        &query,
+                        &mut actions,
+                    ),
+                    _ => {}
                 }
-                Some(FIX_RENAME) => self.rename_member_action(uri, diagnostic, data, &mut actions),
-                Some(FIX_CREATE_TYPE) => {
-                    self.create_type_action(uri, document, diagnostic, data, &mut actions)
-                }
-                Some(FIX_CREATE_MEMBER) => {
-                    self.create_member_action(uri, document, diagnostic, data, &mut actions)
-                }
-                _ => {}
             }
         }
         actions
@@ -862,112 +893,229 @@ impl TreeSitterEngine {
         });
     }
 
-    /// A "Create class/interface `X`" action that adds a new file under the
-    /// source root of the file's own package. Only offered when the client
-    /// supports the `CreateFile` resource operation.
-    fn create_type_action(
+    /// Four "Create class/interface/enum/record `name`" actions, each writing a
+    /// stub file under the source root of the file's own package. Only offered
+    /// when the client supports the `CreateFile` resource operation.
+    fn create_type_actions(
         &self,
         uri: &Url,
         document: &ParsedDocument,
         diagnostic: &Diagnostic,
-        data: &serde_json::Value,
+        name: &str,
         actions: &mut Vec<CodeAction>,
     ) {
-        if !self.resource_operations.load(Ordering::Relaxed) {
+        if !self.resource_operations.load(Ordering::Relaxed) || !is_java_identifier(name) {
             return;
         }
-        let Some(name) = data.get("name").and_then(|value| value.as_str()) else {
-            return;
-        };
-        if !is_java_identifier(name) {
-            return;
-        }
-        let kind = data
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .unwrap_or("class");
         let package = types::file_package(&document.tree, &document.text);
         let Some(new_file) = self.new_type_file_uri(uri, package.as_deref(), name) else {
             return;
         };
-        let contents = stub_type_source(package.as_deref(), kind, name);
-        let operations = vec![
-            DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
-                uri: new_file.clone(),
-                options: Some(CreateFileOptions {
-                    overwrite: None,
-                    ignore_if_exists: Some(true),
-                }),
-                annotation_id: None,
-            })),
-            DocumentChangeOperation::Edit(TextDocumentEdit {
-                text_document: OptionalVersionedTextDocumentIdentifier {
+        for kind in ["class", "interface", "enum", "record"] {
+            let contents = stub_type_source(package.as_deref(), kind, name);
+            let operations = vec![
+                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
                     uri: new_file.clone(),
-                    version: None,
-                },
-                edits: vec![OneOf::Left(TextEdit {
-                    range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                    new_text: contents,
-                })],
-            }),
-        ];
-        actions.push(CodeAction {
-            title: format!("Create {kind} `{name}`"),
-            kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: Some(vec![diagnostic.clone()]),
-            edit: Some(WorkspaceEdit {
-                changes: None,
-                document_changes: Some(DocumentChanges::Operations(operations)),
-                change_annotations: None,
-            }),
-            is_preferred: Some(true),
-            ..CodeAction::default()
-        });
+                    options: Some(CreateFileOptions {
+                        overwrite: None,
+                        ignore_if_exists: Some(true),
+                    }),
+                    annotation_id: None,
+                })),
+                DocumentChangeOperation::Edit(TextDocumentEdit {
+                    text_document: OptionalVersionedTextDocumentIdentifier {
+                        uri: new_file.clone(),
+                        version: None,
+                    },
+                    edits: vec![OneOf::Left(TextEdit {
+                        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                        new_text: contents,
+                    })],
+                }),
+            ];
+            actions.push(CodeAction {
+                title: format!("Create {kind} `{name}`"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(WorkspaceEdit {
+                    changes: None,
+                    document_changes: Some(DocumentChanges::Operations(operations)),
+                    change_annotations: None,
+                }),
+                is_preferred: Some(kind == "class"),
+                ..CodeAction::default()
+            });
+        }
     }
 
-    /// A "Create method/field" action that inserts a stub into the enclosing
-    /// type declaration in the open file.
-    fn create_member_action(
+    /// Create-stub actions for a bare identifier: a method when it is called
+    /// unqualified, else a local variable (preferred) and a field, with the
+    /// signature inferred from the usage.
+    fn create_symbol_actions(
         &self,
         uri: &Url,
         document: &ParsedDocument,
         diagnostic: &Diagnostic,
-        data: &serde_json::Value,
+        name: &str,
+        model: &dyn TypeLookup,
         actions: &mut Vec<CodeAction>,
     ) {
-        let Some(name) = data.get("name").and_then(|value| value.as_str()) else {
+        if !is_java_identifier(name) {
+            return;
+        }
+        let Some(node) = node_at(&document.tree, &document.text, diagnostic.range) else {
+            return;
+        };
+        let text = &document.text;
+        let scope = types::scope_at(node, text, &document.tree, model);
+        // An unqualified call name becomes a method on the enclosing type.
+        let call = node.parent().filter(|parent| {
+            parent.kind() == "method_invocation"
+                && parent.child_by_field_name("object").is_none()
+                && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|named| named.id() == node.id())
+        });
+        if let Some(call) = call {
+            let Some(body) = enclosing_type_body(&document.tree, node.start_byte()) else {
+                return;
+            };
+            let params = parameter_list(call, text, &scope, model);
+            let ret = return_type(call, text, &scope, model);
+            let stub = format!(
+                "    public {ret} {name}({}) {{\n    }}\n",
+                params.join(", ")
+            );
+            push_body_insert(
+                uri,
+                text,
+                diagnostic,
+                body,
+                stub,
+                format!("Create method `{name}`"),
+                actions,
+            );
+            return;
+        }
+        // A value use becomes a local variable (preferred) and a field.
+        let ty = value_type(node, text, &scope, model);
+        if let Some(block) = enclosing_block(node).filter(|_| enclosing_method(node).is_some()) {
+            let position = lsp_position(text, block.start_byte() + 1);
+            let edit = TextEdit {
+                range: Range::new(position, position),
+                new_text: format!("\n    {ty} {name};"),
+            };
+            actions.push(CodeAction {
+                title: format!("Create local variable `{name}`"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(workspace_edit_changes(uri, vec![edit])),
+                is_preferred: Some(true),
+                ..CodeAction::default()
+            });
+        }
+        if let Some(body) = enclosing_type_body(&document.tree, node.start_byte()) {
+            push_body_insert(
+                uri,
+                text,
+                diagnostic,
+                body,
+                format!("    private {ty} {name};\n"),
+                format!("Create field `{name}`"),
+                actions,
+            );
+        }
+    }
+
+    /// A "Create method/field `name` in `T`" action for an unresolved member on
+    /// a workspace receiver: the stub is inserted into `T`'s file (the open
+    /// buffer when it is the current document, else read from disk) with the
+    /// signature inferred from the call site.
+    #[allow(clippy::too_many_arguments)]
+    fn create_receiver_member_action(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        diagnostic: &Diagnostic,
+        name: &str,
+        fix: &serde_json::Value,
+        model: &dyn TypeLookup,
+        actions: &mut Vec<CodeAction>,
+    ) {
+        let Some(owner) = fix.get("owner").and_then(|value| value.as_str()) else {
             return;
         };
         if !is_java_identifier(name) {
             return;
         }
-        let kind = data
+        let kind = fix
             .get("kind")
             .and_then(|value| value.as_str())
-            .unwrap_or("field");
-        let offset = byte_offset(&document.text, diagnostic.range.start);
-        let Some(body) = enclosing_type_body(&document.tree, offset) else {
+            .unwrap_or("method");
+        let simple = owner.rsplit('.').next().unwrap_or(owner);
+        let Some(entry) = self
+            .index
+            .query_name(simple)
+            .into_iter()
+            .find(|entry| !entry.dependency && import_target(entry).as_deref() == Some(owner))
+        else {
             return;
         };
-        // Insert whole lines before the type body's closing brace.
-        let close = lsp_position(&document.text, body.end_byte().saturating_sub(1));
+        let owner_uri = entry.uri.clone();
+        let owner_text = if &owner_uri == uri {
+            document.text.clone()
+        } else {
+            match owner_uri
+                .to_file_path()
+                .ok()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+            {
+                Some(text) => text,
+                None => return,
+            }
+        };
+        // A fresh parser, so the shared parser lock is never taken while the
+        // documents lock is held (which would risk a lock-order deadlock).
+        let mut parser = java_parser();
+        let Some(tree) = parser.parse(owner_text.as_bytes(), None) else {
+            return;
+        };
+        let Some(body) = type_body_by_name(&tree, &owner_text, simple) else {
+            return;
+        };
+        // The signature comes from the call site in the current buffer.
+        let Some(node) = node_at(&document.tree, &document.text, diagnostic.range) else {
+            return;
+        };
+        let call_scope = types::scope_at(node, &document.text, &document.tree, model);
         let stub = if kind == "method" {
-            format!("    public void {name}() {{\n    }}\n")
+            let call = node
+                .parent()
+                .filter(|parent| parent.kind() == "method_invocation");
+            let params = call
+                .map(|call| parameter_list(call, &document.text, &call_scope, model))
+                .unwrap_or_default();
+            let ret = call
+                .map(|call| return_type(call, &document.text, &call_scope, model))
+                .unwrap_or_else(|| "void".to_string());
+            format!(
+                "    public {ret} {name}({}) {{\n    }}\n",
+                params.join(", ")
+            )
         } else {
             format!("    private Object {name};\n")
         };
+        let close = lsp_position(&owner_text, body.end_byte().saturating_sub(1));
         let edit = TextEdit {
             range: Range::new(Position::new(close.line, 0), Position::new(close.line, 0)),
             new_text: stub,
         };
         actions.push(CodeAction {
-            title: format!(
-                "Create {} `{name}`",
-                if kind == "method" { "method" } else { "field" }
-            ),
+            title: format!("Create {kind} `{name}` in `{simple}`"),
             kind: Some(CodeActionKind::QUICKFIX),
             diagnostics: Some(vec![diagnostic.clone()]),
-            edit: Some(workspace_edit_changes(uri, vec![edit])),
+            edit: Some(workspace_edit_changes(&owner_uri, vec![edit])),
+            is_preferred: Some(true),
             ..CodeAction::default()
         });
     }
@@ -2918,7 +3066,8 @@ const CODE_UNRESOLVED_IMPORT: &str = "unresolved-import";
 const FIX_ADD_IMPORT: &str = "add-import";
 const FIX_RENAME: &str = "rename";
 const FIX_CREATE_TYPE: &str = "create-type";
-const FIX_CREATE_MEMBER: &str = "create-member";
+const FIX_CREATE_SYMBOL: &str = "create-symbol";
+const FIX_CREATE_RECEIVER_MEMBER: &str = "create-receiver-member";
 
 /// Whether semantic diagnostics are enabled, from `JAVA_LSP_SEMANTIC_DIAGNOSTICS`:
 /// unset (or any value but `0`/`false`) keeps them on.
@@ -3075,25 +3224,24 @@ impl<'a> SemanticCheck<'a> {
         if self.type_visible(name, &scope) {
             return;
         }
-        if self.type_candidates(name).is_empty() {
-            let data = json!({ "fix": FIX_CREATE_TYPE, "name": name, "kind": "class" });
-            self.push(
-                name_node,
-                CODE_UNRESOLVED_TYPE,
-                format!("cannot resolve type `{name}`"),
-                data,
-            );
+        let candidates = self.type_candidates(name);
+        let fixes = if candidates.is_empty() {
+            json!([{ "fix": FIX_CREATE_TYPE }])
         } else {
-            let candidates = self.type_candidates(name);
             let importable = self.importable(&candidates);
-            let data = json!({ "fix": FIX_ADD_IMPORT, "name": name, "candidates": importable });
-            self.push(
-                name_node,
-                CODE_UNRESOLVED_TYPE,
-                format!("cannot resolve type `{name}`"),
-                data,
-            );
-        }
+            if importable.is_empty() {
+                json!([])
+            } else {
+                json!([{ "fix": FIX_ADD_IMPORT, "candidates": importable }])
+            }
+        };
+        let data = json!({ "name": name, "fixes": fixes });
+        self.push(
+            name_node,
+            CODE_UNRESOLVED_TYPE,
+            format!("cannot resolve type `{name}`"),
+            data,
+        );
     }
 
     /// Whether a simple type name is visible here: declared in the file's
@@ -3215,18 +3363,40 @@ impl<'a> SemanticCheck<'a> {
             .collect();
         names.sort();
         names.dedup();
-        let data = match nearest_name(name, &names) {
-            Some(replacement) => {
-                json!({ "fix": FIX_RENAME, "name": name, "replacement": replacement })
-            }
-            None => json!({ "fix": "" }),
-        };
+        let mut fixes: Vec<serde_json::Value> = Vec::new();
+        if let Some(replacement) = nearest_name(name, &names) {
+            fixes.push(json!({ "fix": FIX_RENAME, "replacement": replacement }));
+        }
+        if let Some(owner) = self.workspace_owner(&receiver, package) {
+            fixes.push(json!({
+                "fix": FIX_CREATE_RECEIVER_MEMBER,
+                "owner": owner,
+                "kind": if is_call { "method" } else { "field" },
+            }));
+        }
+        let data = json!({ "name": name, "fixes": fixes });
         self.push(
             name_node,
             CODE_UNRESOLVED_MEMBER,
             format!("cannot resolve `{name}`"),
             data,
         );
+    }
+
+    /// The fully-qualified name of `receiver`'s type when it is a workspace
+    /// source (never a jar/JDK declaration), so a member can be created in it.
+    fn workspace_owner(&self, receiver: &Ty, package: Option<&str>) -> Option<String> {
+        let info = self.model.lookup(receiver, package)?;
+        let entry = self
+            .index
+            .query_name(&info.name)
+            .into_iter()
+            .find(|entry| {
+                !entry.dependency
+                    && types::is_type_kind(entry.kind)
+                    && entry.package == info.package
+            })?;
+        import_target(&entry)
     }
 
     /// Flags a bare name used as a symbol reference that resolves to no local,
@@ -3269,7 +3439,10 @@ impl<'a> SemanticCheck<'a> {
         let candidates = self.type_candidates(name);
         let importable = self.importable(&candidates);
         if !importable.is_empty() {
-            let data = json!({ "fix": FIX_ADD_IMPORT, "name": name, "candidates": importable });
+            let data = json!({
+                "name": name,
+                "fixes": [{ "fix": FIX_ADD_IMPORT, "candidates": importable }],
+            });
             self.push(
                 node,
                 CODE_UNRESOLVED_SYMBOL,
@@ -3289,17 +3462,7 @@ impl<'a> SemanticCheck<'a> {
         {
             return;
         }
-        let is_call = node.parent().is_some_and(|parent| {
-            parent.kind() == "method_invocation"
-                && parent
-                    .child_by_field_name("name")
-                    .is_some_and(|named| named.id() == node.id())
-        });
-        let data = json!({
-            "fix": FIX_CREATE_MEMBER,
-            "name": name,
-            "kind": if is_call { "method" } else { "field" },
-        });
+        let data = json!({ "name": name, "fixes": [{ "fix": FIX_CREATE_SYMBOL }] });
         self.push(
             node,
             CODE_UNRESOLVED_SYMBOL,
@@ -3518,10 +3681,16 @@ fn is_declared_name(node: Node, parent: &Node) -> bool {
 fn collect_declared_names(node: Node, text: &str, out: &mut HashSet<String>) {
     if node.kind() == "identifier" {
         let is_binding = node.parent().is_some_and(|parent| {
-            parent
+            let is_name = parent
                 .child_by_field_name("name")
-                .is_some_and(|named| named.id() == node.id())
+                .is_some_and(|named| named.id() == node.id());
+            // A call's callee and a member access are uses, not bindings.
+            (is_name && !matches!(parent.kind(), "method_invocation" | "field_access"))
                 || matches!(parent.kind(), "inferred_parameters" | "lambda_parameters")
+                || (parent.kind() == "lambda_expression"
+                    && parent
+                        .child_by_field_name("parameters")
+                        .is_some_and(|params| params.id() == node.id()))
         });
         if is_binding {
             out.insert(text[node.byte_range()].to_string());
@@ -3548,14 +3717,193 @@ fn enclosing_type_body(tree: &Tree, offset: usize) -> Option<Node<'_>> {
     }
 }
 
+/// The node covering an LSP range (the identifier a diagnostic points at).
+fn node_at<'a>(tree: &'a Tree, text: &str, range: Range) -> Option<Node<'a>> {
+    let start = byte_offset(text, range.start);
+    let end = byte_offset(text, range.end);
+    tree.root_node().descendant_for_byte_range(start, end)
+}
+
+/// The innermost `block` containing `node`.
+fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "block" {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// The innermost method/constructor declaration containing `node`.
+fn enclosing_method(node: Node<'_>) -> Option<Node<'_>> {
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if matches!(
+            candidate.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
+            return Some(candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// The `body` of the top-level type declaration named `name` in a parsed file.
+fn type_body_by_name<'a>(tree: &'a Tree, text: &str, name: &str) -> Option<Node<'a>> {
+    let mut stack = vec![tree.root_node()];
+    while let Some(node) = stack.pop() {
+        if matches!(
+            node.kind(),
+            "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+        ) && node
+            .child_by_field_name("name")
+            .is_some_and(|named| &text[named.byte_range()] == name)
+        {
+            if let Some(body) = node.child_by_field_name("body") {
+                return Some(body);
+            }
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.named_children(&mut cursor).collect();
+        stack.extend(children);
+    }
+    None
+}
+
+/// A created method's parameter list: types inferred from the call's arguments,
+/// names from bare identifiers (else `argN`).
+fn parameter_list(
+    call: Node<'_>,
+    text: &str,
+    scope: &types::Scope,
+    model: &dyn TypeLookup,
+) -> Vec<String> {
+    let Some(arguments) = call.child_by_field_name("arguments") else {
+        return Vec::new();
+    };
+    let mut cursor = arguments.walk();
+    arguments
+        .named_children(&mut cursor)
+        .enumerate()
+        .map(|(index, argument)| {
+            let ty = display_type(&types::receiver_type(&argument, text, scope, model));
+            let name = if argument.kind() == "identifier" {
+                text[argument.byte_range()].to_string()
+            } else {
+                format!("arg{}", index + 1)
+            };
+            format!("{ty} {name}")
+        })
+        .collect()
+}
+
+/// The return type a created method needs, from the context its call sits in.
+fn return_type(call: Node<'_>, text: &str, scope: &types::Scope, model: &dyn TypeLookup) -> String {
+    let Some(parent) = call.parent() else {
+        return "Object".to_string();
+    };
+    match parent.kind() {
+        "expression_statement" => "void".to_string(),
+        "variable_declarator" => {
+            declared_type_of(parent, text).unwrap_or_else(|| "Object".to_string())
+        }
+        "assignment_expression" => parent
+            .child_by_field_name("left")
+            .map(|left| display_type(&types::receiver_type(&left, text, scope, model)))
+            .unwrap_or_else(|| "Object".to_string()),
+        "return_statement" => enclosing_method(call)
+            .and_then(|method| method.child_by_field_name("type"))
+            .map(|ty| text[ty.byte_range()].to_string())
+            .unwrap_or_else(|| "Object".to_string()),
+        _ => "Object".to_string(),
+    }
+}
+
+/// A declaration's written type, unless it is `var`.
+fn declared_type_of(declarator: Node<'_>, text: &str) -> Option<String> {
+    let declaration = declarator.parent()?;
+    if !matches!(
+        declaration.kind(),
+        "local_variable_declaration" | "field_declaration"
+    ) {
+        return None;
+    }
+    let ty = declaration.child_by_field_name("type")?;
+    let written = &text[ty.byte_range()];
+    (written != "var").then(|| written.to_string())
+}
+
+/// The type a created local/field needs, from the value's context.
+fn value_type(node: Node<'_>, text: &str, scope: &types::Scope, model: &dyn TypeLookup) -> String {
+    let Some(parent) = node.parent() else {
+        return "Object".to_string();
+    };
+    match parent.kind() {
+        "variable_declarator" => {
+            declared_type_of(parent, text).unwrap_or_else(|| "Object".to_string())
+        }
+        "assignment_expression" => {
+            let is_target = parent
+                .child_by_field_name("left")
+                .is_some_and(|left| left.id() == node.id());
+            if is_target {
+                return "Object".to_string();
+            }
+            parent
+                .child_by_field_name("left")
+                .map(|left| display_type(&types::receiver_type(&left, text, scope, model)))
+                .unwrap_or_else(|| "Object".to_string())
+        }
+        _ => "Object".to_string(),
+    }
+}
+
+/// A type for a generated stub; an unresolved type becomes `Object`.
+fn display_type(ty: &Ty) -> String {
+    match ty {
+        Ty::Unknown => "Object".to_string(),
+        other => other.display(),
+    }
+}
+
+/// Inserts a stub before a type body's closing brace, as a `changes` edit.
+fn push_body_insert(
+    uri: &Url,
+    text: &str,
+    diagnostic: &Diagnostic,
+    body: Node<'_>,
+    stub: String,
+    title: String,
+    actions: &mut Vec<CodeAction>,
+) {
+    let close = lsp_position(text, body.end_byte().saturating_sub(1));
+    let edit = TextEdit {
+        range: Range::new(Position::new(close.line, 0), Position::new(close.line, 0)),
+        new_text: stub,
+    };
+    actions.push(CodeAction {
+        title,
+        kind: Some(CodeActionKind::QUICKFIX),
+        diagnostics: Some(vec![diagnostic.clone()]),
+        edit: Some(workspace_edit_changes(uri, vec![edit])),
+        ..CodeAction::default()
+    });
+}
+
 /// A trivial source stub for a created type file.
 fn stub_type_source(package: Option<&str>, kind: &str, name: &str) -> String {
-    let keyword = if kind == "interface" {
-        "interface"
-    } else {
-        "class"
+    let body = match kind {
+        "interface" => format!("public interface {name} {{\n}}\n"),
+        "enum" => format!("public enum {name} {{\n}}\n"),
+        "record" => format!("public record {name}() {{\n}}\n"),
+        _ => format!("public class {name} {{\n}}\n"),
     };
-    let body = format!("public {keyword} {name} {{\n}}\n");
     match package {
         Some(package) => format!("package {package};\n\n{body}"),
         None => body,
@@ -6123,11 +6471,7 @@ class Sample {
             Some(NumberOrString::String("unresolved-member".to_string()))
         );
         assert_eq!(
-            diagnostics[0]
-                .data
-                .as_ref()
-                .and_then(|data| data.get("replacement"))
-                .and_then(|value| value.as_str()),
+            fix_field(&diagnostics[0], "rename", "replacement").and_then(|value| value.as_str()),
             Some("size")
         );
     }
@@ -6183,10 +6527,7 @@ class Sample {
             diagnostics[0].code,
             Some(NumberOrString::String("unresolved-type".to_string()))
         );
-        let candidates = diagnostics[0]
-            .data
-            .as_ref()
-            .and_then(|data| data.get("candidates"))
+        let candidates = fix_field(&diagnostics[0], "add-import", "candidates")
             .and_then(|value| value.as_array())
             .cloned()
             .unwrap_or_default();
@@ -6224,17 +6565,23 @@ class Sample {
 
         engine.set_resource_operations(true);
         let actions = engine.code_actions(&uri(), &diagnostics);
-        assert_eq!(actions.len(), 1, "{actions:?}");
-        assert_eq!(actions[0].title, "Create class `Widget`");
-        assert!(actions[0]
+        let titles: Vec<String> = actions.iter().map(|action| action.title.clone()).collect();
+        assert_eq!(actions.len(), 4, "{titles:?}");
+        for kind in ["class", "interface", "enum", "record"] {
+            assert!(
+                titles.contains(&format!("Create {kind} `Widget`")),
+                "{titles:?}"
+            );
+        }
+        assert!(actions.iter().all(|action| action
             .edit
             .as_ref()
             .and_then(|edit| edit.document_changes.as_ref())
-            .is_some());
+            .is_some()));
     }
 
     #[test]
-    fn an_unknown_identifier_offers_a_member_stub() {
+    fn an_unknown_identifier_offers_local_and_field_stubs() {
         let engine = unknown_symbol_engine();
         let text = "\
 class Sample {
@@ -6251,9 +6598,25 @@ class Sample {
             Some(NumberOrString::String("unresolved-symbol".to_string()))
         );
         let actions = engine.code_actions(&uri(), &diagnostics);
-        assert_eq!(actions.len(), 1, "{actions:?}");
-        assert_eq!(actions[0].title, "Create field `missing`");
-        let edits = actions[0]
+        let titles: Vec<String> = actions.iter().map(|action| action.title.clone()).collect();
+        assert!(
+            titles.contains(&"Create local variable `missing`".to_string()),
+            "{titles:?}"
+        );
+        assert!(
+            titles.contains(&"Create field `missing`".to_string()),
+            "{titles:?}"
+        );
+        let local = actions
+            .iter()
+            .find(|action| action.title == "Create local variable `missing`")
+            .unwrap();
+        assert_eq!(local.is_preferred, Some(true));
+        let field = actions
+            .iter()
+            .find(|action| action.title == "Create field `missing`")
+            .unwrap();
+        let edits = field
             .edit
             .as_ref()
             .unwrap()
@@ -6264,6 +6627,165 @@ class Sample {
             .unwrap();
         assert!(
             edits[0].new_text.contains("private Object missing;"),
+            "{:?}",
+            edits[0].new_text
+        );
+    }
+
+    #[test]
+    fn a_created_method_infers_parameters_from_the_call() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+class Sample {
+    void m() {
+        int available = 1;
+        foo(available);
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        let foo = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("foo"))
+            .expect("foo flagged");
+        let actions = engine.code_actions(&uri(), std::slice::from_ref(foo));
+        let method = actions
+            .iter()
+            .find(|action| action.title == "Create method `foo`")
+            .expect("method action");
+        let edits = method
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri())
+            .unwrap();
+        assert!(
+            edits[0].new_text.contains("public void foo(int available)"),
+            "{:?}",
+            edits[0].new_text
+        );
+    }
+
+    #[test]
+    fn a_created_method_takes_its_return_type_from_the_context() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+class Sample {
+    void m() {
+        int n = compute();
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        let compute = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("compute"))
+            .expect("compute flagged");
+        let actions = engine.code_actions(&uri(), std::slice::from_ref(compute));
+        let method = actions
+            .iter()
+            .find(|action| action.title == "Create method `compute`")
+            .expect("method action");
+        let edits = method
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri())
+            .unwrap();
+        assert!(
+            edits[0].new_text.contains("public int compute()"),
+            "{:?}",
+            edits[0].new_text
+        );
+    }
+
+    #[test]
+    fn a_created_local_takes_the_declared_type() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+class Sample {
+    void m() {
+        String s = text;
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        let text_diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("text"))
+            .expect("text flagged");
+        let actions = engine.code_actions(&uri(), std::slice::from_ref(text_diagnostic));
+        let local = actions
+            .iter()
+            .find(|action| action.title == "Create local variable `text`")
+            .expect("local action");
+        let edits = local
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri())
+            .unwrap();
+        assert!(
+            edits[0].new_text.contains("String text;"),
+            "{:?}",
+            edits[0].new_text
+        );
+    }
+
+    #[test]
+    fn a_method_can_be_created_on_a_workspace_receiver() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+package com.a;
+
+class Sample {
+    void m() {
+        Sample s = this;
+        int count = 1;
+        s.newMethod(count);
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        let member = diagnostics
+            .iter()
+            .find(|diagnostic| diagnostic.message.contains("newMethod"))
+            .expect("newMethod flagged");
+        assert_eq!(
+            member.code,
+            Some(NumberOrString::String("unresolved-member".to_string()))
+        );
+        let actions = engine.code_actions(&uri(), std::slice::from_ref(member));
+        let created = actions
+            .iter()
+            .find(|action| action.title == "Create method `newMethod` in `Sample`")
+            .expect("create action");
+        let edits = created
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri())
+            .unwrap();
+        assert!(
+            edits[0]
+                .new_text
+                .contains("public void newMethod(int count)"),
             "{:?}",
             edits[0].new_text
         );
@@ -6636,6 +7158,22 @@ class Sample {
             jdk_entry("Object", IndexKind::Class, Some("java.lang")),
             jdk_entry("String", IndexKind::Class, Some("java.lang")),
         ])
+    }
+
+    /// A named field of the fix within a diagnostic's `data`.
+    fn fix_field<'a>(
+        diagnostic: &'a Diagnostic,
+        fix: &str,
+        field: &str,
+    ) -> Option<&'a serde_json::Value> {
+        diagnostic
+            .data
+            .as_ref()?
+            .get("fixes")?
+            .as_array()?
+            .iter()
+            .find(|entry| entry.get("fix").and_then(|value| value.as_str()) == Some(fix))?
+            .get(field)
     }
 
     /// Opens a helper declaration file in the engine so it appears in the

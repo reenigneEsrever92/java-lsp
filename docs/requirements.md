@@ -71,7 +71,7 @@ All use cases belong to the Java developer.
 | R8 | Gradle project model | Functional | low | deferred |
 | R9 | Inlay hints: variable types (including `var` inference), parameter names, and chained-call return types, computed for the requested range | Functional | medium | UC1, R7 |
 | R10 | Dependency sources fetched and indexed; go-to-definition opens library declarations | Functional | medium | UC3 |
-| R11 | Semantic diagnostics: unresolved types, members, identifiers, and imports reported as errors, each with a code-action quick fix (add import, did-you-mean, create stub) | Functional | medium | UC4, R7 |
+| R11 | Semantic diagnostics: unresolved types, members, identifiers, and imports reported as errors, each with a code-action quick fix (add import, did-you-mean, or create a class/interface/enum/record, method, field, or local variable with a signature inferred from the usage) | Functional | medium | UC4, R7 |
 
 ## Milestones
 

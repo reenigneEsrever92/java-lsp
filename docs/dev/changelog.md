@@ -12,6 +12,14 @@ named change.
 
 ## 2026-09-24
 
+- **Create-symbol quick fixes** — unresolved symbols now offer full create
+  actions: class / interface / enum / record (a scaffolded file), and a method,
+  field, or local variable with the signature inferred from the usage
+  (parameter types from the call's arguments, the return type from the
+  assignment/declaration/`return` context), including on a workspace receiver's
+  type. Verified by `cargo test --all-targets` (229 tests). See
+  [Create-symbol quick fixes for unresolved symbols](backlog/create-stub-quick-fixes.md).
+
 - **Unresolved-symbol diagnostics and quick fixes** — the server now reports
   unresolved types, members, bare identifiers, and imports as `ERROR`
   diagnostics (gated on a clean parse and an indexed `java.lang`, disabled by

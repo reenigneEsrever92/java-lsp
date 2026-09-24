@@ -1244,7 +1244,7 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
     )
     .unwrap();
     let main_uri = Url::from_file_path(root.join("Main.java")).unwrap();
-    let main_text = "class Main {\n    Widget field;\n}\n";
+    let main_text = "class Main {\n    Widget field;\n    Missing other;\n}\n";
     std::fs::write(root.join("Main.java"), main_text).unwrap();
 
     let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
@@ -1252,7 +1252,12 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
         &mut service,
         Request::build("initialize")
             .id(Id::Number(1))
-            .params(json!({ "capabilities": {}, "rootUri": Url::from_file_path(&root).unwrap().as_str() }))
+            .params(json!({
+                "capabilities": {
+                    "workspace": { "workspaceEdit": { "resourceOperations": ["create"] } }
+                },
+                "rootUri": Url::from_file_path(&root).unwrap().as_str(),
+            }))
             .finish(),
     )
     .await
@@ -1292,8 +1297,16 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
         .as_array()
         .unwrap()
         .iter()
-        .find(|diagnostic| diagnostic["code"] == "unresolved-type")
+        .find(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Widget"))
+        })
         .expect("Widget should be flagged as an unresolved type");
+    assert_eq!(
+        widget["code"], "unresolved-type",
+        "expected an unresolved type, got {diagnostics}"
+    );
     assert_eq!(
         widget["severity"], 1,
         "expected an error, got {diagnostics}"
@@ -1319,6 +1332,43 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
         action["edit"]["changes"][main_uri.as_str()][0]["newText"],
         "import com.b.Widget;\n"
     );
+
+    // A type nowhere in the index offers the four create-type actions.
+    let missing = diagnostics
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("Missing"))
+        })
+        .expect("Missing should be flagged");
+    let create_actions = respond(
+        &mut service,
+        Request::build("textDocument/codeAction")
+            .id(Id::Number(3))
+            .params(json!({
+                "textDocument": { "uri": main_uri.as_str() },
+                "range": missing["range"].clone(),
+                "context": { "diagnostics": [missing] },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("codeAction must respond");
+    let titles: Vec<String> = create_actions
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|action| action["title"].as_str().map(str::to_string))
+        .collect();
+    for kind in ["class", "interface", "enum", "record"] {
+        assert!(
+            titles.contains(&format!("Create {kind} `Missing`")),
+            "missing create-{kind} action, got {titles:?}"
+        );
+    }
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&jdk);
