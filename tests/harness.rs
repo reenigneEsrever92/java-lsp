@@ -145,6 +145,10 @@ async fn initialize_advertises_incremental_sync_and_language_capabilities() {
     assert_eq!(capabilities["workspaceSymbolProvider"], true);
     assert_eq!(capabilities["referencesProvider"], true);
     assert_eq!(capabilities["renameProvider"], true);
+    assert_eq!(
+        capabilities["codeActionProvider"]["codeActionKinds"][0],
+        json!("quickfix")
+    );
     assert_eq!(capabilities["inlayHintProvider"], true);
     assert_eq!(capabilities["foldingRangeProvider"], true);
     assert!(
@@ -1201,6 +1205,119 @@ class Main {\n    List names;\n    String greeting;\n}\n",
     assert!(
         symbols.as_array().map_or(true, |items| items.is_empty()),
         "JDK types must not appear in workspace symbols, got {symbols}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&jdk);
+}
+
+#[tokio::test]
+async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action() {
+    // A fake JDK providing java.lang.Object and java.lang.String, so the
+    // semantic-diagnostics gate holds.
+    let jdk = temp_dir("diag-jdk");
+    std::fs::create_dir_all(jdk.join("jmods")).unwrap();
+    let _env = JdkEnv::set(&jdk.display().to_string());
+    let object_class = test_class_bytes("java/lang/Object", 0x0021, None, &[], &[]);
+    let string_class = test_class_bytes(
+        "java/lang/String",
+        0x0021,
+        Some("java/lang/Object"),
+        &[],
+        &[],
+    );
+    std::fs::write(
+        jdk.join("jmods").join("java.base.jmod"),
+        test_stored_zip(&[
+            ("classes/java/lang/Object.class", &object_class),
+            ("classes/java/lang/String.class", &string_class),
+        ]),
+    )
+    .unwrap();
+
+    // A workspace holding Widget in com.b, plus a file that uses it unimported.
+    let root = temp_dir("diag-workspace");
+    std::fs::create_dir_all(root.join("com").join("b")).unwrap();
+    std::fs::write(
+        root.join("com").join("b").join("Widget.java"),
+        "package com.b;\n\npublic class Widget {\n}\n",
+    )
+    .unwrap();
+    let main_uri = Url::from_file_path(root.join("Main.java")).unwrap();
+    let main_text = "class Main {\n    Widget field;\n}\n";
+    std::fs::write(root.join("Main.java"), main_text).unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": Url::from_file_path(&root).unwrap().as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |entries, ready| {
+        ready
+            && entries
+                .iter()
+                .any(|entry| entry.name == "Widget" && entry.package.as_deref() == Some("com.b"))
+    })
+    .await;
+
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": main_uri.as_str(),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": main_text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    let diagnostics = next_diagnostics_for(&mut socket, main_uri.as_str()).await;
+    let widget = diagnostics
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|diagnostic| diagnostic["code"] == "unresolved-type")
+        .expect("Widget should be flagged as an unresolved type");
+    assert_eq!(
+        widget["severity"], 1,
+        "expected an error, got {diagnostics}"
+    );
+
+    // The quick fix adds the import the index already knows.
+    let actions = respond(
+        &mut service,
+        Request::build("textDocument/codeAction")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": main_uri.as_str() },
+                "range": widget["range"].clone(),
+                "context": { "diagnostics": [widget] },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("codeAction must respond");
+    let action = &actions.as_array().unwrap()[0];
+    assert_eq!(action["title"], "Add import `com.b.Widget`");
+    assert_eq!(
+        action["edit"]["changes"][main_uri.as_str()][0]["newText"],
+        "import com.b.Widget;\n"
     );
 
     let _ = std::fs::remove_dir_all(&root);

@@ -37,9 +37,11 @@ declared-type model built during warm-up:
 - **Inlay hints** — variable types (including `var` inference), parameter names
   at call sites, and intermediate chained-call return types, computed for the
   range the client requests.
-- **Type-aware diagnostics** — conservative `type X cannot be resolved` warnings
-  that only fire when the model can vouch for `java.lang` and the file parses
-  cleanly, so a missing JDK or dependency never becomes a wall of false
+- **Diagnostics** — parse errors from tree-sitter plus type-aware unresolved
+  symbols (types, members, identifiers, imports) reported as errors, each with a
+  quick fix: add the missing import, change to a near member, or create a
+  class/interface/method stub. Gated on the model vouching for `java.lang` and
+  the file parsing cleanly, so a missing JDK never becomes a wall of false
   positives.
 - **Project model** — statically parsed Maven `pom.xml` (multi-module, `<build>`
   overrides), offline dependency resolution from the local repository, and
@@ -116,6 +118,7 @@ and skips dependencies with a warning.
 | `JAVA_HOME` | JDK home used when `JAVA_LSP_JDK` is unset; otherwise common locations (including SDKMAN's `current`) are searched. |
 | `SDKMAN_DIR` | SDKMAN root, for locating candidates' JDKs. |
 | `JAVA_LSP_OFFLINE` | Any non-empty value disables **all** network work; dependency sources stay class-file-only. |
+| `JAVA_LSP_SEMANTIC_DIAGNOSTICS` | `0`/`false` disables the unresolved-symbol diagnostics (parse errors still report). On by default. |
 | `JAVA_LSP_MAVEN_CENTRAL_URL` | Base URL for dependency-source downloads. Default Maven Central (`https://repo1.maven.org/maven2`). |
 | `JAVA_LSP_SOURCES_CACHE` | Where extracted sources are cached. Default `$XDG_CACHE_HOME/java-lsp/sources`, else `~/.cache/java-lsp/sources`. |
 

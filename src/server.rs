@@ -7,18 +7,19 @@ use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, RwLock};
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::{
-    notification::Progress, request::WorkDoneProgressCreate, CompletionOptions, CompletionParams,
-    CompletionResponse, DidChangeTextDocumentParams, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, FoldingRange,
-    FoldingRangeParams, FoldingRangeProviderCapability, GotoDefinitionParams,
-    GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability, InitializeParams,
-    InitializeResult, InitializedParams, InlayHint, InlayHintParams, Location, MessageType,
-    NumberOrString, OneOf, ProgressParams, ProgressParamsValue, ReferenceParams, RenameParams,
-    SemanticTokenModifier, SemanticTokensFullOptions, SemanticTokensLegend, SemanticTokensOptions,
-    SemanticTokensParams, SemanticTokensResult, SemanticTokensServerCapabilities,
-    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgress,
-    WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
+    notification::Progress, request::WorkDoneProgressCreate, CodeActionKind, CodeActionOptions,
+    CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
+    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
+    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
+    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams, Location,
+    MessageType, NumberOrString, OneOf, ProgressParams, ProgressParamsValue, ReferenceParams,
+    RenameParams, ResourceOperationKind, SemanticTokenModifier, SemanticTokensFullOptions,
+    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
+    SignatureHelpParams, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
     WorkDoneProgressOptions, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolParams,
 };
 use tower_lsp::{Client, LanguageServer};
@@ -167,6 +168,17 @@ impl LanguageServer for JavaLanguageServer {
             .and_then(|window| window.work_done_progress)
             .unwrap_or(false);
         self.progress.store(progress_supported, Ordering::Relaxed);
+        // The create-type quick fix needs the client to accept a `CreateFile`
+        // resource operation; without it, those actions are withheld.
+        let resource_operations = params
+            .capabilities
+            .workspace
+            .and_then(|workspace| workspace.workspace_edit)
+            .and_then(|edit| edit.resource_operations)
+            .is_some_and(|operations| operations.contains(&ResourceOperationKind::Create));
+        self.engine
+            .set_resource_operations(resource_operations)
+            .await;
         let root = params.root_uri.or_else(|| {
             params
                 .workspace_folders
@@ -199,6 +211,12 @@ impl LanguageServer for JavaLanguageServer {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
+                code_action_provider: Some(CodeActionProviderCapability::Options(
+                    CodeActionOptions {
+                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
+                        ..CodeActionOptions::default()
+                    },
+                )),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
@@ -232,6 +250,23 @@ impl LanguageServer for JavaLanguageServer {
     async fn shutdown(&self) -> Result<()> {
         tracing::info!("shutdown requested");
         Ok(())
+    }
+
+    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
+        let uri = params.text_document.uri;
+        let actions = self
+            .engine
+            .code_actions(uri, params.context.diagnostics)
+            .await;
+        if actions.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(
+            actions
+                .into_iter()
+                .map(CodeActionOrCommand::CodeAction)
+                .collect(),
+        ))
     }
 
     async fn did_open(&self, params: DidOpenTextDocumentParams) {

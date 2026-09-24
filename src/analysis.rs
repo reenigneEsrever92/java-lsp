@@ -15,14 +15,18 @@
 //! later optimization.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 
+use serde_json::json;
 use tower_lsp::lsp_types::{
-    CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic, DiagnosticSeverity,
+    CodeAction, CodeActionKind, CompletionItem, CompletionItemKind, CompletionResponse, CreateFile,
+    CreateFileOptions, Diagnostic, DiagnosticSeverity, DocumentChangeOperation, DocumentChanges,
     DocumentSymbol, FoldingRange, FoldingRangeKind, Hover, HoverContents, InlayHint, InlayHintKind,
-    InlayHintLabel, Location, MarkupContent, MarkupKind, Position, Range, SemanticToken,
+    InlayHintLabel, Location, MarkupContent, MarkupKind, NumberOrString, OneOf,
+    OptionalVersionedTextDocumentIdentifier, Position, Range, ResourceOp, SemanticToken,
     SemanticTokenType, SemanticTokens, SignatureHelp, SignatureInformation, SymbolInformation,
-    SymbolKind, TextEdit, Url, WorkspaceEdit,
+    SymbolKind, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
 };
 use tree_sitter::{Node, Parser, Tree};
 
@@ -74,6 +78,12 @@ pub struct TreeSitterEngine {
     documents: Mutex<HashMap<Url, ParsedDocument>>,
     index: WorkspaceIndex,
     workspace_root: Mutex<Option<Url>>,
+    /// Whether semantic (unresolved-symbol) diagnostics are enabled; read from
+    /// `JAVA_LSP_SEMANTIC_DIAGNOSTICS` at construction (on by default).
+    semantic_diagnostics: AtomicBool,
+    /// Whether the client advertised `workspace.workspaceEdit.resourceOperations`
+    /// with `CreateFile`, so the create-type quick fix can be offered.
+    resource_operations: AtomicBool,
     /// Where the background warm-up reports progress; detached (a no-op) until
     /// the shell installs one.
     reporter: Mutex<Reporter>,
@@ -86,8 +96,22 @@ impl TreeSitterEngine {
             documents: Mutex::new(HashMap::new()),
             index: WorkspaceIndex::new(),
             workspace_root: Mutex::new(None),
+            semantic_diagnostics: AtomicBool::new(semantic_diagnostics_enabled()),
+            resource_operations: AtomicBool::new(false),
             reporter: Mutex::new(Reporter::default()),
         }
+    }
+
+    /// Records whether the client supports the `CreateFile` resource operation,
+    /// so create-type quick fixes are only offered when they can be applied.
+    pub fn set_resource_operations(&self, supported: bool) {
+        self.resource_operations.store(supported, Ordering::Relaxed);
+    }
+
+    /// Enables or disables semantic diagnostics, overriding the environment
+    /// default (used by tests).
+    pub fn set_semantic_diagnostics(&self, enabled: bool) {
+        self.semantic_diagnostics.store(enabled, Ordering::Relaxed);
     }
 
     /// Installs the reporter the background warm-up reports through.
@@ -714,8 +738,259 @@ impl TreeSitterEngine {
             // adding them would only pile noise onto broken code.
             return diagnostics;
         }
-        diagnostics.extend(semantic_diagnostics(document, &self.index));
+        if self.semantic_diagnostics.load(Ordering::Relaxed) {
+            diagnostics.extend(semantic_diagnostics(document, uri, &self.index));
+        }
         diagnostics
+    }
+
+    /// Quick fixes for the unresolved-symbol diagnostics the client is showing:
+    /// add an import, change to a near member, or create a stub type/member.
+    /// Built from each diagnostic's `data`, so the fix matches what was
+    /// reported.
+    pub fn code_actions(&self, uri: &Url, diagnostics: &[Diagnostic]) -> Vec<CodeAction> {
+        let Ok(documents) = self.documents.lock() else {
+            return Vec::new();
+        };
+        let Some(document) = documents.get(uri) else {
+            return Vec::new();
+        };
+        let mut actions = Vec::new();
+        for diagnostic in diagnostics {
+            if diagnostic.source.as_deref() != Some("java-lsp") {
+                continue;
+            }
+            let Some(data) = diagnostic.data.as_ref() else {
+                continue;
+            };
+            match data.get("fix").and_then(|value| value.as_str()) {
+                Some(FIX_ADD_IMPORT) => {
+                    self.add_import_actions(uri, document, diagnostic, data, &mut actions)
+                }
+                Some(FIX_RENAME) => self.rename_member_action(uri, diagnostic, data, &mut actions),
+                Some(FIX_CREATE_TYPE) => {
+                    self.create_type_action(uri, document, diagnostic, data, &mut actions)
+                }
+                Some(FIX_CREATE_MEMBER) => {
+                    self.create_member_action(uri, document, diagnostic, data, &mut actions)
+                }
+                _ => {}
+            }
+        }
+        actions
+    }
+
+    /// One "Add import" action per importable candidate (the client shows a
+    /// picker when several are offered). Edits come from `import_edit`.
+    fn add_import_actions(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        diagnostic: &Diagnostic,
+        data: &serde_json::Value,
+        actions: &mut Vec<CodeAction>,
+    ) {
+        let Some(candidates) = data.get("candidates").and_then(|value| value.as_array()) else {
+            return;
+        };
+        let root = document.tree.root_node();
+        let imports = collect_imports(&root, &document.text);
+        let package = types::file_package(&document.tree, &document.text);
+        let package_line = package_line(&document.tree);
+        for candidate in candidates {
+            let Some(target) = candidate.as_str() else {
+                continue;
+            };
+            let simple = target.rsplit('.').next().unwrap_or(target);
+            let Some(entry) = self
+                .index
+                .query_name(simple)
+                .into_iter()
+                .find(|entry| import_target(entry).as_deref() == Some(target))
+            else {
+                continue;
+            };
+            let edits = import_edit(
+                uri,
+                &entry,
+                package.as_deref(),
+                package_line,
+                &imports,
+                &self.index,
+            );
+            if edits.is_empty() {
+                continue;
+            }
+            actions.push(CodeAction {
+                title: format!("Add import `{target}`"),
+                kind: Some(CodeActionKind::QUICKFIX),
+                diagnostics: Some(vec![diagnostic.clone()]),
+                edit: Some(workspace_edit_changes(uri, edits)),
+                ..CodeAction::default()
+            });
+        }
+    }
+
+    /// A "Change to `x`" action for a member name close to a real one.
+    fn rename_member_action(
+        &self,
+        uri: &Url,
+        diagnostic: &Diagnostic,
+        data: &serde_json::Value,
+        actions: &mut Vec<CodeAction>,
+    ) {
+        let Some(replacement) = data
+            .get("replacement")
+            .and_then(|value| value.as_str())
+            .filter(|replacement| !replacement.is_empty())
+        else {
+            return;
+        };
+        actions.push(CodeAction {
+            title: format!("Change to `{replacement}`"),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(workspace_edit_changes(
+                uri,
+                vec![TextEdit {
+                    range: diagnostic.range,
+                    new_text: replacement.to_string(),
+                }],
+            )),
+            is_preferred: Some(true),
+            ..CodeAction::default()
+        });
+    }
+
+    /// A "Create class/interface `X`" action that adds a new file under the
+    /// source root of the file's own package. Only offered when the client
+    /// supports the `CreateFile` resource operation.
+    fn create_type_action(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        diagnostic: &Diagnostic,
+        data: &serde_json::Value,
+        actions: &mut Vec<CodeAction>,
+    ) {
+        if !self.resource_operations.load(Ordering::Relaxed) {
+            return;
+        }
+        let Some(name) = data.get("name").and_then(|value| value.as_str()) else {
+            return;
+        };
+        if !is_java_identifier(name) {
+            return;
+        }
+        let kind = data
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("class");
+        let package = types::file_package(&document.tree, &document.text);
+        let Some(new_file) = self.new_type_file_uri(uri, package.as_deref(), name) else {
+            return;
+        };
+        let contents = stub_type_source(package.as_deref(), kind, name);
+        let operations = vec![
+            DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
+                uri: new_file.clone(),
+                options: Some(CreateFileOptions {
+                    overwrite: None,
+                    ignore_if_exists: Some(true),
+                }),
+                annotation_id: None,
+            })),
+            DocumentChangeOperation::Edit(TextDocumentEdit {
+                text_document: OptionalVersionedTextDocumentIdentifier {
+                    uri: new_file.clone(),
+                    version: None,
+                },
+                edits: vec![OneOf::Left(TextEdit {
+                    range: Range::new(Position::new(0, 0), Position::new(0, 0)),
+                    new_text: contents,
+                })],
+            }),
+        ];
+        actions.push(CodeAction {
+            title: format!("Create {kind} `{name}`"),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(WorkspaceEdit {
+                changes: None,
+                document_changes: Some(DocumentChanges::Operations(operations)),
+                change_annotations: None,
+            }),
+            is_preferred: Some(true),
+            ..CodeAction::default()
+        });
+    }
+
+    /// A "Create method/field" action that inserts a stub into the enclosing
+    /// type declaration in the open file.
+    fn create_member_action(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        diagnostic: &Diagnostic,
+        data: &serde_json::Value,
+        actions: &mut Vec<CodeAction>,
+    ) {
+        let Some(name) = data.get("name").and_then(|value| value.as_str()) else {
+            return;
+        };
+        if !is_java_identifier(name) {
+            return;
+        }
+        let kind = data
+            .get("kind")
+            .and_then(|value| value.as_str())
+            .unwrap_or("field");
+        let offset = byte_offset(&document.text, diagnostic.range.start);
+        let Some(body) = enclosing_type_body(&document.tree, offset) else {
+            return;
+        };
+        // Insert whole lines before the type body's closing brace.
+        let close = lsp_position(&document.text, body.end_byte().saturating_sub(1));
+        let stub = if kind == "method" {
+            format!("    public void {name}() {{\n    }}\n")
+        } else {
+            format!("    private Object {name};\n")
+        };
+        let edit = TextEdit {
+            range: Range::new(Position::new(close.line, 0), Position::new(close.line, 0)),
+            new_text: stub,
+        };
+        actions.push(CodeAction {
+            title: format!(
+                "Create {} `{name}`",
+                if kind == "method" { "method" } else { "field" }
+            ),
+            kind: Some(CodeActionKind::QUICKFIX),
+            diagnostics: Some(vec![diagnostic.clone()]),
+            edit: Some(workspace_edit_changes(uri, vec![edit])),
+            ..CodeAction::default()
+        });
+    }
+
+    /// The URI for a new `name.java`: under the deepest source root containing
+    /// the file, in the file's package, else beside the file.
+    fn new_type_file_uri(&self, uri: &Url, package: Option<&str>, name: &str) -> Option<Url> {
+        let path = uri.to_file_path().ok()?;
+        let base = self
+            .index
+            .source_roots()
+            .into_iter()
+            .filter(|root| path.starts_with(root))
+            .max_by_key(|root| root.components().count())
+            .or_else(|| path.parent().map(std::path::Path::to_path_buf))?;
+        let mut target = base;
+        if let Some(package) = package {
+            for segment in package.split('.') {
+                target.push(segment);
+            }
+        }
+        target.push(format!("{name}.java"));
+        Url::from_file_path(target).ok()
     }
 
     pub fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
@@ -2634,11 +2909,45 @@ fn hint_label(hint: &InlayHint) -> &str {
     }
 }
 
-/// Conservative semantic diagnostics for a document: type names that resolve
-/// nowhere. Gated on the model actually vouching for `java.lang`, and on the
-/// file parsing cleanly, so a missing JDK or a broken file never produces a
-/// wall of false positives.
-fn semantic_diagnostics(document: &ParsedDocument, index: &WorkspaceIndex) -> Vec<Diagnostic> {
+/// Marks a semantic diagnostic and the quick fix it carries; the code-action
+/// handler rebuilds the edit from the diagnostic's `data`.
+const CODE_UNRESOLVED_TYPE: &str = "unresolved-type";
+const CODE_UNRESOLVED_MEMBER: &str = "unresolved-member";
+const CODE_UNRESOLVED_SYMBOL: &str = "unresolved-symbol";
+const CODE_UNRESOLVED_IMPORT: &str = "unresolved-import";
+const FIX_ADD_IMPORT: &str = "add-import";
+const FIX_RENAME: &str = "rename";
+const FIX_CREATE_TYPE: &str = "create-type";
+const FIX_CREATE_MEMBER: &str = "create-member";
+
+/// Whether semantic diagnostics are enabled, from `JAVA_LSP_SEMANTIC_DIAGNOSTICS`:
+/// unset (or any value but `0`/`false`) keeps them on.
+fn semantic_diagnostics_enabled() -> bool {
+    semantic_diagnostics_setting(
+        std::env::var("JAVA_LSP_SEMANTIC_DIAGNOSTICS")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// The setting a `JAVA_LSP_SEMANTIC_DIAGNOSTICS` value denotes.
+fn semantic_diagnostics_setting(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
+        None => true,
+    }
+}
+
+/// Unresolved-symbol diagnostics for a document: type references, member
+/// accesses on a known receiver, bare identifiers, and import declarations, all
+/// at `ERROR` severity. Gated on the model actually vouching for `java.lang` and
+/// on the file parsing cleanly, so a missing JDK or a broken file never produces
+/// a wall of false positives.
+fn semantic_diagnostics(
+    document: &ParsedDocument,
+    uri: &Url,
+    index: &WorkspaceIndex,
+) -> Vec<Diagnostic> {
     let Some(workspace) = index.type_model() else {
         return Vec::new();
     };
@@ -2647,95 +2956,669 @@ fn semantic_diagnostics(document: &ParsedDocument, index: &WorkspaceIndex) -> Ve
     }
     let local = local_model(document);
     let query = TypeQuery::new(&workspace, &local);
-    let mut out = Vec::new();
-    visit_type_positions(
-        document.tree.root_node(),
-        &document.text,
-        &document.tree,
-        &query,
-        &mut out,
-    );
-    out
+    let mut check = SemanticCheck::new(uri, document, index, &query);
+    check.visit(document.tree.root_node());
+    check.out
 }
 
-fn visit_type_positions(
-    node: Node,
-    text: &str,
-    tree: &Tree,
-    model: &dyn TypeLookup,
-    out: &mut Vec<Diagnostic>,
-) {
-    for type_node in checked_type_nodes(node) {
-        check_type(type_node, text, tree, model, out);
+/// The state of one diagnostics pass over an open document.
+struct SemanticCheck<'a> {
+    uri: &'a Url,
+    text: &'a str,
+    tree: &'a Tree,
+    index: &'a WorkspaceIndex,
+    model: &'a dyn TypeLookup,
+    imports: Vec<ExistingImport>,
+    package: Option<String>,
+    package_line: Option<u32>,
+    /// Every simple name bound anywhere in the file (locals, parameters,
+    /// fields, types, methods, lambda parameters, catch bindings, ...). A bare
+    /// identifier matching one of these is never reported: the scope collector
+    /// does not model every binding kind, and a false positive is worse than a
+    /// missed one.
+    declared_names: HashSet<String>,
+    out: Vec<Diagnostic>,
+}
+
+impl<'a> SemanticCheck<'a> {
+    fn new(
+        uri: &'a Url,
+        document: &'a ParsedDocument,
+        index: &'a WorkspaceIndex,
+        model: &'a dyn TypeLookup,
+    ) -> Self {
+        let root = document.tree.root_node();
+        let mut declared_names = HashSet::new();
+        collect_declared_names(root, &document.text, &mut declared_names);
+        Self {
+            uri,
+            text: &document.text,
+            tree: &document.tree,
+            index,
+            model,
+            imports: collect_imports(&root, &document.text),
+            package: types::file_package(&document.tree, &document.text),
+            package_line: package_line(&document.tree),
+            declared_names,
+            out: Vec::new(),
+        }
+    }
+
+    /// One pass over the tree, dispatching on the constructs that can carry an
+    /// unresolved symbol.
+    fn visit(&mut self, node: Node) {
+        match node.kind() {
+            "import_declaration" => self.check_import(node),
+            "object_creation_expression"
+            | "cast_expression"
+            | "field_declaration"
+            | "constant_declaration"
+            | "local_variable_declaration"
+            | "formal_parameter"
+            | "spread_parameter"
+            | "method_declaration"
+            | "enhanced_for_statement" => {
+                if let Some(ty) = node.child_by_field_name("type") {
+                    self.check_type(ty);
+                }
+            }
+            "superclass" => {
+                if let Some(ty) = node.named_child(0) {
+                    self.check_type(ty);
+                }
+            }
+            // An `implements`/`extends` clause wraps a `type_list`; checking the
+            // list's members is enough.
+            "type_list" => {
+                let mut cursor = node.walk();
+                let types: Vec<Node> = node.named_children(&mut cursor).collect();
+                for ty in types {
+                    self.check_type(ty);
+                }
+            }
+            "method_invocation" | "field_access" => self.check_member(node),
+            "identifier" => self.check_identifier(node),
+            _ => {}
+        }
+        let mut cursor = node.walk();
+        let children: Vec<Node> = node.named_children(&mut cursor).collect();
+        for child in children {
+            self.visit(child);
+        }
+    }
+
+    /// Flags a simple, unqualified type name that neither an import, a type
+    /// parameter, nor the file's visible types account for. Qualified names
+    /// (`scoped_type_identifier`) and `var` are left alone; generic arguments
+    /// are not inspected, only the type's base name.
+    fn check_type(&mut self, node: Node) {
+        let Some(name_node) = base_type_name(node) else {
+            return;
+        };
+        let name = &self.text[name_node.byte_range()];
+        if name.is_empty() || name == "var" {
+            return;
+        }
+        let scope = types::scope_at(name_node, self.text, self.tree, self.model);
+        if scope.type_params.iter().any(|param| param == name) {
+            return;
+        }
+        // A single-type or static import binds the name; the import check owns
+        // whether that binding resolves (D5).
+        if scope
+            .imports
+            .iter()
+            .any(|import| !import.is_wildcard && import.simple_name() == Some(name))
+        {
+            return;
+        }
+        if self.type_visible(name, &scope) {
+            return;
+        }
+        if self.type_candidates(name).is_empty() {
+            let data = json!({ "fix": FIX_CREATE_TYPE, "name": name, "kind": "class" });
+            self.push(
+                name_node,
+                CODE_UNRESOLVED_TYPE,
+                format!("cannot resolve type `{name}`"),
+                data,
+            );
+        } else {
+            let candidates = self.type_candidates(name);
+            let importable = self.importable(&candidates);
+            let data = json!({ "fix": FIX_ADD_IMPORT, "name": name, "candidates": importable });
+            self.push(
+                name_node,
+                CODE_UNRESOLVED_TYPE,
+                format!("cannot resolve type `{name}`"),
+                data,
+            );
+        }
+    }
+
+    /// Whether a simple type name is visible here: declared in the file's
+    /// package, reached by a wildcard import, or in `java.lang`. Consulted
+    /// against both the index and the declared-type model.
+    fn type_visible(&self, name: &str, scope: &types::Scope) -> bool {
+        let in_package =
+            |package: Option<&str>| {
+                self.index.query_name(name).iter().any(|entry| {
+                    types::is_type_kind(entry.kind) && entry.package.as_deref() == package
+                }) || self.model.find_in_package(name, package).is_some()
+            };
+        if in_package(scope.package.as_deref()) {
+            return true;
+        }
+        for import in scope
+            .imports
+            .iter()
+            .filter(|import| import.is_wildcard && !import.is_static)
+        {
+            if in_package(import.package().as_deref()) {
+                return true;
+            }
+        }
+        in_package(Some("java.lang"))
+    }
+
+    fn type_candidates(&self, name: &str) -> Vec<SymbolEntry> {
+        self.index
+            .query_name(name)
+            .into_iter()
+            .filter(|entry| types::is_type_kind(entry.kind))
+            .collect()
+    }
+
+    /// The fully-qualified import targets among `candidates` that an `import`
+    /// edit can actually add — `import_edit` already excludes same-file,
+    /// same-package, `java.lang`, already-imported, and conflicting names.
+    fn importable(&self, candidates: &[SymbolEntry]) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for entry in candidates {
+            if import_edit(
+                self.uri,
+                entry,
+                self.package.as_deref(),
+                self.package_line,
+                &self.imports,
+                self.index,
+            )
+            .is_empty()
+            {
+                continue;
+            }
+            if let Some(target) = import_target(entry) {
+                if !out.contains(&target) {
+                    out.push(target);
+                }
+            }
+        }
+        out
+    }
+
+    /// Flags a member the receiver's known type does not declare. The receiver
+    /// must be a modelled reference type (never `Unknown`, an array, or a type
+    /// variable), so a member the model cannot enumerate is never reported.
+    fn check_member(&mut self, node: Node) {
+        let (object, name_node, is_call) = match node.kind() {
+            "method_invocation" => (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("name"),
+                true,
+            ),
+            "field_access" => (
+                node.child_by_field_name("object"),
+                node.child_by_field_name("field"),
+                false,
+            ),
+            _ => return,
+        };
+        let (Some(object), Some(name_node)) = (object, name_node) else {
+            return;
+        };
+        if matches!(
+            object.kind(),
+            "scoped_identifier" | "scoped_type_identifier"
+        ) {
+            return;
+        }
+        let name = &self.text[name_node.byte_range()];
+        if name.is_empty() {
+            return;
+        }
+        let scope = types::scope_at(node, self.text, self.tree, self.model);
+        let package = scope.package.as_deref();
+        let receiver = types::receiver_type(&object, self.text, &scope, self.model);
+        if matches!(receiver, Ty::Unknown | Ty::Array(_)) {
+            return;
+        }
+        if self.model.lookup(&receiver, package).is_none() {
+            return;
+        }
+        if types::member_of(&receiver, name, self.model, package).is_some() {
+            return;
+        }
+        if is_call {
+            let arg_count = node
+                .child_by_field_name("arguments")
+                .map(|args| args.named_child_count())
+                .unwrap_or(0);
+            if types::member_for_call(&receiver, name, arg_count, self.model, package).is_some() {
+                return;
+            }
+        }
+        let mut names: Vec<String> = self
+            .model
+            .members(&receiver, package)
+            .into_iter()
+            .map(|member| member.name)
+            .collect();
+        names.sort();
+        names.dedup();
+        let data = match nearest_name(name, &names) {
+            Some(replacement) => {
+                json!({ "fix": FIX_RENAME, "name": name, "replacement": replacement })
+            }
+            None => json!({ "fix": "" }),
+        };
+        self.push(
+            name_node,
+            CODE_UNRESOLVED_MEMBER,
+            format!("cannot resolve `{name}`"),
+            data,
+        );
+    }
+
+    /// Flags a bare name used as a symbol reference that resolves to no local,
+    /// field, member, type, or import.
+    fn check_identifier(&mut self, node: Node) {
+        if !self.is_symbolic_identifier(node) {
+            return;
+        }
+        let name = &self.text[node.byte_range()];
+        if name.is_empty() {
+            return;
+        }
+        // A name bound anywhere in the file is left alone: lambda parameters,
+        // catch bindings, and pattern variables are not all modelled by
+        // `scope_at`, and a false positive is worse than a missed one.
+        if self.declared_names.contains(name) {
+            return;
+        }
+        let scope = types::scope_at(node, self.text, self.tree, self.model);
+        if scope.type_params.iter().any(|param| param == name) {
+            return;
+        }
+        if scope
+            .imports
+            .iter()
+            .any(|import| !import.is_wildcard && import.simple_name() == Some(name))
+        {
+            return;
+        }
+        if self.type_visible(name, &scope) {
+            return;
+        }
+        if let Some(resolved) = types::resolve_name(name, &scope, self.model) {
+            if !resolved.is_type {
+                return; // a local, field, parameter, or enclosing member
+            }
+        }
+        // A name the model knows as a type, used where a type is not expected,
+        // is a missing import; otherwise it is an unknown symbol with a stub.
+        let candidates = self.type_candidates(name);
+        let importable = self.importable(&candidates);
+        if !importable.is_empty() {
+            let data = json!({ "fix": FIX_ADD_IMPORT, "name": name, "candidates": importable });
+            self.push(
+                node,
+                CODE_UNRESOLVED_SYMBOL,
+                format!("cannot resolve `{name}`"),
+                data,
+            );
+            return;
+        }
+        // Any non-type declaration with this name elsewhere may be an
+        // outer-class field or a static-imported member this file cannot see; a
+        // wrong "create" would be worse than silence.
+        if self
+            .index
+            .query_name(name)
+            .iter()
+            .any(|entry| !types::is_type_kind(entry.kind))
+        {
+            return;
+        }
+        let is_call = node.parent().is_some_and(|parent| {
+            parent.kind() == "method_invocation"
+                && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|named| named.id() == node.id())
+        });
+        let data = json!({
+            "fix": FIX_CREATE_MEMBER,
+            "name": name,
+            "kind": if is_call { "method" } else { "field" },
+        });
+        self.push(
+            node,
+            CODE_UNRESOLVED_SYMBOL,
+            format!("cannot resolve `{name}`"),
+            data,
+        );
+    }
+
+    /// Whether `node` is a bare identifier used as a symbol reference: not a
+    /// declaration's own name, not a qualified-name segment, and not a member
+    /// the member check already owns, and in a recognized expression position.
+    fn is_symbolic_identifier(&self, node: Node) -> bool {
+        if node.kind() != "identifier" {
+            return false;
+        }
+        let Some(parent) = node.parent() else {
+            return false;
+        };
+        if is_declared_name(node, &parent) {
+            return false;
+        }
+        // The member check owns these two positions.
+        if parent.kind() == "field_access"
+            && parent
+                .child_by_field_name("field")
+                .is_some_and(|field| field.id() == node.id())
+        {
+            return false;
+        }
+        if parent.kind() == "method_invocation"
+            && parent.child_by_field_name("object").is_some()
+            && parent
+                .child_by_field_name("name")
+                .is_some_and(|named| named.id() == node.id())
+        {
+            return false;
+        }
+        matches!(
+            parent.kind(),
+            "argument_list"
+                | "assignment_expression"
+                | "binary_expression"
+                | "unary_expression"
+                | "parenthesized_expression"
+                | "ternary_expression"
+                | "array_access"
+                | "array_initializer"
+                | "return_statement"
+                | "throw_statement"
+                | "expression_statement"
+                | "if_statement"
+                | "while_statement"
+                | "do_statement"
+                | "enhanced_for_statement"
+                | "variable_declarator"
+                | "method_invocation"
+                | "field_access"
+        )
+    }
+
+    /// Flags an `import` whose target the index cannot supply: a single type by
+    /// package and name, a wildcard by package existence, a static import by
+    /// its type (and named member).
+    fn check_import(&mut self, node: Node) {
+        let raw = self.text[node.byte_range()].trim();
+        let raw = raw.strip_prefix("import").map_or(raw, str::trim);
+        let is_static = raw.starts_with("static");
+        let raw = raw.strip_prefix("static").map_or(raw, str::trim);
+        let path = raw.trim_end_matches(';').trim();
+        if path.is_empty() {
+            return;
+        }
+        let (path, is_wildcard) = match path.strip_suffix(".*") {
+            Some(head) => (head, true),
+            None => (path, false),
+        };
+        let resolved = if is_static {
+            self.static_import_resolves(path, is_wildcard)
+        } else if is_wildcard {
+            self.index.has_package(path)
+        } else {
+            self.type_import_resolves(path)
+        };
+        if resolved {
+            return;
+        }
+        self.push(
+            node,
+            CODE_UNRESOLVED_IMPORT,
+            format!("cannot resolve import `{path}`"),
+            json!({ "fix": "" }),
+        );
+    }
+
+    /// Whether an `import a.b.C;` (possibly a nested `a.b.Outer.Inner`) names a
+    /// type the index or the declared-type model holds.
+    fn type_import_resolves(&self, path: &str) -> bool {
+        let simple = path.rsplit('.').next().unwrap_or(path);
+        if self.index.query_name(simple).iter().any(|entry| {
+            types::is_type_kind(entry.kind) && import_target(entry).as_deref() == Some(path)
+        }) {
+            return true;
+        }
+        match path.rsplit_once('.') {
+            Some((package, _)) => self.model.find_in_package(simple, Some(package)).is_some(),
+            None => self.model.find_in_package(simple, None).is_some(),
+        }
+    }
+
+    fn static_import_resolves(&self, path: &str, is_wildcard: bool) -> bool {
+        let owner = if is_wildcard {
+            path
+        } else {
+            match path.rsplit_once('.') {
+                Some((owner, _)) => owner,
+                None => return false,
+            }
+        };
+        let owner_simple = owner.rsplit('.').next().unwrap_or(owner);
+        let owner_in_index = self.index.query_name(owner_simple).iter().any(|entry| {
+            types::is_type_kind(entry.kind) && import_target(entry).as_deref() == Some(owner)
+        });
+        let owner_in_model = match owner.rsplit_once('.') {
+            Some((package, _)) => self
+                .model
+                .find_in_package(owner_simple, Some(package))
+                .is_some(),
+            None => false,
+        };
+        if !(owner_in_index || owner_in_model) {
+            return false;
+        }
+        if is_wildcard {
+            return true;
+        }
+        let member = path.rsplit('.').next().unwrap_or(path);
+        let owner_ref = Ty::reference(owner);
+        types::member_of(&owner_ref, member, self.model, None).is_some()
+            || self
+                .model
+                .members(&owner_ref, None)
+                .iter()
+                .any(|candidate| candidate.name == member)
+    }
+
+    fn push(&mut self, node: Node, code: &str, message: String, data: serde_json::Value) {
+        self.out.push(Diagnostic {
+            range: lsp_range(self.text, &node),
+            severity: Some(DiagnosticSeverity::ERROR),
+            code: Some(NumberOrString::String(code.to_string())),
+            code_description: None,
+            source: Some("java-lsp".to_string()),
+            message,
+            related_information: None,
+            tags: None,
+            data: Some(data),
+        });
+    }
+}
+
+/// The simple type name a type node denotes, looking through `generic_type` and
+/// `array_type`; a qualified (`scoped_type_identifier`) name is left alone.
+fn base_type_name(node: Node) -> Option<Node> {
+    match node.kind() {
+        "type_identifier" => Some(node),
+        "generic_type" => node.child_by_field_name("type").and_then(base_type_name),
+        "array_type" => node.child_by_field_name("element").and_then(base_type_name),
+        _ => None,
+    }
+}
+
+/// The line after the file's `package` declaration, where an import goes when
+/// there are none yet.
+fn package_line(tree: &Tree) -> Option<u32> {
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let line = root
+        .children(&mut cursor)
+        .find(|child| child.kind() == "package_declaration")
+        .map(|child| (child.end_position().row + 1) as u32);
+    line
+}
+
+/// Whether an identifier node is a declaration's own name rather than a use.
+fn is_declared_name(node: Node, parent: &Node) -> bool {
+    let is_name = parent
+        .child_by_field_name("name")
+        .is_some_and(|named| named.id() == node.id());
+    if !is_name {
+        return false;
+    }
+    matches!(
+        parent.kind(),
+        "variable_declarator"
+            | "method_declaration"
+            | "constructor_declaration"
+            | "class_declaration"
+            | "interface_declaration"
+            | "enum_declaration"
+            | "record_declaration"
+            | "annotation_type_declaration"
+            | "formal_parameter"
+            | "spread_parameter"
+            | "catch_formal_parameter"
+            | "lambda_parameter"
+            | "enhanced_for_statement"
+            | "local_variable_declaration"
+            | "field_declaration"
+            | "annotation_type_element_declaration"
+    )
+}
+
+/// Collects every simple name the document binds: any identifier that is a
+/// parent's `name` field, plus lambda parameters. Used as a conservative guard
+/// so an unmodelled binding is never reported as unknown.
+fn collect_declared_names(node: Node, text: &str, out: &mut HashSet<String>) {
+    if node.kind() == "identifier" {
+        let is_binding = node.parent().is_some_and(|parent| {
+            parent
+                .child_by_field_name("name")
+                .is_some_and(|named| named.id() == node.id())
+                || matches!(parent.kind(), "inferred_parameters" | "lambda_parameters")
+        });
+        if is_binding {
+            out.insert(text[node.byte_range()].to_string());
+        }
     }
     let mut cursor = node.walk();
-    for child in node.named_children(&mut cursor) {
-        visit_type_positions(child, text, tree, model, out);
+    let children: Vec<Node> = node.named_children(&mut cursor).collect();
+    for child in children {
+        collect_declared_names(child, text, out);
     }
 }
 
-/// The type nodes of a construct that declares or constructs a type.
-fn checked_type_nodes(node: Node) -> Vec<Node> {
-    match node.kind() {
-        "object_creation_expression"
-        | "cast_expression"
-        | "field_declaration"
-        | "constant_declaration"
-        | "local_variable_declaration"
-        | "formal_parameter"
-        | "spread_parameter"
-        | "method_declaration"
-        | "enhanced_for_statement" => node.child_by_field_name("type").into_iter().collect(),
-        "superclass" => node.named_child(0).into_iter().collect(),
-        // An `implements`/`extends` clause wraps a `type_list`; checking the
-        // list's members here is enough, so the enclosing clause is left to the
-        // generic recursion rather than expanded a second time.
-        "type_list" => {
-            let mut cursor = node.walk();
-            node.named_children(&mut cursor).collect()
+/// The innermost type body enclosing `offset`, for inserting a created member.
+fn enclosing_type_body(tree: &Tree, offset: usize) -> Option<Node<'_>> {
+    let mut node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+    loop {
+        if matches!(
+            node.kind(),
+            "class_body" | "interface_body" | "enum_body" | "record_body" | "annotation_type_body"
+        ) {
+            return Some(node);
         }
-        _ => Vec::new(),
+        node = node.parent()?;
     }
 }
 
-/// Flags a simple, unqualified type name that neither an import, a type
-/// parameter, nor the model accounts for. Qualified names, generic arguments,
-/// and `var` are deliberately left alone rather than guessed at.
-fn check_type(
-    node: Node,
-    text: &str,
-    tree: &Tree,
-    model: &dyn TypeLookup,
-    out: &mut Vec<Diagnostic>,
-) {
-    if node.kind() != "type_identifier" {
-        return;
+/// A trivial source stub for a created type file.
+fn stub_type_source(package: Option<&str>, kind: &str, name: &str) -> String {
+    let keyword = if kind == "interface" {
+        "interface"
+    } else {
+        "class"
+    };
+    let body = format!("public {keyword} {name} {{\n}}\n");
+    match package {
+        Some(package) => format!("package {package};\n\n{body}"),
+        None => body,
     }
-    let name = &text[node.byte_range()];
-    if name.is_empty() || name == "var" {
-        return;
+}
+
+/// `name` if it is a legal Java identifier, so a create-stub cannot inject
+/// arbitrary text into a generated file or member.
+fn is_java_identifier(name: &str) -> bool {
+    let mut chars = name.chars();
+    match chars.next() {
+        Some(c) if c.is_alphabetic() || c == '_' || c == '$' => {}
+        _ => return false,
     }
-    let scope = types::scope_at(node, text, tree, model);
-    if scope.type_params.iter().any(|param| param == name) {
-        return;
+    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
+}
+
+/// A workspace edit holding plain text changes for one document.
+fn workspace_edit_changes(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
+    WorkspaceEdit {
+        changes: Some(HashMap::from([(uri.clone(), edits)])),
+        document_changes: None,
+        change_annotations: None,
     }
-    if scope
-        .imports
-        .iter()
-        .any(|import| import.simple_name() == Some(name))
-    {
-        return;
+}
+
+/// The closest candidate to `name` within a small edit distance, for a
+/// did-you-mean fix.
+fn nearest_name(name: &str, candidates: &[String]) -> Option<String> {
+    let mut best: Option<(usize, &String)> = None;
+    for candidate in candidates {
+        if candidate == name {
+            continue;
+        }
+        let distance = edit_distance(name, candidate);
+        if distance > 2 {
+            continue;
+        }
+        if best.is_none_or(|(best_distance, best_name)| {
+            distance < best_distance || (distance == best_distance && candidate < best_name)
+        }) {
+            best = Some((distance, candidate));
+        }
     }
-    if model.contains(name) {
-        return;
+    best.map(|(_, candidate)| candidate.clone())
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let a: Vec<char> = a.chars().collect();
+    let b: Vec<char> = b.chars().collect();
+    let mut previous: Vec<usize> = (0..=b.len()).collect();
+    let mut current = vec![0usize; b.len() + 1];
+    for (i, ca) in a.iter().enumerate() {
+        current[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            current[j + 1] = (previous[j + 1] + 1)
+                .min(current[j] + 1)
+                .min(previous[j] + cost);
+        }
+        std::mem::swap(&mut previous, &mut current);
     }
-    out.push(Diagnostic {
-        range: lsp_range(text, &node),
-        severity: Some(DiagnosticSeverity::WARNING),
-        source: Some("java-lsp".to_string()),
-        message: format!("type `{name}` cannot be resolved"),
-        ..Default::default()
-    });
+    previous[b.len()]
 }
 
 /// Converts a byte offset to an LSP position (line + UTF-16 code units).
@@ -5172,13 +6055,10 @@ class Widget {
 
     #[test]
     fn unresolved_type_names_are_diagnosed_but_known_ones_are_not() {
-        let engine = TreeSitterEngine::new();
-        engine
-            .index
-            .set_types(std::sync::Arc::new(TypeModel::from_entries(&[
-                synthetic_entry("Object", IndexKind::Class),
-                synthetic_entry("String", IndexKind::Class),
-            ])));
+        let engine = engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+        ]);
         let text = "\
 class Sample {
     Missing field;
@@ -5189,18 +6069,21 @@ class Sample {
         let diagnostics = engine.diagnostics(&uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(diagnostics[0].message.contains("Missing"));
-        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::WARNING));
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("unresolved-type".to_string()))
+        );
     }
 
     #[test]
     fn imported_and_wildcard_types_are_never_diagnosed() {
-        let engine = TreeSitterEngine::new();
-        engine
-            .index
-            .set_types(std::sync::Arc::new(TypeModel::from_entries(&[
-                synthetic_entry("Object", IndexKind::Class),
-                synthetic_entry("String", IndexKind::Class),
-            ])));
+        let engine = engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+            jdk_entry("Thing", IndexKind::Class, Some("com.external")),
+            jdk_entry("List", IndexKind::Interface, Some("java.util")),
+        ]);
         let text = "\
 import com.external.Thing;
 import java.util.*;
@@ -5212,7 +6095,275 @@ class Sample {
 }
 ";
         engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn an_unresolved_member_is_flagged_and_a_near_name_suggested() {
+        let engine = engine_with_model(list_model());
+        let text = "\
+package com.a;
+
+import java.util.List;
+
+class Sample {
+    void m() {
+        List<String> xs = null;
+        xs.sixe();
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("unresolved-member".to_string()))
+        );
+        assert_eq!(
+            diagnostics[0]
+                .data
+                .as_ref()
+                .and_then(|data| data.get("replacement"))
+                .and_then(|value| value.as_str()),
+            Some("size")
+        );
+    }
+
+    #[test]
+    fn a_did_you_mean_action_renames_the_member() {
+        let engine = engine_with_model(list_model());
+        let text = "\
+package com.a;
+
+import java.util.List;
+
+class Sample {
+    void m() {
+        List<String> xs = null;
+        xs.sixe();
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        let actions = engine.code_actions(&uri(), &diagnostics);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].title, "Change to `size`");
+        let edits = actions[0]
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri())
+            .unwrap();
+        assert_eq!(edits[0].new_text, "size");
+    }
+
+    #[test]
+    fn a_type_known_elsewhere_offers_an_import() {
+        let engine = engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+            jdk_entry("Widget", IndexKind::Class, Some("com.b")),
+        ]);
+        let text = "\
+class Sample {
+    Widget field;
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("unresolved-type".to_string()))
+        );
+        let candidates = diagnostics[0]
+            .data
+            .as_ref()
+            .and_then(|data| data.get("candidates"))
+            .and_then(|value| value.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(candidates, vec![serde_json::json!("com.b.Widget")]);
+
+        let actions = engine.code_actions(&uri(), &diagnostics);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].title, "Add import `com.b.Widget`");
+        let edits = actions[0]
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri())
+            .unwrap();
+        assert_eq!(edits[0].new_text, "import com.b.Widget;\n");
+    }
+
+    #[test]
+    fn a_create_type_action_needs_the_client_capability() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+class Sample {
+    Widget field;
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+
+        // Without the client capability, no create-type action is offered.
+        assert!(engine.code_actions(&uri(), &diagnostics).is_empty());
+
+        engine.set_resource_operations(true);
+        let actions = engine.code_actions(&uri(), &diagnostics);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].title, "Create class `Widget`");
+        assert!(actions[0]
+            .edit
+            .as_ref()
+            .and_then(|edit| edit.document_changes.as_ref())
+            .is_some());
+    }
+
+    #[test]
+    fn an_unknown_identifier_offers_a_member_stub() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+class Sample {
+    void m() {
+        missing = 1;
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("unresolved-symbol".to_string()))
+        );
+        let actions = engine.code_actions(&uri(), &diagnostics);
+        assert_eq!(actions.len(), 1, "{actions:?}");
+        assert_eq!(actions[0].title, "Create field `missing`");
+        let edits = actions[0]
+            .edit
+            .as_ref()
+            .unwrap()
+            .changes
+            .as_ref()
+            .unwrap()
+            .get(&uri())
+            .unwrap();
+        assert!(
+            edits[0].new_text.contains("private Object missing;"),
+            "{:?}",
+            edits[0].new_text
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_import_is_flagged() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+package com.a;
+
+import com.b.Nope;
+
+class Sample {
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("unresolved-import".to_string()))
+        );
+        assert!(diagnostics[0].message.contains("com.b.Nope"));
+    }
+
+    #[test]
+    fn a_wildcard_import_of_an_unknown_package_is_flagged() {
+        let engine = unknown_symbol_engine();
+        let text = "\
+import com.unknown.*;
+
+class Sample {
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("unresolved-import".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_static_import_checks_its_member() {
+        let engine = engine_with_model(source_model(
+            "java.util",
+            "public class Collections {\n    public static void sort(Object o) {\n    }\n}\n",
+        ));
+        let text = "\
+import static java.util.Collections.sort;
+import static java.util.Collections.sortt;
+
+class Sample {
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains("sortt"));
+    }
+
+    #[test]
+    fn a_lambda_parameter_is_not_an_unknown_symbol() {
+        // `x` in the lambda body is a binding `scope_at` does not model; the
+        // declared-name guard must keep it from being reported.
+        let engine = engine_with_model(list_model());
+        let text = "\
+package com.a;
+
+class Sample {
+    void m() {
+        var f = (int x) -> x + 1;
+    }
+}
+";
+        engine.open(&uri(), text);
+        let diagnostics = engine.diagnostics(&uri());
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn semantic_diagnostics_can_be_switched_off() {
+        let engine = unknown_symbol_engine();
+        let text = "class Sample {\n    Missing field;\n}\n";
+        engine.open(&uri(), text);
+        assert_eq!(engine.diagnostics(&uri()).len(), 1);
+        engine.set_semantic_diagnostics(false);
         assert!(engine.diagnostics(&uri()).is_empty());
+    }
+
+    #[test]
+    fn the_semantic_diagnostics_setting_maps_the_environment_value() {
+        assert!(semantic_diagnostics_setting(None));
+        assert!(semantic_diagnostics_setting(Some("1")));
+        assert!(semantic_diagnostics_setting(Some("true")));
+        assert!(!semantic_diagnostics_setting(Some("0")));
+        assert!(!semantic_diagnostics_setting(Some("false")));
+        assert!(!semantic_diagnostics_setting(Some("FALSE")));
     }
 
     #[test]
@@ -5426,6 +6577,65 @@ class Sample {
             dependency: true,
             library_source: false,
         }
+    }
+
+    /// A synthetic dependency entry in a given package.
+    fn jdk_entry(name: &str, kind: IndexKind, package: Option<&str>) -> SymbolEntry {
+        let mut entry = synthetic_entry(name, kind);
+        entry.package = package.map(str::to_string);
+        entry
+    }
+
+    /// An engine whose index and declared-type model both hold `entries`, so
+    /// the resolution and the import checks see the same world.
+    fn engine_with_types(entries: Vec<SymbolEntry>) -> TreeSitterEngine {
+        let engine = TreeSitterEngine::new();
+        let jar = Url::parse("file:///jdk.jar").unwrap();
+        engine.index.upsert_file(&jar, entries.clone());
+        engine
+            .index
+            .set_types(std::sync::Arc::new(TypeModel::from_entries(&entries)));
+        engine
+    }
+
+    /// A workspace type model from a Java source snippet in `package`, with
+    /// `java.lang.Object`/`String` added so the diagnostics gate is satisfied.
+    fn source_model(package: &str, source: &str) -> TypeModel {
+        let mut parser = java_parser();
+        let tree = parser.parse(source.as_bytes(), None).expect("parse");
+        let mut model = TypeModel::new();
+        model.extend(types::collect_type_infos(Some(package), &tree, source));
+        model.insert(types::TypeInfo::new(
+            "Object".to_string(),
+            Some("java.lang".to_string()),
+            IndexKind::Class,
+        ));
+        model.insert(types::TypeInfo::new(
+            "String".to_string(),
+            Some("java.lang".to_string()),
+            IndexKind::Class,
+        ));
+        model
+    }
+
+    fn engine_with_model(model: TypeModel) -> TreeSitterEngine {
+        let engine = TreeSitterEngine::new();
+        engine.index.set_types(std::sync::Arc::new(model));
+        engine
+    }
+
+    fn list_model() -> TypeModel {
+        source_model(
+            "java.util",
+            "public interface List<E> {\n    int size();\n    boolean isEmpty();\n}\n",
+        )
+    }
+
+    fn unknown_symbol_engine() -> TreeSitterEngine {
+        engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+        ])
     }
 
     /// Opens a helper declaration file in the engine so it appears in the

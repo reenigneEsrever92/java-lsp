@@ -10,6 +10,18 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-09-24
+
+- **Unresolved-symbol diagnostics and quick fixes** — the server now reports
+  unresolved types, members, bare identifiers, and imports as `ERROR`
+  diagnostics (gated on a clean parse and an indexed `java.lang`, disabled by
+  `JAVA_LSP_SEMANTIC_DIAGNOSTICS=0`), and serves `textDocument/codeAction`
+  (`codeActionProvider`, kind `quickfix`) offering "Add import", a did-you-mean
+  rename, and create-stub actions — the create-type fix a `CreateFile` resource
+  operation, withheld unless the client advertises it. Verified by
+  `cargo test --all-targets` (225 tests). See
+  [Unresolved-symbol diagnostics and quick fixes](backlog/unresolved-symbol-diagnostics.md).
+
 ## 2026-09-23
 
 - **Float literals and parameter hints honour overloads** — a floating literal

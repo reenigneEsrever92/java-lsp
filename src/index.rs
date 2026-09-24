@@ -60,6 +60,9 @@ pub struct SymbolEntry {
 struct IndexState {
     files: HashMap<Url, Vec<SymbolEntry>>,
     by_name: HashMap<String, Vec<SymbolEntry>>,
+    /// How many entries belong to each package, so a wildcard import can be
+    /// checked without scanning every entry.
+    packages: HashMap<String, usize>,
 }
 
 /// Cheaply cloneable handle to the shared index state and its warm flag.
@@ -89,9 +92,11 @@ impl WorkspaceIndex {
         if let Some(old) = state.files.insert(uri.clone(), entries.clone()) {
             for old_entry in old {
                 remove_from_name_index(&mut state, &old_entry);
+                remove_from_package_index(&mut state, &old_entry);
             }
         }
         for entry in entries {
+            add_to_package_index(&mut state, &entry);
             state
                 .by_name
                 .entry(entry.name.clone())
@@ -108,8 +113,18 @@ impl WorkspaceIndex {
         if let Some(old) = state.files.remove(uri) {
             for old_entry in old {
                 remove_from_name_index(&mut state, &old_entry);
+                remove_from_package_index(&mut state, &old_entry);
             }
         }
+    }
+
+    /// Whether any indexed declaration (a type, member, or import) sits in
+    /// `package`, so a wildcard import can be checked against the index.
+    pub fn has_package(&self, package: &str) -> bool {
+        self.state
+            .read()
+            .map(|state| state.packages.contains_key(package))
+            .unwrap_or(false)
     }
 
     /// All entries declared with exactly `name`.
@@ -238,6 +253,23 @@ fn remove_from_name_index(state: &mut IndexState, entry: &SymbolEntry) {
         list.retain(|candidate| candidate != entry);
         if list.is_empty() {
             state.by_name.remove(&entry.name);
+        }
+    }
+}
+
+fn add_to_package_index(state: &mut IndexState, entry: &SymbolEntry) {
+    if let Some(package) = &entry.package {
+        *state.packages.entry(package.clone()).or_default() += 1;
+    }
+}
+
+fn remove_from_package_index(state: &mut IndexState, entry: &SymbolEntry) {
+    if let Some(package) = &entry.package {
+        if let Some(count) = state.packages.get_mut(package) {
+            *count -= 1;
+            if *count == 0 {
+                state.packages.remove(package);
+            }
         }
     }
 }

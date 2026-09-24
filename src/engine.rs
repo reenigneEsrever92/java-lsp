@@ -13,8 +13,9 @@ use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
 use tower_lsp::lsp_types::{
-    CompletionResponse, Diagnostic, DocumentSymbol, FoldingRange, Hover, InlayHint, Location,
-    Position, Range, SemanticTokens, SignatureHelp, SymbolInformation, Url, WorkspaceEdit,
+    CodeAction, CompletionResponse, Diagnostic, DocumentSymbol, FoldingRange, Hover, InlayHint,
+    Location, Position, Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
+    WorkspaceEdit,
 };
 
 use crate::analysis::TreeSitterEngine;
@@ -30,6 +31,10 @@ type Reply<T> = oneshot::Sender<T>;
 pub enum Command {
     /// The workspace root is known; the background warm-up may start.
     SetWorkspaceRoot(Url),
+    /// Records whether the client supports the `CreateFile` resource operation.
+    SetClientCapabilities {
+        resource_operations: bool,
+    },
     Open {
         uri: Url,
         text: String,
@@ -93,6 +98,11 @@ pub enum Command {
     WorkspaceSymbols {
         query: String,
         reply: Reply<Vec<SymbolInformation>>,
+    },
+    CodeActions {
+        uri: Url,
+        diagnostics: Vec<Diagnostic>,
+        reply: Reply<Vec<CodeAction>>,
     },
     /// A flat snapshot of the index; a verification hook for tests.
     IndexedSymbols {
@@ -196,6 +206,17 @@ pub struct EngineHandle {
 impl EngineHandle {
     pub async fn set_workspace_root(&self, root: Url) {
         let _ = self.commands.send(Command::SetWorkspaceRoot(root)).await;
+    }
+
+    /// Tells the engine whether the client advertised `CreateFile`, so it may
+    /// offer the create-type quick fix.
+    pub async fn set_resource_operations(&self, supported: bool) {
+        let _ = self
+            .commands
+            .send(Command::SetClientCapabilities {
+                resource_operations: supported,
+            })
+            .await;
     }
 
     pub async fn open(&self, uri: Url, text: String, version: i32) {
@@ -318,6 +339,16 @@ impl EngineHandle {
             .unwrap_or_default()
     }
 
+    pub async fn code_actions(&self, uri: Url, diagnostics: Vec<Diagnostic>) -> Vec<CodeAction> {
+        self.request(|reply| Command::CodeActions {
+            uri,
+            diagnostics,
+            reply,
+        })
+        .await
+        .unwrap_or_default()
+    }
+
     pub async fn indexed_symbols(&self) -> Vec<SymbolEntry> {
         self.request(|reply| Command::IndexedSymbols { reply })
             .await
@@ -363,6 +394,9 @@ fn dispatch(
 ) {
     match command {
         Command::SetWorkspaceRoot(root) => engine.set_workspace_root(&root),
+        Command::SetClientCapabilities {
+            resource_operations,
+        } => engine.set_resource_operations(resource_operations),
         Command::Open { uri, text, version } => {
             engine.open(&uri, &text);
             publish_diagnostics(engine, events, uri, Some(version));
@@ -446,6 +480,15 @@ fn dispatch(
         Command::WorkspaceSymbols { query, reply } => read(
             engine,
             move |engine| engine.workspace_symbols(&query),
+            reply,
+        ),
+        Command::CodeActions {
+            uri,
+            diagnostics,
+            reply,
+        } => read(
+            engine,
+            move |engine| engine.code_actions(&uri, &diagnostics),
             reply,
         ),
         Command::IndexedSymbols { reply } => read(engine, |engine| engine.indexed_symbols(), reply),

@@ -28,8 +28,10 @@ All use cases belong to the Java developer.
   go-to-definition backed by the symbol index (declarations, imports, and
   unambiguous references) — including into a dependency's fetched sources —
   and query workspace symbols.
-- **UC4 — See syntax diagnostics.** When a file has parse errors, they are
-  reported as diagnostics on open and on edit.
+- **UC4 — See diagnostics.** Parse errors and unresolved symbols are reported
+  as diagnostics on open and on edit — a type, member, bare identifier, or
+  import that does not resolve (including a symbol that exists but is not
+  imported) — each unresolved symbol with a quick fix.
 
 ## Technology choices
 
@@ -69,6 +71,7 @@ All use cases belong to the Java developer.
 | R8 | Gradle project model | Functional | low | deferred |
 | R9 | Inlay hints: variable types (including `var` inference), parameter names, and chained-call return types, computed for the requested range | Functional | medium | UC1, R7 |
 | R10 | Dependency sources fetched and indexed; go-to-definition opens library declarations | Functional | medium | UC3 |
+| R11 | Semantic diagnostics: unresolved types, members, identifiers, and imports reported as errors, each with a code-action quick fix (add import, did-you-mean, create stub) | Functional | medium | UC4, R7 |
 
 ## Milestones
 
@@ -135,3 +138,11 @@ workspace-only — the cache is never searched or edited.
 
 **Deferred**: Gradle project model support (what remains of R8) stays listed
 here so a later change request can pick it up.
+
+**v0.6 — unresolved-symbol diagnostics**: the type layer turns from an on-demand
+answer into red squiggles. Unresolved types, members on a known receiver, bare
+identifiers, and imports are reported as `ERROR` diagnostics — each with a quick
+fix (add the missing import, change to a near member, or create a class/interface/
+method stub) served through a new `codeActionProvider` — gated on a clean parse
+and an indexed `java.lang`, and switchable off with `JAVA_LSP_SEMANTIC_DIAGNOSTICS`
+(R11; see `unresolved-symbol-diagnostics` in the backlog).

@@ -68,7 +68,8 @@ graph LR
 - **LSP shell** (`server.rs`): implements `tower_lsp::LanguageServer`.
   `initialize` advertises incremental text sync, hover, definition,
   completions, signature help, document symbols, workspace symbols, folding
-  ranges, semantic tokens, references, rename, and inlay hints.
+  ranges, semantic tokens, references, rename, code actions (kind `quickfix`),
+  and inlay hints.
   `didOpen`/`didChange`/`didClose` update the document store and send the
   matching command; the engine's diagnostics come back as events, which the
   shell's drain task publishes. Query handlers await the engine handle. That
@@ -246,12 +247,23 @@ graph LR
   (a lone `null` yielding the other branch), array creation, `instanceof`, or
   `switch` expression). Everything the layer cannot pin to a single
   answer is `Unknown`, and callers treat that as "no answer".
-  **Semantic diagnostics** flag a simple type name in a declaration, `new`,
-  cast, `extends`, or `implements` that resolves nowhere — but only when the
-  model actually vouches for `java.lang` (an indexed JDK), and only for files
-  that parse cleanly, so neither a missing JDK nor a missing dependency turns
-  into a wall of false positives. Qualified names, generic arguments, `var`,
-  and type parameters are left alone rather than guessed at.
+  **Semantic diagnostics** report unresolved symbols at `ERROR` severity across
+  four families: a simple type name in a declaration, `new`, a cast, `extends`,
+  or `implements`; a member access on a receiver whose type is known; a bare
+  identifier that resolves nowhere; and an `import` whose target the index
+  cannot supply (a single type, a best-effort `.*` wildcard, or a `static`
+  import). A name known in the index but not visible here (no import, another
+  package) is reported on its *usage*, with a quick fix to add the import; a
+  name nowhere in the index offers a create-stub fix; an unresolved member
+  offers a did-you-mean rename. All of it is gated on the model actually
+  vouching for `java.lang` (an indexed JDK) and on the file parsing cleanly, so
+  neither a missing JDK nor a broken file turns into a wall of false positives;
+  a missing dependency is reported (imports and usages go red) rather than
+  silently skipped. Qualified names, generic arguments, `var`, type parameters,
+  and any name bound anywhere in the file are left alone rather than guessed at
+  (the scope collector does not model every binding kind, so a lambda parameter
+  or catch binding is never reported), and the check is switched off wholesale
+  by `JAVA_LSP_SEMANTIC_DIAGNOSTICS`.
   Known approximations, documented rather than hidden: a simple type name
   resolves in Java's order — an exact single-type import, the file's own
   package, a wildcard import, then a unique model match — so a name shared
@@ -278,15 +290,21 @@ graph LR
   inherited `toString()`/`equals()`/... types a call, hover, and `var`
   inference — and only for a known reference-ish receiver (`Ref`/`Var`/`Array`),
   never an `Unknown` one.
-  The semantic diagnostic is deliberately narrow so it never cries wolf: it
-  checks a bare simple type name in a declaration, `new`, a cast, `extends`, or
-  `implements` only, and treats a name the model knows in *any* package as
-  resolved, so it under-reports rather than risk a false positive on a name it
-  cannot fully reason about. Overload selection by argument types is now
+  Overload selection by argument types is now
   available to definition, find-references, completions, and inlay hints (see
   the type layer's
   `assignable` relation); full Java overload resolution, lambdas, casts, and
   static-import member resolution remain follow-up work (R7 remainder, R8).
+  Each semantic diagnostic carries a `code` (`unresolved-type`,
+  `unresolved-member`, `unresolved-symbol`, `unresolved-import`) and `data`
+  (the symbol name and its importable candidates), which the shell's code-action
+  handler turns into a quick fix: one "Add import" per candidate (from
+  `import_edit`), a "Change to `x`" rename for a near member, or a
+  "Create class/interface/method" stub. The create-type fix builds a `CreateFile`
+  resource operation plus a `TextDocumentEdit` for a new file under the source
+  root of the file's own package, and is offered only when the client
+  advertises `workspace.workspaceEdit.resourceOperations` including `CreateFile`
+  (read in `initialize` and forwarded to the engine).
 - **Inlay hints** (`analysis.rs`, R9): computed on demand for the range
   the client requests — the tree walk is pruned to that range, so cost scales
   with the visible text rather than the file. Three families: variable type
