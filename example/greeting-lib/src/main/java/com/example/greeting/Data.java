@@ -8,5 +8,7 @@ public record Data(
     public void test(int count) {}
 
     public void test(float number) {}
+
+    public void shout() {}
 }
 

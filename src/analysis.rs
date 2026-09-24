@@ -30,7 +30,7 @@ use tower_lsp::lsp_types::{
 };
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::engine::Reporter;
+use crate::engine::{Reporter, WatchedChange};
 use crate::index::{
     extract_entries, java_parser, scan_workspace, scan_workspace_async, IndexKind, SymbolEntry,
     WorkspaceIndex,
@@ -76,6 +76,11 @@ struct ParsedDocument {
 pub struct TreeSitterEngine {
     parser: Mutex<Parser>,
     documents: Mutex<HashMap<Url, ParsedDocument>>,
+    /// Declared-type models for sources whose types differ from the warm-up
+    /// base: every open buffer, plus any file a watcher event or close re-read.
+    /// [`TypeQuery`] layers their union over the base, so an edit replaces the
+    /// file's stale warm-up contribution and cross-file edits are visible.
+    dirty: Mutex<HashMap<Url, TypeModel>>,
     index: WorkspaceIndex,
     workspace_root: Mutex<Option<Url>>,
     /// Whether semantic (unresolved-symbol) diagnostics are enabled; read from
@@ -94,6 +99,7 @@ impl TreeSitterEngine {
         Self {
             parser: Mutex::new(java_parser()),
             documents: Mutex::new(HashMap::new()),
+            dirty: Mutex::new(HashMap::new()),
             index: WorkspaceIndex::new(),
             workspace_root: Mutex::new(None),
             semantic_diagnostics: AtomicBool::new(semantic_diagnostics_enabled()),
@@ -125,6 +131,7 @@ impl TreeSitterEngine {
         if let Ok(mut parser) = self.parser.lock() {
             if let Some(tree) = parser.parse(text.as_bytes(), None) {
                 let entries = extract_entries(uri, &tree, text);
+                let types = model_of(&tree, text);
                 if let Ok(mut documents) = self.documents.lock() {
                     documents.insert(
                         uri.clone(),
@@ -135,6 +142,7 @@ impl TreeSitterEngine {
                     );
                 }
                 self.index.upsert_file(uri, entries);
+                self.record_types(uri, types);
             }
         }
     }
@@ -145,10 +153,37 @@ impl TreeSitterEngine {
         let Some(path) = uri.to_file_path().ok() else {
             return false;
         };
+        if !self.is_workspace_source(&path) {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.index.remove_file(uri);
+            self.drop_types(uri);
+            return true;
+        };
+        self.index_source(uri, &text);
+        true
+    }
+
+    /// Parses `text` and replaces `uri`'s index entries and its contribution to
+    /// the analysis model, without touching the open-document map.
+    fn index_source(&self, uri: &Url, text: &str) {
+        let Ok(mut parser) = self.parser.lock() else {
+            return;
+        };
+        let Some(tree) = parser.parse(text.as_bytes(), None) else {
+            return;
+        };
+        self.index
+            .upsert_file(uri, extract_entries(uri, &tree, text));
+        self.record_types(uri, model_of(&tree, text));
+    }
+
+    /// Whether `path` lies in a workspace source root (or, before the scan has
+    /// set a project model, in the workspace root).
+    fn is_workspace_source(&self, path: &std::path::Path) -> bool {
         let roots = self.index.source_roots();
-        let inside = if roots.is_empty() {
-            // No scan has run (or no root was set): fall back to the raw
-            // workspace root check, matching pre-model behaviour.
+        if roots.is_empty() {
             self.workspace_root
                 .lock()
                 .ok()
@@ -157,23 +192,49 @@ impl TreeSitterEngine {
                 .is_some_and(|root_path| path.starts_with(root_path))
         } else {
             roots.iter().any(|root| path.starts_with(root))
-        };
-        if !inside {
-            return false;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            self.index.remove_file(uri);
-            return true;
-        };
-        if let Ok(mut parser) = self.parser.lock() {
-            if let Some(tree) = parser.parse(text.as_bytes(), None) {
-                let entries = extract_entries(uri, &tree, &text);
-                self.index.upsert_file(uri, entries);
-                return true;
+    }
+
+    fn record_types(&self, uri: &Url, types: TypeModel) {
+        if let Ok(mut dirty) = self.dirty.lock() {
+            dirty.insert(uri.clone(), types);
+        }
+    }
+
+    fn drop_types(&self, uri: &Url) {
+        if let Ok(mut dirty) = self.dirty.lock() {
+            dirty.remove(uri);
+        }
+    }
+
+    /// The union of every workspace source's declared types with the dirty
+    /// overlay layered over them: an open buffer, a watched change, or a close
+    /// re-read replaces its file's warm-up contribution. A deleted file is
+    /// absent from both maps, so its types vanish from every model-based
+    /// feature.
+    fn overlay_model(&self) -> TypeModel {
+        let sources = self.index.source_models();
+        let dirty = self.dirty.lock().ok();
+        let mut model = TypeModel::new();
+        let mut overridden: HashSet<Url> = HashSet::with_capacity(sources.len());
+        for (uri, warm) in &sources {
+            overridden.insert(uri.clone());
+            let chosen = dirty
+                .as_ref()
+                .and_then(|dirty| dirty.get(uri))
+                .unwrap_or(warm);
+            model.merge(chosen);
+        }
+        // A file that exists only in the overlay — created after warm-up — has
+        // no source model to replace, so merge it on its own.
+        if let Some(dirty) = dirty.as_ref() {
+            for (uri, types) in dirty.iter() {
+                if !overridden.contains(uri) {
+                    model.merge(types);
+                }
             }
         }
-        self.index.remove_file(uri);
-        true
+        model
     }
 
     /// Completion items for a member access after `.`: the receiver's inferred
@@ -189,11 +250,11 @@ impl TreeSitterEngine {
         let Some(object) = receiver_before_dot(&document.tree, text, offset) else {
             return Vec::new();
         };
-        let local = local_model(document);
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let scope = types::scope_at(object, text, &document.tree, &query);
 
         let static_only = matches!(object.kind(), "identifier" | "type_identifier")
@@ -256,11 +317,11 @@ impl TreeSitterEngine {
         let tree = &document.tree;
         let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
         let node = cursor_node(tree, node, text, offset);
-        let local = local_model(document);
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let scope = types::scope_at(node, text, tree, &query);
 
         // Inside an import declaration, the dotted path's last segment names the
@@ -625,13 +686,14 @@ impl TreeSitterEngine {
                     if &uri != requested {
                         continue;
                     }
-                    let package = types::file_package(&tree, &text);
-                    let mut local = TypeModel::new();
-                    local.extend(types::collect_type_infos(package.as_deref(), &tree, &text));
+                    // The whole workspace model (base plus every source's model,
+                    // with the dirty overlay on top), so a receiver in this file
+                    // still resolves the type its member belongs to.
+                    let overlay = self.overlay_model();
                     let workspace = self.index.type_model();
                     let empty = TypeModel::new();
                     let base = workspace.as_deref().unwrap_or(&empty);
-                    let query = TypeQuery::new(base, &local);
+                    let query = TypeQuery::new(base, &overlay);
                     collect_local_occurrences(
                         &tree.root_node(),
                         &text,
@@ -666,12 +728,14 @@ impl TreeSitterEngine {
         seen: &mut HashSet<(String, u32, u32)>,
     ) {
         let package = types::file_package(tree, text);
-        let mut local = TypeModel::new();
-        local.extend(types::collect_type_infos(package.as_deref(), tree, text));
+        // The whole workspace model (base plus every source's model, with the
+        // dirty overlay on top), so a receiver in this file still resolves the
+        // type its member belongs to.
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
 
         // The declaring type's byte span in this file, when this is its file.
         let owner_span = target.owner.as_ref().and_then(|owner| {
@@ -721,7 +785,56 @@ impl TreeSitterEngine {
         }
         if !self.reindex_from_disk(uri) {
             self.index.remove_file(uri);
+            self.drop_types(uri);
         }
+    }
+
+    /// Applies watched filesystem events: re-indexes a created/changed file from
+    /// disk and drops a deleted one. A file the editor currently has open is
+    /// skipped — its `didChange` is authoritative (D2) — and so is a path
+    /// outside every source root. Reports whether anything changed, so the
+    /// caller can republish diagnostics for the open documents that can see it.
+    pub fn watched_files(&self, changes: &[(Url, WatchedChange)]) -> bool {
+        let mut changed = false;
+        for (uri, change) in changes {
+            if self.is_open(uri) {
+                continue;
+            }
+            match change {
+                WatchedChange::Deleted => {
+                    if uri
+                        .to_file_path()
+                        .is_ok_and(|path| self.is_workspace_source(&path))
+                    {
+                        self.index.remove_file(uri);
+                        self.drop_types(uri);
+                        changed = true;
+                    }
+                }
+                WatchedChange::Created | WatchedChange::Changed => {
+                    changed |= self.reindex_from_disk(uri);
+                }
+            }
+        }
+        changed
+    }
+
+    /// The URIs the editor currently has open, sorted — the set a diagnostics
+    /// republish covers.
+    pub fn open_documents(&self) -> Vec<Url> {
+        let Ok(documents) = self.documents.lock() else {
+            return Vec::new();
+        };
+        let mut uris: Vec<Url> = documents.keys().cloned().collect();
+        uris.sort();
+        uris
+    }
+
+    fn is_open(&self, uri: &Url) -> bool {
+        self.documents
+            .lock()
+            .map(|documents| documents.contains_key(uri))
+            .unwrap_or(false)
     }
 
     pub fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
@@ -739,7 +852,8 @@ impl TreeSitterEngine {
             return diagnostics;
         }
         if self.semantic_diagnostics.load(Ordering::Relaxed) {
-            diagnostics.extend(semantic_diagnostics(document, uri, &self.index));
+            let overlay = self.overlay_model();
+            diagnostics.extend(semantic_diagnostics(document, uri, &self.index, &overlay));
         }
         diagnostics
     }
@@ -756,11 +870,11 @@ impl TreeSitterEngine {
             return Vec::new();
         };
         // The type model, for inferring created signatures from the usage.
-        let local = local_model(document);
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let mut actions = Vec::new();
         for diagnostic in diagnostics {
             if diagnostic.source.as_deref() != Some("java-lsp") {
@@ -1151,11 +1265,11 @@ impl TreeSitterEngine {
             .root_node()
             .descendant_for_byte_range(offset, offset)?;
         let node = cursor_node(&document.tree, node, text, offset);
-        let local = local_model(document);
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let value = hover_value(node, text, &document.tree, &query)?;
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -1257,11 +1371,11 @@ impl TreeSitterEngine {
         {
             return None;
         }
-        let local = local_model(document);
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let scope = types::scope_at(*node, text, &document.tree, &query);
         let receiver = match parent.child_by_field_name("object") {
             Some(object) => types::receiver_type(&object, text, &scope, &query),
@@ -1449,13 +1563,13 @@ impl TreeSitterEngine {
         let imports = collect_imports(&document.tree.root_node(), &document.text);
         let entries = self.index.query_prefix(prefix);
         let ambiguous = ambiguous_names(&entries);
-        // A type model layered with the open buffer, so a method's overloads
-        // reflect unsaved edits.
-        let local = local_model(document);
+        // A type model layered with every open buffer, so a method's overloads
+        // reflect unsaved edits — including edits to other files.
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         for entry in entries {
             let Some(kind) = completion_kind(entry.kind) else {
                 continue;
@@ -1608,11 +1722,11 @@ impl TreeSitterEngine {
         if end <= start {
             return Vec::new();
         }
-        let local = local_model(document);
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let mut hints = Vec::new();
         collect_inlay_hints(
             document.tree.root_node(),
@@ -1645,11 +1759,11 @@ impl TreeSitterEngine {
         let name_node = call.child_by_field_name("name")?;
         let name = &text[name_node.byte_range()];
 
-        let local = local_model(document);
+        let overlay = self.overlay_model();
         let workspace = self.index.type_model();
         let empty = TypeModel::new();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let scope = types::scope_at(name_node, text, &document.tree, &query);
 
         let (receiver, static_only) = match call.child_by_field_name("object") {
@@ -2490,16 +2604,12 @@ fn is_type_node(kind: &str) -> bool {
     )
 }
 
-/// The declared-type model of one open document, to be layered over the
+/// The declared-type model of one parsed Java source, to be layered over the
 /// workspace model so unsaved edits are what features answer from.
-fn local_model(document: &ParsedDocument) -> TypeModel {
-    let package = types::file_package(&document.tree, &document.text);
+fn model_of(tree: &Tree, text: &str) -> TypeModel {
+    let package = types::file_package(tree, text);
     let mut model = TypeModel::new();
-    model.extend(types::collect_type_infos(
-        package.as_deref(),
-        &document.tree,
-        &document.text,
-    ));
+    model.extend(types::collect_type_infos(package.as_deref(), tree, text));
     model
 }
 
@@ -3096,6 +3206,7 @@ fn semantic_diagnostics(
     document: &ParsedDocument,
     uri: &Url,
     index: &WorkspaceIndex,
+    overlay: &TypeModel,
 ) -> Vec<Diagnostic> {
     let Some(workspace) = index.type_model() else {
         return Vec::new();
@@ -3103,8 +3214,7 @@ fn semantic_diagnostics(
     if !workspace.contains("Object") || !workspace.contains("String") {
         return Vec::new();
     }
-    let local = local_model(document);
-    let query = TypeQuery::new(&workspace, &local);
+    let query = TypeQuery::new(&workspace, overlay);
     let mut check = SemanticCheck::new(uri, document, index, &query);
     check.visit(document.tree.root_node());
     check.out
@@ -6549,6 +6659,317 @@ class Sample {
     }
 
     #[test]
+    fn accepting_the_add_import_clears_the_diagnostic() {
+        let engine = engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+            jdk_entry("Widget", IndexKind::Class, Some("com.b")),
+        ]);
+        engine.open(&uri(), "class Sample {\n    Widget field;\n}\n");
+        assert_eq!(engine.diagnostics(&uri()).len(), 1);
+        engine.change(
+            &uri(),
+            "import com.b.Widget;\n\nclass Sample {\n    Widget field;\n}\n",
+        );
+        assert!(
+            engine.diagnostics(&uri()).is_empty(),
+            "{:?}",
+            engine.diagnostics(&uri())
+        );
+    }
+
+    #[test]
+    fn a_method_created_in_the_open_file_completes_after_a_dot() {
+        let engine = unknown_symbol_engine();
+        let text = "class Sample {\n    public void newMethod() {\n    }\n\n    void m() {\n        Sample s = this;\n        s.newMethod();\n    }\n}\n";
+        engine.open(&uri(), text);
+        let offset = text.find("s.newMethod").unwrap() + 2;
+        let response = engine
+            .completions(&uri(), lsp_position(text, offset))
+            .expect("completions");
+        let labels: Vec<String> = match response {
+            CompletionResponse::Array(items) => items
+                .into_iter()
+                .filter_map(|item| item.filter_text)
+                .collect(),
+            _ => Vec::new(),
+        };
+        assert!(
+            labels.iter().any(|label| label == "newMethod"),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_method_added_to_another_open_file_completes_and_defines_alike() {
+        // The isolated asymmetry: the workspace model is built before the edit
+        // and the method arrives through `change` on another buffer. Definition
+        // already reached it through the index; completion must agree (D4/D5).
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "cross-file-model",
+            &[
+                ("a/Widget.java", "package a;\n\npublic class Widget {\n}\n"),
+                (
+                    "a/Use.java",
+                    "package a;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let widget_uri = Url::from_file_path(root.join("a/Widget.java")).unwrap();
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        let widget_text = std::fs::read_to_string(root.join("a/Widget.java")).unwrap();
+        engine.open(&use_uri, &use_text);
+        engine.open(&widget_uri, &widget_text);
+        // The edit lands on the *other* open file.
+        engine.change(
+            &widget_uri,
+            "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+        );
+
+        let definition = engine
+            .definition(
+                &use_uri,
+                lsp_position(&use_text, use_text.find("w.run").unwrap() + 3),
+            )
+            .expect("definition resolves the added method");
+        assert_eq!(definition.uri, widget_uri);
+
+        let response = engine
+            .completions(
+                &use_uri,
+                lsp_position(&use_text, use_text.find("w.run").unwrap() + 2),
+            )
+            .expect("completions");
+        let CompletionResponse::Array(items) = response else {
+            panic!("expected an array after `.`");
+        };
+        let labels: Vec<String> = items
+            .into_iter()
+            .filter_map(|item| item.filter_text)
+            .collect();
+        assert!(labels.iter().any(|label| label == "run"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_watched_create_is_indexed_and_a_delete_drops_it_again() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "watched-create",
+            &[(
+                "a/Use.java",
+                "package a;\n\nclass Use {\n    Widget w = null;\n}\n",
+            )],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text);
+        assert!(engine.index.query_name("Widget").is_empty());
+
+        // A file created on disk, never opened, becomes visible.
+        let widget_path = root.join("a").join("Widget.java");
+        std::fs::write(&widget_path, "package a;\n\npublic class Widget {\n}\n").unwrap();
+        let widget_uri = Url::from_file_path(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri.clone(), WatchedChange::Created)]));
+        let entries = engine.index.query_name("Widget");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(entries[0].uri, widget_uri);
+
+        // A later disk change replaces its entries and its model contribution.
+        std::fs::write(
+            &widget_path,
+            "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+        )
+        .unwrap();
+        assert!(engine.watched_files(&[(widget_uri.clone(), WatchedChange::Changed)]));
+        assert!(engine
+            .index
+            .query_name("run")
+            .iter()
+            .any(|entry| entry.uri == widget_uri));
+
+        // Deleting it drops its entries.
+        std::fs::remove_file(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]));
+        assert!(engine.index.query_name("Widget").is_empty());
+    }
+
+    #[test]
+    fn a_watched_event_for_an_open_buffer_is_ignored() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "watched-open",
+            &[("a/Widget.java", "package a;\n\npublic class Widget {\n}\n")],
+        );
+        let engine = scanned_engine(&root_uri);
+        let widget_path = root.join("a/Widget.java");
+        let widget_uri = Url::from_file_path(&widget_path).unwrap();
+        // The buffer holds an unsaved edit the watcher must not override (D2).
+        engine.open(
+            &widget_uri,
+            "package a;\n\npublic class Widget {\n    void unsaved() {}\n}\n",
+        );
+        std::fs::write(
+            &widget_path,
+            "package a;\n\npublic class Widget {\n    void fromDisk() {}\n}\n",
+        )
+        .unwrap();
+
+        assert!(!engine.watched_files(&[(widget_uri.clone(), WatchedChange::Changed)]));
+        assert!(engine
+            .index
+            .query_name("unsaved")
+            .iter()
+            .any(|entry| entry.uri == widget_uri));
+        assert!(engine.index.query_name("fromDisk").is_empty());
+    }
+
+    #[test]
+    fn a_deleted_warmup_source_is_forgotten() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "deleted-warmup",
+            &[
+                (
+                    "a/Widget.java",
+                    "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+                ),
+                (
+                    "a/Use.java",
+                    "package a;\n\nclass Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text);
+
+        let labels = |engine: &TreeSitterEngine| -> Vec<String> {
+            let offset = use_text.find("w.run").unwrap() + 2;
+            match engine.completions(&use_uri, lsp_position(&use_text, offset)) {
+                Some(CompletionResponse::Array(items)) => items
+                    .into_iter()
+                    .filter_map(|item| item.filter_text)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        assert!(labels(&engine).contains(&"run".to_string()));
+
+        let widget_uri = Url::from_file_path(root.join("a/Widget.java")).unwrap();
+        std::fs::remove_file(root.join("a/Widget.java")).unwrap();
+        engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]);
+
+        assert!(engine.index.query_name("Widget").is_empty());
+        let after = labels(&engine);
+        assert!(
+            !after.contains(&"run".to_string()),
+            "deleted type still resolves: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_warmup_source_stops_resolving_in_hover() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "deleted-hover",
+            &[
+                (
+                    "a/Widget.java",
+                    "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+                ),
+                (
+                    "a/Use.java",
+                    "package a;\n\nclass Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text);
+
+        let member_hover = lsp_position(&use_text, use_text.find("w.run").unwrap() + 2);
+        assert!(
+            engine.hover(&use_uri, member_hover).is_some(),
+            "the warm-up member must hover before the delete"
+        );
+
+        let widget_uri = Url::from_file_path(root.join("a/Widget.java")).unwrap();
+        std::fs::remove_file(root.join("a/Widget.java")).unwrap();
+        engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]);
+
+        assert!(
+            engine.hover(&use_uri, member_hover).is_none(),
+            "a deleted type's member must not hover"
+        );
+    }
+
+    #[test]
+    fn a_deleted_watched_only_source_leaves_nothing_behind() {
+        // A file that exists only in the dirty overlay — created after warm-up
+        // and never opened — must vanish from the model when it is deleted, not
+        // just from the index (the warm-up model never contained it).
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "deleted-dirty-only",
+            &[(
+                "a/Use.java",
+                "package a;\n\nclass Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+            )],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text);
+
+        let labels = |engine: &TreeSitterEngine| -> Vec<String> {
+            let offset = use_text.find("w.run").unwrap() + 2;
+            match engine.completions(&use_uri, lsp_position(&use_text, offset)) {
+                Some(CompletionResponse::Array(items)) => items
+                    .into_iter()
+                    .filter_map(|item| item.filter_text)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        assert!(!labels(&engine).contains(&"run".to_string()));
+
+        // Created on disk, never opened: only the dirty overlay knows it.
+        let widget_path = root.join("a/Widget.java");
+        std::fs::write(
+            &widget_path,
+            "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+        )
+        .unwrap();
+        let widget_uri = Url::from_file_path(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri.clone(), WatchedChange::Created)]));
+        assert!(
+            labels(&engine).contains(&"run".to_string()),
+            "the watched create must be visible cross-file"
+        );
+
+        std::fs::remove_file(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]));
+        assert!(engine.index.query_name("Widget").is_empty());
+        let after = labels(&engine);
+        assert!(
+            !after.contains(&"run".to_string()),
+            "a deleted watched-only type still resolves: {after:?}"
+        );
+    }
+
+    #[test]
     fn a_create_type_action_needs_the_client_capability() {
         let engine = unknown_symbol_engine();
         let text = "\
@@ -7370,10 +7791,13 @@ package com.a;\n\nclass Sample {\n    void m() {\n        String s = getNa;\n   
             "getNa".len(),
         );
 
+        // The helper buffer is part of the overlay (D4), so the model resolves
+        // the member: it is offered with its real signature, import included.
         let get_name = items
             .iter()
-            .find(|item| item.label == "Widget.getName")
+            .find(|item| item.filter_text.as_deref() == Some("getName"))
             .expect("member offered");
+        assert_eq!(get_name.label, "String getName()");
         let edits = get_name
             .additional_text_edits
             .as_ref()

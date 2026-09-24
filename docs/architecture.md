@@ -72,7 +72,14 @@ graph LR
   and inlay hints.
   `didOpen`/`didChange`/`didClose` update the document store and send the
   matching command; the engine's diagnostics come back as events, which the
-  shell's drain task publishes. Query handlers await the engine handle. That
+  shell's drain task publishes. `initialized` also registers
+  `workspace/didChangeWatchedFiles` for `**/*.java` when the client advertises
+  `workspace.didChangeWatchedFiles.dynamicRegistration` — a fire-and-forget
+  `client/registerCapability`, so the handshake never waits on the client — and
+  the `didChangeWatchedFiles` handler forwards each created/changed/deleted
+  event to the engine; without the capability the watcher is simply skipped and
+  everything else stands (D6).
+  Query handlers await the engine handle. That
   same drain task renders the engine's progress events as
   `window/workDoneProgress/create` plus `$/progress` — one status-bar item
   titled `java-lsp`, whose message names the current phase and whose percentage
@@ -88,8 +95,9 @@ graph LR
   only place position semantics are handled on the way in.
 - **Engine boundary** (`engine.rs`): the shell never touches the core directly.
   It holds an `EngineHandle` (cheap, cloneable) and sends a `Command` per LSP
-  handler — `SetWorkspaceRoot`, `Open`/`Change`/`Close`, and one variant per
-  query, each carrying a `oneshot` reply — to a single dispatcher task that owns
+  handler — `SetWorkspaceRoot`, `Open`/`Change`/`Close`, `WatchedFiles`, and one
+  variant per query (the queries carrying a `oneshot` reply) — to a single
+  dispatcher task that owns
   the core. The dispatcher applies mutations and orchestration **inline, in
   arrival order** (the one place ordering matters: an edit must land before the
   query the client sends at the new cursor) and hands read-only queries to
@@ -97,8 +105,13 @@ graph LR
   concurrency the old read-locked handle gave, made explicit. `EngineEvent` is
   the reverse channel the previous `&self` trait could not express:
   `Diagnostics { uri, version, diagnostics }`, emitted after an applied
-  open/change (and an empty one after a close), and — from the background
-  warm-up — `Progress(ProgressUpdate)` (begin/update/end with a phase message, a
+  open/change, after a close (an empty event clears the closed document, and
+  the other open documents are republished), and after a watched-file event
+  that changed the index or model — each pass covering **every** open document,
+  the just-edited one first, so a referring file's squiggles clear without an
+  edit of its own (D3). From the background
+  warm-up come
+  `Progress(ProgressUpdate)` (begin/update/end with a phase message, a
   count, and an optional download percentage) and `Message { level, text }`. The
   shell owns a drain task that
   turns each into a client notification (the events channel is unbounded, so a
@@ -141,7 +154,10 @@ graph LR
   fields keeping their name and their type in `detail` (inherited members
   included for workspace types) — while an uninferrable receiver still returns
   an empty list, claiming nothing a type-free engine
-  cannot verify. The receiver of a `.` is normally the tree's member access, but
+  cannot verify. The receiver's members come from the model layered with
+  **all** open buffers (see the `types.rs` bullet), so a member added to
+  another open file — or to a file a watcher event re-read — is offered without
+  reopening this one. The receiver of a `.` is normally the tree's member access, but
   an incomplete `receiver.` at the end of a line can parse the dot into the next
   token (a following `var` line reads `gson.var` as a scoped type identifier);
   then the receiver is recovered from the source as the expression ending at the
@@ -192,8 +208,8 @@ graph LR
   resolved through its receiver and arguments, above), so an unqualified `foo`
   may hit a same- or cross-file declaration by name or return nothing; overload
   selection covers only the assignability relation's conversions and refuses
-  when they are inconclusive; and scanned-file ranges reflect the last disk
-  scan, not a live watcher.
+  when they are inconclusive; and a watched file's indexed ranges reflect its
+  last re-read, not a live document.
   **References and rename** resolve the symbol under the cursor the way hover
   does — a member's declaring type coming from the receiver's type, identified
   by simple name *and* package so a same-named type elsewhere is never touched —
@@ -228,14 +244,22 @@ graph LR
   record's components are modelled as accessor methods — the component's type
   with no parameters — so an outside receiver sees `x()` and never the private
   backing field, while inside the record the bare component name resolves as
-  that field would. The model is built in two layers during warm-up: source
-  files contribute full `TypeInfo`s (member types and supertypes) from the
-  trees the scan already parses, and the resolved jars and
-  JDK contribute `TypeInfo`s with real signatures and supertypes, parsed from
-  their class files (or, for a source-only JDK, from `lib/src.zip` through the
-  same tree-sitter extractor). Member
+  that field would. The model has two parts. A **non-source base** holds the
+  resolved jars, the JDK, and extracted dependency sources as `TypeInfo`s with
+  real signatures and supertypes, parsed from their class files (or, for a
+  source-only JDK, from `lib/src.zip` through the same tree-sitter extractor);
+  it is built once and never changes. Each workspace source file keeps its own
+  model, built from the tree the scan already parses, so one file can be
+  forgotten by dropping its own model rather than rebuilding the base. Member
   lookup walks supertypes breadth-first, cycle-guarded, first declaration
-  winning, so inherited members are found.
+  winning, so inherited members are found. The type layer is not frozen at
+  warm-up: the engine answers from the base layered under the union of the
+  current per-source models, with a **dirty** overlay — every open buffer, plus
+  any file a watcher event or a close re-read from disk — replacing its file's
+  warm-up model per URI. So completion, hover, signature help, inlay hints, and
+  semantic diagnostics answer from unsaved edits to any open file (the same
+  edits `definition` reaches through the index), and a file deleted on disk is
+  forgotten from the index and the model at once (D4, D5).
   **Binding** turns a cursor position into an answer: it collects the names
   visible there (locals and parameters with their declared types — an
   enhanced-for binding written `var` taking its iterable's element type and a
@@ -359,16 +383,25 @@ graph LR
   the index. Edits to open
   documents re-extract that file's entries from its already parsed tree; on
   `didClose`, a file inside any source root is re-read from disk (disk truth
-  wins), anything else drops its entries. `index_ready()` flips when warm-up
+  wins), anything else drops its entries. A watched-file event does the same
+  for a file the editor never opened: a created or changed `.java` file inside
+  a source root is re-read and re-indexed from disk, a deleted one loses its
+  entries, and a file the editor currently has open is skipped because its
+  `didChange` is authoritative (D2). Every such change also refreshes the
+  declared-type model and republishes the open documents' diagnostics (see the
+  engine-boundary and type-layer bullets). `index_ready()` flips when warm-up
   completes so index-backed features can report themselves briefly
   unavailable during warm-up instead of blocking; completions consume the
   index via `query_prefix` (see the engine-core bullet above), and
   go-to-definition and `workspace/symbol` are backed by the same two lookups
   — `query_name` for exact-name definition targets, `query_prefix` for
   workspace symbols — with dependency-jar entries filtered out of both (see
-  the project-model bullet). Known v1 limitations: there is no file watcher,
-  so out-of-editor disk changes are picked up on close re-reads only, and a
-  scanned file's indexed ranges reflect the last disk scan. Extracted dependency
+  the project-model bullet). Known v1 limitation: a watched file's indexed
+  ranges reflect its last re-read rather than a live document (the index
+  changes only when the client reports an event). A file deleted on disk is
+  forgotten from both the index and the model: the watcher drops its entries
+  and its per-source type model, so no model-based feature resolves it any more
+  (see the type-layer bullet). Extracted dependency
   sources (see the dependency-sources bullet) are indexed as ordinary `.java`
   files under the cache, but their entries carry `library_source`;
   `source_files()` — the candidate set for references and rename — excludes

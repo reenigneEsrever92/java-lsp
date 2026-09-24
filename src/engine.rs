@@ -9,6 +9,7 @@
 //! each event into a client notification (today, diagnostics; later, warm-up
 //! progress).
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -46,6 +47,11 @@ pub enum Command {
         version: i32,
     },
     Close(Url),
+    /// Watched filesystem events (created/changed/deleted `.java` files) the
+    /// editor reported but never opened; the engine re-indexes or drops them.
+    WatchedFiles {
+        changes: Vec<(Url, WatchedChange)>,
+    },
     Hover {
         uri: Url,
         position: Position,
@@ -112,6 +118,14 @@ pub enum Command {
     IndexReady {
         reply: Reply<bool>,
     },
+}
+
+/// How a watched file changed, as reported through `workspace/didChangeWatchedFiles`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WatchedChange {
+    Created,
+    Changed,
+    Deleted,
 }
 
 /// Events the engine pushes to the shell.
@@ -235,6 +249,11 @@ impl EngineHandle {
 
     pub async fn close(&self, uri: Url) {
         let _ = self.commands.send(Command::Close(uri)).await;
+    }
+
+    /// Reports watched filesystem events for the engine to index or drop.
+    pub async fn watched_files(&self, changes: Vec<(Url, WatchedChange)>) {
+        let _ = self.commands.send(Command::WatchedFiles { changes }).await;
     }
 
     pub async fn hover(&self, uri: Url, position: Position) -> Option<Hover> {
@@ -378,8 +397,11 @@ pub fn spawn(events: mpsc::UnboundedSender<EngineEvent>) -> EngineHandle {
     // The warm-up reports through the same channel the dispatcher pushes to.
     engine.set_reporter(Reporter::attached(events.clone()));
     tokio::spawn(async move {
+        // The last version seen per open URI, so a diagnostics republish that
+        // covers other documents can stamp them correctly.
+        let mut versions: HashMap<Url, i32> = HashMap::new();
         while let Some(command) = incoming.recv().await {
-            dispatch(command, &engine, &events);
+            dispatch(command, &engine, &events, &mut versions);
         }
     });
     EngineHandle { commands }
@@ -391,6 +413,7 @@ fn dispatch(
     command: Command,
     engine: &Arc<TreeSitterEngine>,
     events: &mpsc::UnboundedSender<EngineEvent>,
+    versions: &mut HashMap<Url, i32>,
 ) {
     match command {
         Command::SetWorkspaceRoot(root) => engine.set_workspace_root(&root),
@@ -399,19 +422,30 @@ fn dispatch(
         } => engine.set_resource_operations(resource_operations),
         Command::Open { uri, text, version } => {
             engine.open(&uri, &text);
-            publish_diagnostics(engine, events, uri, Some(version));
+            versions.insert(uri.clone(), version);
+            publish_all_diagnostics(engine, events, versions, Some(&uri));
         }
         Command::Change { uri, text, version } => {
             engine.change(&uri, &text);
-            publish_diagnostics(engine, events, uri, Some(version));
+            versions.insert(uri.clone(), version);
+            publish_all_diagnostics(engine, events, versions, Some(&uri));
         }
         Command::Close(uri) => {
             engine.close(&uri);
+            versions.remove(&uri);
             let _ = events.send(EngineEvent::Diagnostics {
                 uri,
                 version: None,
                 diagnostics: Vec::new(),
             });
+            publish_all_diagnostics(engine, events, versions, None);
+        }
+        Command::WatchedFiles { changes } => {
+            // The index or model changed, so files that can see the change must
+            // be re-analysed even though they were not edited (D3).
+            if engine.watched_files(&changes) {
+                publish_all_diagnostics(engine, events, versions, None);
+            }
         }
         Command::Hover {
             uri,
@@ -509,19 +543,33 @@ fn read<T: Send + 'static>(
     });
 }
 
-/// Computes and emits diagnostics for a just-applied edit.
-fn publish_diagnostics(
+/// Computes and emits diagnostics for **every** open document after an index or
+/// model change, so a referring file that was not itself edited refreshes too
+/// (D3). `preferred`, when given, is published first. Cost is bounded by the
+/// number of open documents and runs on the dispatcher's inline path; the bench
+/// is what decides if that ever needs to move.
+fn publish_all_diagnostics(
     engine: &TreeSitterEngine,
     events: &mpsc::UnboundedSender<EngineEvent>,
-    uri: Url,
-    version: Option<i32>,
+    versions: &HashMap<Url, i32>,
+    preferred: Option<&Url>,
 ) {
-    let diagnostics = engine.diagnostics(&uri);
-    let _ = events.send(EngineEvent::Diagnostics {
-        uri,
-        version,
-        diagnostics,
-    });
+    let mut uris = engine.open_documents();
+    if let Some(preferred) = preferred {
+        if let Some(index) = uris.iter().position(|uri| uri == preferred) {
+            let uri = uris.remove(index);
+            uris.insert(0, uri);
+        }
+    }
+    for uri in uris {
+        let version = versions.get(&uri).copied();
+        let diagnostics = engine.diagnostics(&uri);
+        let _ = events.send(EngineEvent::Diagnostics {
+            uri,
+            version,
+            diagnostics,
+        });
+    }
 }
 
 #[cfg(test)]

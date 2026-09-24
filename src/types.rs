@@ -433,6 +433,16 @@ impl TypeModel {
         }
     }
 
+    /// Adds every type of `other`, replacing same-slot entries (by name,
+    /// package, kind, and enclosing chain). Used to union per-file overlays.
+    pub fn merge(&mut self, other: &TypeModel) {
+        for infos in other.by_name.values() {
+            for info in infos {
+                self.insert(info.clone());
+            }
+        }
+    }
+
     /// Every type declared with this simple name.
     pub fn find(&self, name: &str) -> &[TypeInfo] {
         self.by_name.get(name).map(Vec::as_slice).unwrap_or(&[])

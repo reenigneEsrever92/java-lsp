@@ -12,6 +12,23 @@ named change.
 
 ## 2026-09-24
 
+- **Forget a deleted source file in the type model** — `WorkspaceIndex` now
+  splits the declared-type model into a non-source base (dependency jars and the
+  JDK) plus one model per workspace source file keyed by URI, so deleting a file
+  drops its types along with its index entries and no model-based feature
+  (member completion, hover, signature help, inlay hints) resolves it any more.
+  Verified by `cargo test --all-targets` (239 tests). See
+  [Forget a deleted source file in the type model](backlog/deleted-file-stays-in-type-model.md).
+
+- **External file changes and a fresh analysis model** — the shell registers a
+  `workspace/didChangeWatchedFiles` watcher for `**/*.java` (when the client
+  supports dynamic registration), re-indexes a created/changed file and drops a
+  deleted one, layers every open buffer's declared types over the warm-up model,
+  and republishes diagnostics for every open document after an open, change,
+  close, or watched event. Verified by `cargo test --all-targets` (236 tests).
+  See
+  [External file change detection and a fresh analysis model](backlog/external-change-detection.md).
+
 - **Create-symbol quick fixes** — unresolved symbols now offer full create
   actions: class / interface / enum / record (a scaffolded file), and a method,
   field, or local variable with the signature inferred from the usage

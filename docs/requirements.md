@@ -31,7 +31,8 @@ All use cases belong to the Java developer.
 - **UC4 — See diagnostics.** Parse errors and unresolved symbols are reported
   as diagnostics on open and on edit — a type, member, bare identifier, or
   import that does not resolve (including a symbol that exists but is not
-  imported) — each unresolved symbol with a quick fix.
+  imported) — each unresolved symbol with a quick fix. Diagnostics also refresh
+  when another workspace file changes, including a file the editor never opened.
 
 ## Technology choices
 
@@ -65,7 +66,7 @@ All use cases belong to the Java developer.
 | R2 | Lifecycle and incremental text sync with versioned documents | Functional | high | UC1 |
 | R3 | Syntax features from tree-sitter: document symbols, folding ranges, semantic tokens, parse-error diagnostics | Functional | high | UC1, UC4 |
 | R4 | Completions without type resolution: keywords, locals in scope, workspace index symbols | Functional | high | UC2 |
-| R5 | Workspace symbol index built without blocking the request path; go-to-definition and workspace symbols backed by it | Functional | high | UC3 |
+| R5 | Workspace symbol index built without blocking the request path and kept current from open buffers and a `**/*.java` file watcher; go-to-definition and workspace symbols backed by it | Functional | high | UC3 |
 | R6 | Project open → responsive: the initial scan never blocks text sync or request handling; individual features may be briefly unavailable while warming up | Non-functional | high | UC1 |
 | R7 | Type-aware semantic engine: a pure-Rust type layer resolving declared types, members, and receivers | Functional | medium | v0.3 |
 | R8 | Gradle project model | Functional | low | deferred |
@@ -145,4 +146,9 @@ identifiers, and imports are reported as `ERROR` diagnostics — each with a qui
 fix (add the missing import, change to a near member, or create a class/interface/
 method stub) served through a new `codeActionProvider` — gated on a clean parse
 and an indexed `java.lang`, and switchable off with `JAVA_LSP_SEMANTIC_DIAGNOSTICS`
-(R11; see `unresolved-symbol-diagnostics` in the backlog).
+(R11; see `unresolved-symbol-diagnostics` in the backlog). They stay current:
+a `.java` file created or changed outside the editor is picked up by a
+`**/*.java` watcher, the declared-type model layers every open buffer over the
+warm-up base, and every open document's diagnostics are recomputed — so a
+referring file's squiggles clear without an edit of its own
+(`external-change-detection`).

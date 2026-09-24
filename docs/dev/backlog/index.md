@@ -34,3 +34,5 @@ Change requests live here as `<slug>.md`. Each request has a `kind`
 | [float-literals-and-overload-hints](float-literals-and-overload-hints.md) | bug | high | done |
 | [unresolved-symbol-diagnostics](unresolved-symbol-diagnostics.md) | feature | high | done |
 | [create-stub-quick-fixes](create-stub-quick-fixes.md) | feature | medium | done |
+| [external-change-detection](external-change-detection.md) | bug | high | done |
+| [deleted-file-stays-in-type-model](deleted-file-stays-in-type-model.md) | bug | high | done |

@@ -73,10 +73,17 @@ pub struct WorkspaceIndex {
     /// The project model discovered by the background scan; drives the
     /// close-policy's "is this file a workspace source" check.
     model: Arc<std::sync::Mutex<Option<crate::project::ProjectModel>>>,
-    /// The declared-type model (R7), built by the same warm-up scan: source
-    /// types with signatures alongside the jars' and JDK's, parsed from their
-    /// class files. `None` until warm-up has built it.
+    /// The declared-type model (R7), built by the same warm-up scan: the
+    /// **non-source base** — dependency jars, the JDK, and extracted library
+    /// sources — with signatures, parsed from their class files. Workspace
+    /// source files are *not* merged in here; they live in `source_types` so a
+    /// single file can be forgotten. `None` until warm-up has built it.
     types: Arc<std::sync::Mutex<Option<Arc<crate::types::TypeModel>>>>,
+    /// Per-workspace-source-file declared-type models from the warm-up scan,
+    /// keyed by URI. The base `types` excludes these, so deleting a file can
+    /// forget its types with a map removal rather than re-scanning the source
+    /// roots (`WorkspaceIndex::remove_file`). Empty until warm-up runs.
+    source_types: Arc<RwLock<HashMap<Url, Arc<crate::types::TypeModel>>>>,
 }
 
 impl WorkspaceIndex {
@@ -105,7 +112,9 @@ impl WorkspaceIndex {
         }
     }
 
-    /// Drops the entries for `uri`.
+    /// Drops the entries for `uri`, and its declared-type model if it was a
+    /// workspace source file — the whole file is forgotten in one call, so the
+    /// index and the model can never disagree after a deletion.
     pub fn remove_file(&self, uri: &Url) {
         let Ok(mut state) = self.state.write() else {
             return;
@@ -115,6 +124,10 @@ impl WorkspaceIndex {
                 remove_from_name_index(&mut state, &old_entry);
                 remove_from_package_index(&mut state, &old_entry);
             }
+        }
+        drop(state);
+        if let Ok(mut models) = self.source_types.write() {
+            models.remove(uri);
         }
     }
 
@@ -199,7 +212,11 @@ impl WorkspaceIndex {
         }
     }
 
-    /// The workspace's declared-type model, if warm-up has built it yet.
+    /// The workspace's non-source declared-type model (jars, JDK, and extracted
+    /// library sources), if warm-up has built it yet. Workspace source files are
+    /// *not* part of it — the engine unions [`WorkspaceIndex::source_models`]
+    /// over it, so a file's types can be removed by a map delete. Every consumer
+    /// pairs it with that overlay.
     pub fn type_model(&self) -> Option<Arc<crate::types::TypeModel>> {
         self.types
             .lock()
@@ -211,6 +228,30 @@ impl WorkspaceIndex {
         if let Ok(mut slot) = self.types.lock() {
             *slot = Some(model);
         }
+    }
+
+    /// Records the warm-up declared-type model for one workspace source file.
+    /// Called by the scan alongside `upsert_file`; a later `remove_file` for the
+    /// same URI forgets it.
+    pub fn set_source_types(&self, uri: &Url, model: Arc<crate::types::TypeModel>) {
+        if let Ok(mut models) = self.source_types.write() {
+            models.insert(uri.clone(), model);
+        }
+    }
+
+    /// The warm-up declared-type models of every workspace source file, ordered
+    /// by URI so the union is deterministic. The engine layers its dirty overlay
+    /// over these (a dirty entry replaces its URI's model).
+    pub fn source_models(&self) -> Vec<(Url, Arc<crate::types::TypeModel>)> {
+        let Ok(models) = self.source_types.read() else {
+            return Vec::new();
+        };
+        let mut out: Vec<(Url, Arc<crate::types::TypeModel>)> = models
+            .iter()
+            .map(|(uri, model)| (uri.clone(), Arc::clone(model)))
+            .collect();
+        out.sort_by(|a, b| a.0.as_str().cmp(b.0.as_str()));
+        out
     }
 
     /// The workspace's own `.java` source files, sorted — the candidate set for
@@ -549,6 +590,9 @@ fn scan_workspace_core(root: Url, index: WorkspaceIndex, reporter: &Reporter) ->
 
     let mut parser = java_parser();
     let mut indexed = 0usize;
+    // The non-source base (jars and the JDK). Workspace source files go into
+    // their own per-URI models, so deleting one forgets its types without
+    // rebuilding this base.
     let mut types = crate::types::TypeModel::new();
     for path in &files {
         let Ok(text) = std::fs::read_to_string(path) else {
@@ -557,16 +601,19 @@ fn scan_workspace_core(root: Url, index: WorkspaceIndex, reporter: &Reporter) ->
         let Some(tree) = parser.parse(text.as_bytes(), None) else {
             continue;
         };
+        let Some(uri) = Url::from_file_path(path).ok() else {
+            continue;
+        };
         let package = crate::types::file_package(&tree, &text);
-        types.extend(crate::types::collect_type_infos(
+        let mut model = crate::types::TypeModel::new();
+        model.extend(crate::types::collect_type_infos(
             package.as_deref(),
             &tree,
             &text,
         ));
-        if let Some(uri) = Url::from_file_path(path).ok() {
-            index.upsert_file(&uri, extract_entries(&uri, &tree, &text));
-            indexed += 1;
-        }
+        index.set_source_types(&uri, Arc::new(model));
+        index.upsert_file(&uri, extract_entries(&uri, &tree, &text));
+        indexed += 1;
     }
     reporter.update(format!("Indexed {indexed} source files"), None);
 
@@ -967,10 +1014,23 @@ class A {}
         assert_eq!(classes, vec!["Top", "Deep"]);
         assert!(index.query_name("Skip").is_empty());
 
-        // The same warm-up builds the declared-type model.
-        let model = index.type_model().expect("type model");
-        assert!(!model.find("Top").is_empty());
-        assert!(!model.find("Deep").is_empty());
+        // The same warm-up builds the declared-type model: the base holds no
+        // workspace source types, each source file gets its own per-URI model.
+        let base = index.type_model().expect("type model");
+        assert!(base.find("Top").is_empty());
+        assert!(base.find("Deep").is_empty());
+        let sources = index.source_models();
+        let top_uri = Url::from_file_path(root.join("Top.java")).unwrap();
+        let deep_uri = Url::from_file_path(root.join("nested").join("Deep.java")).unwrap();
+        let by_uri = |uri: &Url| {
+            sources
+                .iter()
+                .find(|(candidate, _)| candidate == uri)
+                .map(|(_, model)| model.clone())
+                .unwrap_or_else(|| panic!("no source model for {uri}"))
+        };
+        assert!(!by_uri(&top_uri).find("Top").is_empty());
+        assert!(!by_uri(&deep_uri).find("Deep").is_empty());
 
         std::env::remove_var("JAVA_LSP_JDK");
         let _ = std::fs::remove_dir_all(&root);

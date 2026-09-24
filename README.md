@@ -44,7 +44,9 @@ declared-type model built during warm-up:
   method or field with its signature inferred from the usage (in the enclosing
   type or a workspace receiver's type), or a local variable. Gated on the model
   vouching for `java.lang` and the file parsing cleanly, so a missing JDK never
-  becomes a wall of false positives.
+  becomes a wall of false positives. Diagnostics refresh when any workspace file
+  changes — including a `.java` file created on disk outside the editor, which a
+  `**/*.java` file watcher picks up.
 - **Project model** — statically parsed Maven `pom.xml` (multi-module, `<build>`
   overrides), offline dependency resolution from the local repository, and
   indexing of dependency jars, the installed JDK's `java.*`/`javax.*`, and (by

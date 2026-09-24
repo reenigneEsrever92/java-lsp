@@ -371,6 +371,24 @@ async fn next_diagnostics_for(socket: &mut tower_lsp::ClientSocket, uri: &str) -
     panic!("no publishDiagnostics notification arrived for {uri}");
 }
 
+/// Reads server-to-client messages until a request with `method` arrives and
+/// returns its params.
+async fn next_request_with_method(socket: &mut tower_lsp::ClientSocket, method: &str) -> Value {
+    use futures::StreamExt;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {method} request arrived"
+        );
+        let next = tokio::time::timeout(std::time::Duration::from_millis(500), socket.next()).await;
+        let Ok(Some(request)) = next else { continue };
+        if request.method() == method {
+            return request.params().cloned().unwrap_or(Value::Null);
+        }
+    }
+}
+
 #[tokio::test]
 async fn workspace_index_scans_in_background_and_updates_incrementally() {
     // Serializes env-var mutation across scan-driven tests.
@@ -1372,6 +1390,180 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&jdk);
+}
+
+#[tokio::test]
+async fn watched_file_changes_refresh_a_referring_document() {
+    // A fake JDK providing java.lang.Object and java.lang.String, so the
+    // semantic-diagnostics gate holds.
+    let jdk = temp_dir("watch-jdk");
+    std::fs::create_dir_all(jdk.join("jmods")).unwrap();
+    let _env = JdkEnv::set(&jdk.display().to_string());
+    let object_class = test_class_bytes("java/lang/Object", 0x0021, None, &[], &[]);
+    let string_class = test_class_bytes(
+        "java/lang/String",
+        0x0021,
+        Some("java/lang/Object"),
+        &[],
+        &[],
+    );
+    std::fs::write(
+        jdk.join("jmods").join("java.base.jmod"),
+        test_stored_zip(&[
+            ("classes/java/lang/Object.class", &object_class),
+            ("classes/java/lang/String.class", &string_class),
+        ]),
+    )
+    .unwrap();
+
+    // A workspace whose Main.java uses a class that does not exist yet.
+    let root = temp_dir("watch-workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let main_uri = Url::from_file_path(root.join("Main.java")).unwrap();
+    let main_text = "package demo;\n\nclass Main {\n    XY field;\n}\n";
+    std::fs::write(root.join("Main.java"), main_text).unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({
+                "capabilities": {
+                    "workspace": {
+                        "didChangeWatchedFiles": { "dynamicRegistration": true }
+                    }
+                },
+                "rootUri": Url::from_file_path(&root).unwrap().as_str(),
+            }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    // The server asks the client to watch `**/*.java` (D1).
+    let registration = next_request_with_method(&mut socket, "client/registerCapability").await;
+    let watched = registration["registrations"]
+        .as_array()
+        .expect("registrations")
+        .iter()
+        .find(|registration| registration["method"] == "workspace/didChangeWatchedFiles")
+        .expect("a watched-file registration");
+    assert_eq!(
+        watched["registerOptions"]["watchers"][0]["globPattern"],
+        "**/*.java"
+    );
+
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |_, ready| ready).await;
+
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": main_uri.as_str(),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": main_text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+    let diagnostics = next_diagnostics_for(&mut socket, main_uri.as_str()).await;
+    assert!(
+        diagnostics.as_array().unwrap().iter().any(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("XY"))
+        }),
+        "XY should be unresolved before the file exists: {diagnostics}"
+    );
+
+    // The file is created on disk and reported through the watcher; it is never
+    // opened in the editor.
+    std::fs::write(
+        root.join("XY.java"),
+        "package demo;\n\npublic class XY {\n}\n",
+    )
+    .unwrap();
+    let xy_uri = Url::from_file_path(root.join("XY.java")).unwrap();
+    respond(
+        &mut service,
+        Request::build("workspace/didChangeWatchedFiles")
+            .params(json!({ "changes": [{ "uri": xy_uri.as_str(), "type": 1 }] }))
+            .finish(),
+    )
+    .await;
+
+    // `Main.java` was never edited, yet its diagnostic clears (D3).
+    let diagnostics = next_diagnostics_for(&mut socket, main_uri.as_str()).await;
+    assert!(
+        diagnostics.as_array().unwrap().is_empty(),
+        "the referring document must refresh: {diagnostics}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&jdk);
+}
+
+#[tokio::test]
+async fn watched_files_are_not_registered_without_the_client_capability() {
+    use futures::StreamExt;
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
+
+    let root = temp_dir("no-watcher");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Greet.java"),
+        "package demo;\n\npublic class Greet {\n}\n",
+    )
+    .unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    // No `workspace.didChangeWatchedFiles`: the watcher must be skipped (D6).
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({
+                "capabilities": {},
+                "rootUri": Url::from_file_path(&root).unwrap().as_str(),
+            }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    // Wait for the warm-up, then drain for a bounded window: no registration.
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |_, ready| ready).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(100), socket.next()).await;
+        if let Ok(Some(request)) = next {
+            assert_ne!(
+                request.method(),
+                "client/registerCapability",
+                "no watcher registration without the capability: {request:?}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
