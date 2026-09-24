@@ -13,7 +13,9 @@ Java language servers today run on a JVM (Eclipse JDT-LS and friends): a heavy
 install, slow project startup, high memory use. `java-lsp` is the alternative —
 a single native binary with no JVM, that answers text sync, symbols, and
 completions immediately while the workspace index warms up in the background.
-The initial scan never blocks the request path.
+The initial scan never blocks the request path; once the index is populated,
+requests stay responsive too — diagnostics, analysis, and workspace searches run
+off the request path, without holding a shared lock across a pass or a search.
 
 ## Features
 
@@ -27,8 +29,10 @@ declared-type model built during warm-up:
   and workspace-index symbols; member access after `.` offers the receiver's
   inferred members with signatures; accepted symbols from other packages carry
   an automatic `import` edit.
-- **Navigation** — go-to-definition and `workspace/symbol` backed by the symbol
-  index.
+- **Navigation** — go-to-definition (also answering go-to-declaration) and
+  `workspace/symbol` backed by the symbol
+  index, and go-to-implementation listing a type's or method's workspace
+  implementations.
 - **Hover** — a member's signature, a type's declaration, or a local's declared
   type, rendered as Markdown.
 - **References and rename** — attribute occurrences with confidence and refuse
@@ -44,7 +48,9 @@ declared-type model built during warm-up:
   method or field with its signature inferred from the usage (in the enclosing
   type or a workspace receiver's type), or a local variable. Gated on the model
   vouching for `java.lang` and the file parsing cleanly, so a missing JDK never
-  becomes a wall of false positives.
+  becomes a wall of false positives. Diagnostics refresh when any workspace file
+  changes — including a `.java` file created on disk outside the editor, which a
+  `**/*.java` file watcher picks up.
 - **Project model** — statically parsed Maven `pom.xml` (multi-module, `<build>`
   overrides), offline dependency resolution from the local repository, and
   indexing of dependency jars, the installed JDK's `java.*`/`javax.*`, and (by
@@ -112,19 +118,19 @@ and skips dependencies with a warning.
 
 `java-lsp` is configured entirely through the environment:
 
-| Variable | Effect |
-|----------|--------|
-| `RUST_LOG` | Tracing filter on stderr. Default `java_lsp=info`. |
-| `MAVEN_REPO` | Local Maven repository to resolve against. Default `~/.m2/repository`. |
-| `JAVA_LSP_JDK` | Explicit JDK home to index. Pointing it at an unusable home disables JDK indexing entirely (a deterministic opt-out). |
-| `JAVA_HOME` | JDK home used when `JAVA_LSP_JDK` is unset; otherwise common locations (including SDKMAN's `current`) are searched. |
-| `SDKMAN_DIR` | SDKMAN root, for locating candidates' JDKs. |
-| `JAVA_LSP_OFFLINE` | Any non-empty value disables **all** network work; dependency sources stay class-file-only. |
-| `JAVA_LSP_SEMANTIC_DIAGNOSTICS` | `0`/`false` disables the unresolved-symbol diagnostics (parse errors still report). On by default. |
-| `JAVA_LSP_MAVEN_CENTRAL_URL` | Base URL for dependency-source downloads. Default Maven Central (`https://repo1.maven.org/maven2`). |
-| `JAVA_LSP_SOURCES_CACHE` | Where extracted sources are cached. Default `$XDG_CACHE_HOME/java-lsp/sources`, else `~/.cache/java-lsp/sources`. |
+| Variable                        | Effect                                                                                                                |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `RUST_LOG`                      | Tracing filter on stderr. Default `java_lsp=info`.                                                                    |
+| `MAVEN_REPO`                    | Local Maven repository to resolve against. Default `~/.m2/repository`.                                                |
+| `JAVA_LSP_JDK`                  | Explicit JDK home to index. Pointing it at an unusable home disables JDK indexing entirely (a deterministic opt-out). |
+| `JAVA_HOME`                     | JDK home used when `JAVA_LSP_JDK` is unset; otherwise common locations (including SDKMAN's `current`) are searched.   |
+| `SDKMAN_DIR`                    | SDKMAN root, for locating candidates' JDKs.                                                                           |
+| `JAVA_LSP_OFFLINE`              | Any non-empty value disables **all** network work; dependency sources stay class-file-only.                           |
+| `JAVA_LSP_SEMANTIC_DIAGNOSTICS` | `0`/`false` disables the unresolved-symbol diagnostics (parse errors still report). On by default.                    |
+| `JAVA_LSP_MAVEN_CENTRAL_URL`    | Base URL for dependency-source downloads. Default Maven Central (`https://repo1.maven.org/maven2`).                   |
+| `JAVA_LSP_SOURCES_CACHE`        | Where extracted sources are cached. Default `$XDG_CACHE_HOME/java-lsp/sources`, else `~/.cache/java-lsp/sources`.     |
 
-Dependency *resolution* is always offline. Dependency **source** fetching is the
+Dependency _resolution_ is always offline. Dependency **source** fetching is the
 one part that uses the network: for each resolved artifact it reuses a
 `-sources.jar` already in the local repository, otherwise downloads it from
 Maven Central (writing it back into the local repository) and extracts it into
@@ -156,8 +162,14 @@ cargo run --release --bin java-lsp-bench -- --files 500 --methods-per-class 10
 ```
 
 Flags: `--files N`, `--methods-per-class M`, `--fields-per-class F`, `--maven`
-(lay the fixture out as a Maven project), `--server PATH`, `--json`, `--keep`.
-Baselines per milestone are recorded in the [changelog](docs/dev/changelog.md).
+(lay the fixture out as a Maven project), `--server PATH`, `--json`, `--keep`,
+and the responsiveness scenario: `--open-docs K` (open K documents), `--edits M`
+(send M edits, timing each until its diagnostics republish, plus the
+hover/definition sent alongside it), and `--references` (issue
+`textDocument/references` on a member shared by every fixture class). Every
+fixture class calls a shared `bench.BenchShared.ping`, so a references search
+must consider every file. Baselines per milestone are recorded in the
+[changelog](docs/dev/changelog.md).
 
 ### Layout
 

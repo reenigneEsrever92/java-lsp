@@ -12,14 +12,17 @@
 //! request path: the fetch on the runtime, the extraction and parsing on the
 //! blocking pool.
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::mpsc;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tower_lsp::lsp_types::Url;
 
-use crate::engine::Reporter;
-use crate::index::{SymbolEntry, WorkspaceIndex};
+use crate::index::SymbolEntry;
+use crate::messages::{DriverMessage, LogLevel, ProgressUpdate};
 use crate::resolve::Artifact;
 use crate::types::TypeInfo;
 
@@ -67,23 +70,36 @@ pub fn cache_dir() -> PathBuf {
         .join("sources")
 }
 
-/// Fetches and indexes the sources of `artifacts`, upgrading the index and the
-/// type model in place. A no-op when downloads are disabled or nothing resolved.
-pub async fn index_sources(index: WorkspaceIndex, artifacts: Vec<Artifact>, reporter: Reporter) {
+/// Fetches and indexes the sources of `artifacts`, publishing the index updates
+/// and progress onto the bus. A no-op when downloads are disabled or
+/// nothing resolved. Runs concurrently with the workspace source scan.
+pub async fn index_sources(artifacts: Vec<Artifact>, bus: crate::bus::BusClient) {
     if artifacts.is_empty() || offline() {
         return;
     }
     let repo = crate::index::local_repository();
     let base = base_url();
-    let available = fetch_sources(&artifacts, &repo, &base, &reporter).await;
+    let started = Instant::now();
+    let available = fetch_sources(&artifacts, &repo, &base, &bus).await;
+    let fetch_ms = started.elapsed().as_millis();
     if available.is_empty() {
         return;
     }
+    let _ = bus.notify(DriverMessage::Log {
+        level: LogLevel::Info,
+        message: format!(
+            "dependency source fetch: {} of {} archives available in {fetch_ms}ms",
+            available.len(),
+            artifacts.len(),
+        ),
+    });
     let cache = cache_dir();
-    let upgrade = index.clone();
-    let upgrade_reporter = reporter.clone();
+    let extract_bus = bus.clone();
     let _ = tokio::task::spawn_blocking(move || {
-        index_extracted(&upgrade, &available, &repo, &cache, &upgrade_reporter);
+        let mut sink = |message| {
+            let _ = extract_bus.notify(message);
+        };
+        index_extracted(&mut sink, &available, &repo, &cache);
     })
     .await;
 }
@@ -95,7 +111,7 @@ async fn fetch_sources(
     artifacts: &[Artifact],
     repo: &Path,
     base: &str,
-    reporter: &Reporter,
+    bus: &crate::bus::BusClient,
 ) -> Vec<Artifact> {
     let mut available = Vec::new();
     let mut missing = Vec::new();
@@ -112,7 +128,10 @@ async fn fetch_sources(
     }
 
     let total = missing.len();
-    reporter.update(format!("Fetching {total} dependency sources"), Some(0));
+    let _ = bus.notify(DriverMessage::Progress(ProgressUpdate::Update {
+        message: format!("Fetching {total} dependency sources"),
+        percentage: Some(0),
+    }));
 
     let client = match reqwest::Client::builder()
         .user_agent(USER_AGENT)
@@ -121,7 +140,12 @@ async fn fetch_sources(
     {
         Ok(client) => client,
         Err(error) => {
-            tracing::warn!(%error, "no HTTP client for dependency sources; keeping class files");
+            let _ = bus.notify(DriverMessage::Log {
+                level: LogLevel::Warn,
+                message: format!(
+                    "no HTTP client for dependency sources; keeping class files ({error})"
+                ),
+            });
             return available;
         }
     };
@@ -137,16 +161,19 @@ async fn fetch_sources(
         let client = client.clone();
         let base = base.to_string();
         let repo = repo.to_path_buf();
+        let log = bus.clone();
         tasks.spawn(async move {
             let _permit = permit;
             match download_sources(&client, &base, &repo, &artifact).await {
                 Ok(()) => Some(artifact),
                 Err(error) => {
-                    tracing::warn!(
-                        artifact = %format!("{}:{}:{}", artifact.0, artifact.1, artifact.2),
-                        error = %error,
-                        "dependency sources unavailable; keeping class files"
-                    );
+                    let _ = log.notify(DriverMessage::Log {
+                        level: LogLevel::Warn,
+                        message: format!(
+                            "dependency sources unavailable for {}:{}:{}; keeping class files ({error})",
+                            artifact.0, artifact.1, artifact.2
+                        ),
+                    });
                     None
                 }
             }
@@ -158,10 +185,10 @@ async fn fetch_sources(
         if let Ok(Some(artifact)) = joined {
             available.push(artifact);
         }
-        reporter.update(
-            format!("Fetched {done}/{total} dependency sources"),
-            Some((done * 100 / total) as u32),
-        );
+        let _ = bus.notify(DriverMessage::Progress(ProgressUpdate::Update {
+            message: format!("Fetched {done}/{total} dependency sources"),
+            percentage: Some((done * 100 / total) as u32),
+        }));
     }
     available
 }
@@ -224,101 +251,307 @@ async fn verify_checksum(client: &reqwest::Client, url: &str, bytes: &[u8]) -> R
     }
 }
 
-/// Extracts each sources jar into the cache, indexes its `.java` files — first
-/// dropping the artifact's class-file entries so the two never coexist, which
-/// would make `definition` ambiguous — and overlays the source-derived types on
-/// the type model. Runs on the blocking pool.
+/// Per-phase wall-clock totals for one `index_extracted` pass, accumulated across
+/// the workers so one log line shows where the time went.
+#[derive(Default)]
+struct Timers {
+    read: AtomicU64,
+    inflate: AtomicU64,
+    write: AtomicU64,
+    parse: AtomicU64,
+    entries: AtomicU64,
+    types: AtomicU64,
+}
+
+/// Adds `elapsed` to a nanosecond counter.
+fn add_nanos(slot: &AtomicU64, elapsed: Duration) {
+    slot.fetch_add(elapsed.as_nanos() as u64, Ordering::Relaxed);
+}
+
+impl Timers {
+    /// The totals in whole milliseconds: `read inflate write parse entries types`.
+    fn millis(&self) -> (u64, u64, u64, u64, u64, u64) {
+        let ms = |slot: &AtomicU64| slot.load(Ordering::Relaxed) / 1_000_000;
+        (
+            ms(&self.read),
+            ms(&self.inflate),
+            ms(&self.write),
+            ms(&self.parse),
+            ms(&self.entries),
+            ms(&self.types),
+        )
+    }
+}
+
+/// How often the accumulated phase timings are logged during a pass, so a long
+/// run shows the split and the rate without waiting for the end.
+const TIMING_STEP: usize = 200;
+
+/// Logs the accumulated phase timings so far, named with the progress so far.
+fn log_timings(
+    sink: &mut dyn FnMut(DriverMessage),
+    timers: &Timers,
+    attempted: usize,
+    total: usize,
+) {
+    let (read, inflate, write, parse, entries, types) = timers.millis();
+    sink(DriverMessage::Log {
+        level: LogLevel::Info,
+        message: format!(
+            "dependency source extract ({attempted}/{total} archives): read {read}ms, \
+             inflate {inflate}ms, write {write}ms, parse {parse}ms, entries {entries}ms, \
+             types {types}ms"
+        ),
+    });
+}
+
+/// Extracts each sources jar into the cache and publishes the artifact's `.java`
+/// entries and declared types as one base artifact — first dropping the artifact's
+/// class-file entries and layer so the two never coexist, which would make
+/// `definition` ambiguous. Runs on the blocking pool.
+///
+/// The `Parsed x/N … (F source files)` progress line keeps the work-done item
+/// moving; the artifacts are extracted and parsed across `available_parallelism`
+/// worker threads (each its own parser), and the workers hand their finished
+/// layers to this thread, which is the only one that touches the sink (and so the
+/// bus).
 fn index_extracted(
-    index: &WorkspaceIndex,
+    sink: &mut dyn FnMut(DriverMessage),
     artifacts: &[Artifact],
     repo: &Path,
     cache: &Path,
-    reporter: &Reporter,
 ) {
-    let mut types = index
-        .type_model()
-        .map(|model| (*model).clone())
-        .unwrap_or_default();
-    let mut parser = crate::index::java_parser();
+    let total = artifacts.len();
+    sink(DriverMessage::Progress(ProgressUpdate::Update {
+        message: format!("Parsing {total} dependency source archives"),
+        percentage: None,
+    }));
+    if total == 0 {
+        return;
+    }
+
+    let workers = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .min(total);
+    // Report progress ~5 % of the way, not per archive: a large closure would
+    // otherwise be thousands of bus messages and log lines.
+    let progress_step = (total / 20).max(1);
+    let next = AtomicUsize::new(0);
+    let timers = Timers::default();
+    let (tx, rx) = mpsc::channel::<Extracted>();
+
     let mut artifacts_indexed = 0usize;
     let mut files_indexed = 0usize;
-    reporter.update(
-        format!("Parsing {} dependency source archives", artifacts.len()),
-        None,
-    );
+    let mut attempted = 0usize;
 
-    for artifact in artifacts {
-        let (group, id, version) = artifact;
-        let Ok(data) = std::fs::read(sources_jar_path(repo, group, id, version)) else {
-            continue;
-        };
-        let directory = cache.join(group).join(id).join(version);
-        let mut files: Vec<(Url, Vec<SymbolEntry>)> = Vec::new();
-        let mut infos: Vec<TypeInfo> = Vec::new();
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let tx = tx.clone();
+            let next = &next;
+            let timers = &timers;
+            scope.spawn(move || {
+                let mut parser = crate::index::java_parser();
+                loop {
+                    let index = next.fetch_add(1, Ordering::Relaxed);
+                    if index >= total {
+                        break;
+                    }
+                    if tx
+                        .send(index_one(
+                            &mut parser,
+                            &artifacts[index],
+                            repo,
+                            cache,
+                            timers,
+                        ))
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        // This thread also holds a sender; drop it so `rx` ends with the workers.
+        drop(tx);
 
-        crate::classfile::for_each_zip_entry(&data, |name, bytes| {
-            if !name.ends_with(".java") || name.ends_with("package-info.java") {
-                return;
-            }
-            let Ok(text) = String::from_utf8(bytes) else {
-                return;
-            };
-            let Some(tree) = parser.parse(text.as_bytes(), None) else {
-                return;
-            };
-            let target = directory.join(&name);
-            let Some(parent) = target.parent() else {
-                return;
-            };
-            if std::fs::create_dir_all(parent).is_err()
-                || std::fs::write(&target, text.as_bytes()).is_err()
+        for extracted in rx {
+            attempted += 1;
+            if let Extracted::Indexed {
+                sources_uri,
+                class_uri,
+                entries,
+                types,
+                files,
+            } = extracted
             {
-                return;
+                if let Some(class_uri) = class_uri {
+                    sink(DriverMessage::RemoveBase { uri: class_uri });
+                }
+                sink(DriverMessage::BaseArtifact {
+                    uri: sources_uri,
+                    entries: Arc::new(entries),
+                    types: Arc::new(types),
+                });
+                artifacts_indexed += 1;
+                files_indexed += files;
             }
-            let Ok(uri) = Url::from_file_path(&target) else {
-                return;
-            };
-            let mut entries = crate::index::extract_entries(&uri, &tree, &text);
-            for entry in &mut entries {
-                entry.dependency = true;
-                entry.library_source = true;
+            if attempted == total || attempted % progress_step == 0 {
+                sink(DriverMessage::Progress(ProgressUpdate::Update {
+                    message: format!(
+                        "Parsed {attempted}/{total} dependency source archives ({files_indexed} source files)"
+                    ),
+                    percentage: None,
+                }));
             }
-            let package = crate::types::file_package(&tree, &text);
-            infos.extend(crate::types::collect_type_infos(
-                package.as_deref(),
-                &tree,
-                &text,
-            ));
-            files.push((uri, entries));
-        });
-
-        if files.is_empty() {
-            continue;
+            if attempted % TIMING_STEP == 0 {
+                log_timings(&mut *sink, &timers, attempted, total);
+            }
         }
-        if let Ok(class_uri) = Url::from_file_path(class_jar_path(repo, group, id, version)) {
-            index.remove_file(&class_uri);
-        }
-        for (uri, entries) in files {
-            files_indexed += 1;
-            index.upsert_file(&uri, entries);
-        }
-        types.extend(infos);
-        artifacts_indexed += 1;
-    }
+    });
 
     if artifacts_indexed == 0 {
         return;
     }
-    index.set_types(Arc::new(types));
-    reporter.update(
-        format!("Indexed {files_indexed} dependency source files"),
-        None,
-    );
-    tracing::info!(
-        artifacts = artifacts_indexed,
-        files = files_indexed,
-        "library sources indexed"
-    );
+    sink(DriverMessage::Progress(ProgressUpdate::Update {
+        message: format!("Indexed {files_indexed} dependency source files"),
+        percentage: None,
+    }));
+    sink(DriverMessage::Log {
+        level: LogLevel::Info,
+        message: format!(
+            "library sources indexed: {artifacts_indexed} artifacts, {files_indexed} files"
+        ),
+    });
+    log_timings(&mut *sink, &timers, attempted, total);
+}
+
+/// One artifact's extracted and indexed sources, or nothing when the jar is
+/// missing, holds no `.java` files, or its paths are unusable.
+enum Extracted {
+    Skipped,
+    Indexed {
+        sources_uri: Url,
+        class_uri: Option<Url>,
+        entries: Vec<SymbolEntry>,
+        types: crate::types::TypeModel,
+        files: usize,
+    },
+}
+
+/// Extracts one artifact's `.java` files into the cache — creating each package
+/// directory once and rewriting a file only when it is missing or the wrong
+/// length, so a restart over an already-extracted tree does no write work — and
+/// parses them with the caller's parser (one per worker thread), returning the
+/// single merged base layer. Never touches the sink, so it is safe to run off the
+/// hub's thread.
+fn index_one(
+    parser: &mut tree_sitter::Parser,
+    artifact: &Artifact,
+    repo: &Path,
+    cache: &Path,
+    timers: &Timers,
+) -> Extracted {
+    let (group, id, version) = artifact;
+    let t = Instant::now();
+    let Ok(data) = std::fs::read(sources_jar_path(repo, group, id, version)) else {
+        return Extracted::Skipped;
+    };
+    add_nanos(&timers.read, t.elapsed());
+    let directory = cache.join(group).join(id).join(version);
+    let mut files: Vec<(Vec<SymbolEntry>, Vec<TypeInfo>)> = Vec::new();
+    // Package directories already created for this artifact, so `create_dir_all`
+    // runs once per directory instead of once per file.
+    let mut dirs: HashSet<PathBuf> = HashSet::new();
+
+    let mut callback = Duration::ZERO;
+    let t = Instant::now();
+    crate::classfile::for_each_zip_entry(&data, |name, bytes| {
+        if !name.ends_with(".java") || name.ends_with("package-info.java") {
+            return;
+        }
+        let c0 = Instant::now();
+        let Ok(text) = String::from_utf8(bytes) else {
+            callback += c0.elapsed();
+            return;
+        };
+        let Some(tree) = parser.parse(text.as_bytes(), None) else {
+            callback += c0.elapsed();
+            return;
+        };
+        let c1 = Instant::now();
+        let target = directory.join(&name);
+        let Some(parent) = target.parent() else {
+            callback += c0.elapsed();
+            return;
+        };
+        let mut ok = true;
+        if !dirs.contains(parent) {
+            ok = std::fs::create_dir_all(parent).is_ok();
+            if ok {
+                dirs.insert(parent.to_path_buf());
+            }
+        }
+        // A restart has the whole tree already extracted: rewrite only when the
+        // file is missing or truncated, so the writes (a large share of the pass)
+        // are skipped.
+        if ok && std::fs::metadata(&target).map(|meta| meta.len()).ok() != Some(text.len() as u64) {
+            ok = std::fs::write(&target, text.as_bytes()).is_ok();
+        }
+        let c2 = Instant::now();
+        if !ok {
+            callback += c0.elapsed();
+            return;
+        }
+        let Ok(uri) = Url::from_file_path(&target) else {
+            callback += c0.elapsed();
+            return;
+        };
+        let mut entries = crate::index::extract_entries(&uri, &tree, &text);
+        // Import entries are never read by a feature; a library tree has millions.
+        crate::index::drop_import_entries(&mut entries);
+        let c3 = Instant::now();
+        for entry in &mut entries {
+            entry.dependency = true;
+            entry.library_source = true;
+        }
+        let package = crate::types::file_package(&tree, &text);
+        let infos = crate::types::collect_type_infos(package.as_deref(), &tree, &text);
+        let c4 = Instant::now();
+        add_nanos(&timers.parse, c1 - c0);
+        add_nanos(&timers.write, c2 - c1);
+        add_nanos(&timers.entries, c3 - c2);
+        add_nanos(&timers.types, c4 - c3);
+        files.push((entries, infos));
+        callback += c0.elapsed();
+    });
+    add_nanos(&timers.inflate, t.elapsed().saturating_sub(callback));
+
+    if files.is_empty() {
+        return Extracted::Skipped;
+    }
+    let Ok(sources_uri) = Url::from_file_path(sources_jar_path(repo, group, id, version)) else {
+        return Extracted::Skipped;
+    };
+    let class_uri = Url::from_file_path(class_jar_path(repo, group, id, version)).ok();
+    // One base layer for the whole artifact, as the jar and JDK indexers do and as
+    // the base model documents ("one layer per artifact URI"). Each file's entries
+    // keep their own source URI, so navigation is unchanged, while the bus, the hub
+    // log, and the base stay at one per artifact instead of one per file.
+    let mut entries_all: Vec<SymbolEntry> = Vec::new();
+    let mut types = crate::types::TypeModel::new();
+    let files_count = files.len();
+    for (entries, infos) in files {
+        entries_all.extend(entries);
+        types.extend(infos);
+    }
+    Extracted::Indexed {
+        sources_uri,
+        class_uri,
+        entries: entries_all,
+        types,
+        files: files_count,
+    }
 }
 
 /// `<root>/<group as path>/<artifact>/<version>`.
@@ -577,39 +810,37 @@ mod tests {
             Some(&sha1_hex(&sources)),
         ));
 
-        let available = fetch_sources(
-            &[artifact()],
-            &repo,
-            &server.base_url(),
-            &Reporter::default(),
-        )
-        .await;
+        let bus = crate::bus::BusClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &bus).await;
         assert_eq!(available, vec![artifact()]);
         assert!(sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
 
         // A class-file entry for the same artifact must be replaced, not kept.
-        let index = WorkspaceIndex::new();
         let class_uri = Url::from_file_path(class_jar_path(&repo, "demo", "lib", "1.0")).unwrap();
         let zero = tower_lsp::lsp_types::Range::new(
             tower_lsp::lsp_types::Position::new(0, 0),
             tower_lsp::lsp_types::Position::new(0, 0),
         );
-        index.upsert_file(
+        bus.upsert_file(
             &class_uri,
             vec![SymbolEntry {
-                uri: class_uri.clone(),
+                uri: std::sync::Arc::new(class_uri.clone()),
                 name: "Thing".to_string(),
                 kind: crate::index::IndexKind::Class,
-                package: Some("demo".to_string()),
-                container: Vec::new(),
+                package: Some("demo".into()),
+                container: std::sync::Arc::from(Vec::<String>::new()),
                 full_range: zero,
                 selection_range: zero,
                 dependency: true,
                 library_source: false,
+                synthetic: false,
             }],
         );
 
-        index_extracted(&index, &available, &repo, &cache, &Reporter::default());
+        let mut sink = |message| {
+            let _ = bus.notify(message);
+        };
+        index_extracted(&mut sink, &available, &repo, &cache);
 
         let extracted = cache
             .join("demo")
@@ -622,18 +853,17 @@ mod tests {
             "the source should be extracted to the cache"
         );
         assert!(
-            index
-                .all_symbols()
+            bus.all_symbols()
                 .iter()
-                .all(|entry| entry.uri != class_uri),
+                .all(|entry| *entry.uri != class_uri),
             "the class-file entries should be dropped"
         );
-        let entries = index.query_name("Thing");
+        let entries = bus.query_name("Thing");
         assert_eq!(entries.len(), 1);
         assert!(entries[0].dependency && entries[0].library_source);
         assert_eq!(entries[0].uri.to_file_path().unwrap(), extracted);
         // The cache is never a references or rename candidate.
-        assert!(index.source_files().is_empty());
+        assert!(bus.source_files().is_empty());
     }
 
     #[tokio::test]
@@ -644,13 +874,8 @@ mod tests {
         let sources = stored_zip(&[("demo/Thing.java", SOURCE)]);
         let server = TestServer::start(sources_jar_routes(sources, None));
 
-        let available = fetch_sources(
-            &[artifact()],
-            &repo,
-            &server.base_url(),
-            &Reporter::default(),
-        )
-        .await;
+        let bus = crate::bus::BusClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &bus).await;
         assert_eq!(available, vec![artifact()]);
         assert!(sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
     }
@@ -666,13 +891,8 @@ mod tests {
             Some("0000000000000000000000000000000000000000"),
         ));
 
-        let available = fetch_sources(
-            &[artifact()],
-            &repo,
-            &server.base_url(),
-            &Reporter::default(),
-        )
-        .await;
+        let bus = crate::bus::BusClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &bus).await;
         assert!(available.is_empty());
         assert!(!sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
     }
@@ -683,13 +903,8 @@ mod tests {
         let fixture = TempDir::new("unreachable");
         let repo = fixture.path().join("repo");
         // Port 1 is not served; the fetch must fail without panicking.
-        let available = fetch_sources(
-            &[artifact()],
-            &repo,
-            "http://127.0.0.1:1",
-            &Reporter::default(),
-        )
-        .await;
+        let bus = crate::bus::BusClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, "http://127.0.0.1:1", &bus).await;
         assert!(available.is_empty());
         assert!(!sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
     }
@@ -705,11 +920,59 @@ mod tests {
         std::env::set_var("JAVA_LSP_OFFLINE", "1");
         std::env::set_var("MAVEN_REPO", &repo);
         std::env::set_var("JAVA_LSP_MAVEN_CENTRAL_URL", server.base_url());
-        index_sources(WorkspaceIndex::new(), vec![artifact()], Reporter::default()).await;
+        let bus = crate::bus::BusClient::standalone();
+        index_sources(vec![artifact()], bus).await;
         std::env::remove_var("JAVA_LSP_OFFLINE");
         std::env::remove_var("MAVEN_REPO");
         std::env::remove_var("JAVA_LSP_MAVEN_CENTRAL_URL");
 
         assert!(!sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
+    }
+
+    const OTHER: &[u8] = b"package demo;\n\npublic class Other {\n}\n";
+
+    #[test]
+    fn a_sources_jar_is_published_as_one_base_artifact() {
+        let fixture = TempDir::new("one-base-artifact");
+        let repo = fixture.path().join("repo");
+        let cache = fixture.path().join("cache");
+        // Write the sources jar straight into the repository path, so the test
+        // needs no server: `index_extracted` reads it from disk.
+        let sources = stored_zip(&[("demo/Thing.java", SOURCE), ("demo/Other.java", OTHER)]);
+        let jar = sources_jar_path(&repo, "demo", "lib", "1.0");
+        std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
+        std::fs::write(&jar, &sources).unwrap();
+
+        let bus = crate::bus::BusClient::standalone();
+        let mut published: Vec<DriverMessage> = Vec::new();
+        {
+            let mut sink = |message: DriverMessage| {
+                let _ = bus.notify(message.clone());
+                published.push(message);
+            };
+            index_extracted(&mut sink, &[artifact()], &repo, &cache);
+        }
+
+        // One base artifact for the whole jar, not one per source file.
+        let base_artifacts = published
+            .iter()
+            .filter(|message| matches!(message, DriverMessage::BaseArtifact { .. }))
+            .count();
+        assert_eq!(
+            base_artifacts, 1,
+            "expected one BaseArtifact per artifact, got {base_artifacts}"
+        );
+        // A per-archive progress update keeps the work-done item moving.
+        assert!(
+            published.iter().any(|message| matches!(
+                message,
+                DriverMessage::Progress(ProgressUpdate::Update { message, .. })
+                    if message == "Parsed 1/1 dependency source archives (2 source files)"
+            )),
+            "expected a per-archive progress update"
+        );
+        // Both files' entries are in that single layer.
+        assert_eq!(bus.query_name("Thing").len(), 1);
+        assert_eq!(bus.query_name("Other").len(), 1);
     }
 }

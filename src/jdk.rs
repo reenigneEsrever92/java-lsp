@@ -6,6 +6,7 @@
 //! unusable one is a graceful no-op: warm-up completes without JDK entries.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
@@ -113,6 +114,30 @@ pub fn jdk_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types:
     }
 }
 
+/// The archives `jdk_entries` reads for `home`, for the base cache's identity
+/// key. Empty when no readable standard-library archive exists.
+pub(crate) fn jdk_archive_paths(home: &Path) -> Vec<PathBuf> {
+    if home.join("jmods").is_dir() {
+        let mut archives: Vec<PathBuf> = Vec::new();
+        if let Ok(entries) = std::fs::read_dir(home.join("jmods")) {
+            archives.extend(
+                entries
+                    .flatten()
+                    .map(|entry| entry.path())
+                    .filter(|path| path.extension().is_some_and(|ext| ext == "jmod")),
+            );
+        }
+        archives.sort();
+        archives
+    } else if let Some(src) = src_zip(home) {
+        vec![src]
+    } else if let Some(rt) = rt_jar(home) {
+        vec![rt]
+    } else {
+        Vec::new()
+    }
+}
+
 /// Class files from `jmods/*.jmod` (JDK 9+).
 fn jmod_entries(home: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types::TypeInfo>)> {
     let mut archives: Vec<PathBuf> = Vec::new();
@@ -137,12 +162,22 @@ fn class_archive_entries(
     archive: &Path,
     in_jmod: bool,
 ) -> Option<(Url, Vec<SymbolEntry>, Vec<crate::types::TypeInfo>)> {
-    let data = std::fs::read(archive).ok()?;
+    let raw = std::fs::read(archive).ok()?;
+    // A jmod is a ZIP prefixed by a 4-byte `JM` magic (the version follows), so
+    // every central-directory offset is relative to byte 4. Strip the magic so
+    // the offsets index this buffer directly; a plain jar/zip starts with the
+    // local-file-header signature and is used as-is.
+    let data: &[u8] = if raw.starts_with(b"JM") && raw.len() >= 4 {
+        &raw[4..]
+    } else {
+        &raw
+    };
     let uri = Url::from_file_path(archive).ok()?;
+    let shared = Arc::new(uri.clone());
     let mut entries = Vec::new();
     let mut types = Vec::new();
     let mut classes = 0usize;
-    for_each_zip_entry(&data, |name, class_data| {
+    for_each_zip_entry(data, |name, class_data| {
         if !name.ends_with(".class")
             || name.ends_with("module-info.class")
             || name.ends_with("package-info.class")
@@ -165,7 +200,7 @@ fn class_archive_entries(
         let Ok(info) = parse_class(&class_data) else {
             return;
         };
-        entries.extend(crate::classfile::class_entries(&uri, &info));
+        entries.extend(crate::classfile::class_entries(&shared, &info));
         if let Some(type_info) = crate::classfile::class_type_info(&info) {
             types.push(type_info);
         }
@@ -216,6 +251,8 @@ fn src_zip_entries(src: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types::
             return;
         };
         let mut file_entries = crate::index::extract_entries(&uri, &tree, &text);
+        // Import entries are never read by a feature; a JDK tree has many.
+        crate::index::drop_import_entries(&mut file_entries);
         for entry in &mut file_entries {
             entry.dependency = true;
         }
@@ -395,18 +432,19 @@ mod tests {
         let list_class = class_bytes("java/util/List", 0x0601, Some("java/lang/Object"));
         let internal = class_bytes("jdk/internal/Hidden", 0x0021, Some("java/lang/Object"));
         let sun_class = class_bytes("com/sun/also/Hidden", 0x0021, Some("java/lang/Object"));
-        jdk.write(
-            "jmods/java.base.jmod",
-            &test_stored_zip(&[
-                ("classes/java/lang/String.class", &string_class),
-                ("classes/java/util/List.class", &list_class),
-                ("classes/jdk/internal/Hidden.class", &internal),
-                ("classes/com/sun/also/Hidden.class", &sun_class),
-                ("classes/module-info.class", b"not a class"),
-                ("native/libjava.so", b"binary blob"),
-                ("conf/security", b"config"),
-            ]),
-        );
+        // Real jmods are a ZIP prefixed by the 4-byte `JM` magic; include it so
+        // the offset handling is exercised.
+        let mut jmod = b"JM\x01\x00".to_vec();
+        jmod.extend_from_slice(&test_stored_zip(&[
+            ("classes/java/lang/String.class", &string_class),
+            ("classes/java/util/List.class", &list_class),
+            ("classes/jdk/internal/Hidden.class", &internal),
+            ("classes/com/sun/also/Hidden.class", &sun_class),
+            ("classes/module-info.class", b"not a class"),
+            ("native/libjava.so", b"binary blob"),
+            ("conf/security", b"config"),
+        ]));
+        jdk.write("jmods/java.base.jmod", &jmod);
 
         let entries = jdk_entries(&jdk.home);
         assert_eq!(entries.len(), 1, "one archive with classes");

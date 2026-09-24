@@ -1,14 +1,15 @@
-//! The shell <-> engine boundary: commands in, events out, over channels.
+//! The engine: the shell boundary, the message hub, and the drivers.
 //!
-//! The shell holds an [`EngineHandle`] and never touches the analysis core
-//! directly. Each request sends a [`Command`] carrying a oneshot reply; the
-//! dispatcher task owns the [`TreeSitterEngine`] core, applies mutations and
-//! orchestration inline (in arrival order — the one place ordering matters) and
-//! runs read-only queries on spawned tasks, so a slow query never delays
-//! typing. [`EngineEvent`] is the reverse channel: the shell drains it and turns
-//! each event into a client notification (today, diagnostics; later, warm-up
-//! progress).
+//! The shell holds an [`EngineHandle`], sends [`Command`]s (or awaits a reply),
+//! and drains [`EngineEvent`]s. The engine owns the analysis core and a message
+//! bus: every subsystem is a driver that emits [`DriverMessage`]s onto the bus;
+//! the hub task hands the index-affecting ones to the index subsystem, relays
+//! every message to every driver, and is the sole place that turns a message
+//! into an [`EngineEvent`] for the shell. Diagnostics are not computed on this
+//! path: a mutation only forwards the document to the diagnostics subsystem
+//! ([`crate::diagnostics`]), which sweeps on a blocking task, coalesced.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
@@ -20,188 +21,15 @@ use tower_lsp::lsp_types::{
 
 use crate::analysis::TreeSitterEngine;
 use crate::index::SymbolEntry;
+use crate::messages::{
+    Command, DriverMessage, EngineEvent, MessageLevel, ProgressUpdate, Stage, WatchedChange,
+};
 
 /// How many commands may queue before a sender waits. Generous: commands are
 /// small and only mutations hold the dispatcher.
 const COMMANDS_IN_FLIGHT: usize = 64;
 
 type Reply<T> = oneshot::Sender<T>;
-
-/// Commands the shell sends to the engine. Queries carry a `oneshot` reply.
-pub enum Command {
-    /// The workspace root is known; the background warm-up may start.
-    SetWorkspaceRoot(Url),
-    /// Records whether the client supports the `CreateFile` resource operation.
-    SetClientCapabilities {
-        resource_operations: bool,
-    },
-    Open {
-        uri: Url,
-        text: String,
-        version: i32,
-    },
-    Change {
-        uri: Url,
-        text: String,
-        version: i32,
-    },
-    Close(Url),
-    Hover {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<Hover>>,
-    },
-    Definition {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<Location>>,
-    },
-    Completions {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<CompletionResponse>>,
-    },
-    DocumentSymbols {
-        uri: Url,
-        reply: Reply<Option<Vec<DocumentSymbol>>>,
-    },
-    FoldingRanges {
-        uri: Url,
-        reply: Reply<Option<Vec<FoldingRange>>>,
-    },
-    SemanticTokens {
-        uri: Url,
-        reply: Reply<Option<SemanticTokens>>,
-    },
-    InlayHints {
-        uri: Url,
-        range: Range,
-        reply: Reply<Vec<InlayHint>>,
-    },
-    SignatureHelp {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<SignatureHelp>>,
-    },
-    References {
-        uri: Url,
-        position: Position,
-        include_declaration: bool,
-        reply: Reply<Vec<Location>>,
-    },
-    Rename {
-        uri: Url,
-        position: Position,
-        new_name: String,
-        reply: Reply<Option<WorkspaceEdit>>,
-    },
-    WorkspaceSymbols {
-        query: String,
-        reply: Reply<Vec<SymbolInformation>>,
-    },
-    CodeActions {
-        uri: Url,
-        diagnostics: Vec<Diagnostic>,
-        reply: Reply<Vec<CodeAction>>,
-    },
-    /// A flat snapshot of the index; a verification hook for tests.
-    IndexedSymbols {
-        reply: Reply<Vec<SymbolEntry>>,
-    },
-    /// True once the initial scan finished; a verification hook for tests.
-    IndexReady {
-        reply: Reply<bool>,
-    },
-}
-
-/// Events the engine pushes to the shell.
-#[derive(Debug)]
-pub enum EngineEvent {
-    /// Diagnostics for `uri`, replacing whatever was published for it before.
-    /// A `None` version clears them (the document closed).
-    Diagnostics {
-        uri: Url,
-        version: Option<i32>,
-        diagnostics: Vec<Diagnostic>,
-    },
-    /// Progress for the single background job (warm-up and source fetch).
-    Progress(ProgressUpdate),
-    /// A discrete, notable message for the user.
-    Message { level: MessageLevel, text: String },
-}
-
-/// One step of the background job's progress. The shell owns the progress token
-/// and the client-facing shape; the engine only says what happened.
-#[derive(Debug)]
-pub enum ProgressUpdate {
-    /// The job started: create (or reuse) the item under this title.
-    Begin { title: String, message: String },
-    /// A phase or count within the same item.
-    Update {
-        message: String,
-        percentage: Option<u32>,
-    },
-    /// The job finished.
-    End { message: Option<String> },
-}
-
-/// How a notice is presented to the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MessageLevel {
-    Info,
-    Warning,
-}
-
-/// A cheap, cloneable handle the background job reports through. A detached
-/// reporter (the default) drops everything, so inline scans and unit tests stay
-/// silent.
-#[derive(Debug, Clone, Default)]
-pub struct Reporter {
-    events: Option<mpsc::UnboundedSender<EngineEvent>>,
-}
-
-impl Reporter {
-    /// A reporter that forwards to the shell's event channel.
-    pub fn attached(events: mpsc::UnboundedSender<EngineEvent>) -> Self {
-        Self {
-            events: Some(events),
-        }
-    }
-
-    pub fn begin(&self, title: &str, message: &str) {
-        self.send(EngineEvent::Progress(ProgressUpdate::Begin {
-            title: title.to_string(),
-            message: message.to_string(),
-        }));
-    }
-
-    pub fn update(&self, message: String, percentage: Option<u32>) {
-        self.send(EngineEvent::Progress(ProgressUpdate::Update {
-            message,
-            percentage,
-        }));
-    }
-
-    pub fn end(&self, message: Option<String>) {
-        self.send(EngineEvent::Progress(ProgressUpdate::End { message }));
-    }
-
-    pub fn message(&self, level: MessageLevel, text: String) {
-        self.send(EngineEvent::Message { level, text });
-    }
-
-    fn send(&self, event: EngineEvent) {
-        if let Some(events) = &self.events {
-            let _ = events.send(event);
-        }
-    }
-}
-
-/// A cheap, cloneable handle to the engine task.
-#[derive(Clone)]
-pub struct EngineHandle {
-    commands: mpsc::Sender<Command>,
-}
 
 impl EngineHandle {
     pub async fn set_workspace_root(&self, root: Url) {
@@ -237,6 +65,11 @@ impl EngineHandle {
         let _ = self.commands.send(Command::Close(uri)).await;
     }
 
+    /// Reports watched filesystem events for the engine to index or drop.
+    pub async fn watched_files(&self, changes: Vec<(Url, WatchedChange)>) {
+        let _ = self.commands.send(Command::WatchedFiles { changes }).await;
+    }
+
     pub async fn hover(&self, uri: Url, position: Position) -> Option<Hover> {
         self.request(|reply| Command::Hover {
             uri,
@@ -255,6 +88,16 @@ impl EngineHandle {
         })
         .await
         .flatten()
+    }
+
+    pub async fn implementation(&self, uri: Url, position: Position) -> Vec<Location> {
+        self.request(|reply| Command::Implementation {
+            uri,
+            position,
+            reply,
+        })
+        .await
+        .unwrap_or_default()
     }
 
     pub async fn completions(&self, uri: Url, position: Position) -> Option<CompletionResponse> {
@@ -370,48 +213,335 @@ impl EngineHandle {
     }
 }
 
-/// Spawns the engine task over a fresh core and returns its handle. `events` is
-/// the reverse channel; the caller drains it into client notifications.
+/// The filesystem driver's input: the root the shell announced, and the client's
+/// watched-file events.
+
+/// Spawns the engine task over a fresh core, the hub, every module, and the
+/// drivers. `events` is the reverse channel; the caller drains it into client
+/// notifications.
 pub fn spawn(events: mpsc::UnboundedSender<EngineEvent>) -> EngineHandle {
     let (commands, mut incoming) = mpsc::channel(COMMANDS_IN_FLIGHT);
-    let engine = Arc::new(TreeSitterEngine::new());
-    // The warm-up reports through the same channel the dispatcher pushes to.
-    engine.set_reporter(Reporter::attached(events.clone()));
+
+    // The index module owns the symbol index: it answers the requests the hub
+    // routes to it and applies the index-affecting notifications it is
+    // broadcast.
+    let (index, index_rx) = crate::bus::channel();
+    crate::index::spawn_index_module(index_rx);
+
+    // Drivers receive notifications on their own channel.
+    let (project_tx, project_rx) = mpsc::unbounded_channel();
+    let (dependency_tx, dependency_rx) = mpsc::unbounded_channel();
+    let (source_tx, source_rx) = mpsc::unbounded_channel();
+    let (jar_tx, jar_rx) = mpsc::unbounded_channel();
+    let (jdk_tx, jdk_rx) = mpsc::unbounded_channel();
+    let (download_tx, download_rx) = mpsc::unbounded_channel();
+
+    // The hub: broadcasts every notification to every module and driver, routes
+    // each request to the module that owns it, and is the sole translator to the
+    // editor.
+    let (diagnostics, diagnostics_rx) = crate::bus::channel();
+    let (quickfix, quickfix_rx) = crate::bus::channel();
+    let mut owners = HashMap::new();
+    owners.insert(crate::bus::Module::Index, index.clone());
+    owners.insert(crate::bus::Module::Diagnostics, diagnostics.clone());
+    owners.insert(crate::bus::Module::QuickFix, quickfix.clone());
+    let client = crate::bus::spawn_router(
+        events.clone(),
+        vec![index, diagnostics, quickfix],
+        vec![
+            project_tx,
+            dependency_tx,
+            source_tx,
+            jar_tx,
+            jdk_tx,
+            download_tx,
+        ],
+        owners,
+    );
+
+    let engine = Arc::new(TreeSitterEngine::with_index(client.labeled("core")));
+    engine.set_events(events.clone());
+
+    // Each sender logs under its own name: the core, the dispatcher task, the six
+    // drivers, and the two modules are distinct in the hub log.
+    tokio::spawn(project_driver(project_rx, client.labeled("project")));
+    tokio::spawn(dependency_driver(
+        dependency_rx,
+        client.labeled("dependency"),
+    ));
+    tokio::spawn(source_driver(source_rx, client.labeled("source")));
+    tokio::spawn(jar_driver(jar_rx, client.labeled("jar")));
+    tokio::spawn(jdk_driver(jdk_rx, client.labeled("jdk")));
+    tokio::spawn(download_driver(download_rx, client.labeled("download")));
+
+    crate::diagnostics::spawn_module(diagnostics_rx, client.labeled("diagnostics"));
+    crate::quickfix::spawn_module(quickfix_rx, client.labeled("quickfix"));
+
+    // The dispatcher: mutations inline in arrival order, queries spawned.
+    let dispatcher_client = client.labeled("dispatch");
+    let dispatcher_events = events.clone();
     tokio::spawn(async move {
         while let Some(command) = incoming.recv().await {
-            dispatch(command, &engine, &events);
+            dispatch(command, &engine, &dispatcher_events, &dispatcher_client);
         }
     });
     EngineHandle { commands }
 }
 
-/// Applies mutations and orchestration inline, in arrival order, and hands
-/// read-only queries to spawned tasks so none can delay a later command.
+/// The project driver and the warm-up coordinator: on an added folder it walks
+/// for the Maven model and the source inventory, and once the core stages and the
+/// downloader have reported it flips `ready` and closes the progress item.
+async fn project_driver(
+    mut rx: mpsc::UnboundedReceiver<DriverMessage>,
+    client: crate::bus::BusClient,
+) {
+    let mut root: Option<Url> = None;
+    let mut started: Option<std::time::Instant> = None;
+    let mut maven = false;
+    let mut counts: HashMap<Stage, usize> = HashMap::new();
+    let mut ready_sent = false;
+    let mut summary_sent = false;
+    while let Some(message) = rx.recv().await {
+        match message {
+            DriverMessage::FolderAdded { uri } if root.is_none() => {
+                root = Some(uri.clone());
+                started = Some(std::time::Instant::now());
+                let _ = client.notify(DriverMessage::Progress(ProgressUpdate::Begin {
+                    title: "java-lsp".to_string(),
+                    message: "Indexing workspace".to_string(),
+                }));
+                let client = client.clone();
+                let _ = tokio::task::spawn_blocking(move || match uri.to_file_path() {
+                    Ok(path) => {
+                        let (model, files) = crate::index::walk_project(&path);
+                        let _ = client.notify(DriverMessage::ProjectModel {
+                            model: Arc::new(model),
+                        });
+                        let _ = client.notify(DriverMessage::SourceInventory {
+                            files: Arc::new(files),
+                        });
+                    }
+                    Err(_) => {
+                        let _ = client.notify(DriverMessage::ProjectModel {
+                            model: Arc::new(crate::project::ProjectModel::default()),
+                        });
+                        let _ = client.notify(DriverMessage::SourceInventory {
+                            files: Arc::new(Vec::new()),
+                        });
+                    }
+                })
+                .await;
+            }
+            DriverMessage::ProjectModel { model } => {
+                maven = model.maven;
+            }
+            DriverMessage::StageDone { stage, count } => {
+                counts.insert(stage, count);
+                if !ready_sent
+                    && counts.contains_key(&Stage::Sources)
+                    && counts.contains_key(&Stage::Jars)
+                    && counts.contains_key(&Stage::Jdk)
+                {
+                    ready_sent = true;
+                    let _ = client.notify(DriverMessage::Ready);
+                }
+                if ready_sent && !summary_sent && counts.contains_key(&Stage::Downloads) {
+                    summary_sent = true;
+                    let files = counts.get(&Stage::Sources).copied().unwrap_or(0);
+                    let jars = counts.get(&Stage::Jars).copied().unwrap_or(0);
+                    let jdk_classes = counts.get(&Stage::Jdk).copied().unwrap_or(0);
+                    let elapsed_ms = started
+                        .map(|at| at.elapsed().as_millis() as u64)
+                        .unwrap_or(0);
+                    let root = root.as_ref().map(Url::to_string).unwrap_or_default();
+                    let _ = client.notify(DriverMessage::Summary {
+                        root,
+                        files,
+                        jars,
+                        jdk_classes,
+                        maven,
+                        elapsed_ms,
+                    });
+                    let _ = client.notify(DriverMessage::Progress(ProgressUpdate::End {
+                        message: Some(format!(
+                            "Indexed {files} files, {jars} dependency jars, {jdk_classes} JDK classes"
+                        )),
+                    }));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The dependency driver: on the project model, resolves each module's closure
+/// against the local repository and emits the jar list (and the offline notice).
+async fn dependency_driver(
+    mut rx: mpsc::UnboundedReceiver<DriverMessage>,
+    client: crate::bus::BusClient,
+) {
+    while let Some(message) = rx.recv().await {
+        if let DriverMessage::ProjectModel { model } = message {
+            let client = client.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let artifacts = crate::index::resolve_artifacts(&model);
+                if let Some(text) = crate::index::offline_notice(artifacts.len()) {
+                    let _ = client.notify(DriverMessage::Notice {
+                        level: MessageLevel::Info,
+                        text,
+                    });
+                }
+                let _ = client.notify(DriverMessage::Artifacts {
+                    artifacts: Arc::new(artifacts),
+                });
+            })
+            .await;
+        }
+    }
+}
+
+/// The source scanner: on the source inventory, parses each file and emits its
+/// entries and model, then the `Sources` stage-done.
+async fn source_driver(
+    mut rx: mpsc::UnboundedReceiver<DriverMessage>,
+    client: crate::bus::BusClient,
+) {
+    while let Some(message) = rx.recv().await {
+        if let DriverMessage::SourceInventory { files } = message {
+            let client = client.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let count = {
+                    let mut sink = |message| {
+                        let _ = client.notify(message);
+                    };
+                    crate::index::scan_sources(&files, &mut sink)
+                };
+                let _ = client.notify(DriverMessage::StageDone {
+                    stage: Stage::Sources,
+                    count,
+                });
+            })
+            .await;
+        }
+    }
+}
+
+/// The jar indexer: on the artifact list, reads each jar and emits its entries
+/// and model, then the `Jars` stage-done.
+async fn jar_driver(mut rx: mpsc::UnboundedReceiver<DriverMessage>, client: crate::bus::BusClient) {
+    while let Some(message) = rx.recv().await {
+        if let DriverMessage::Artifacts { artifacts } = message {
+            let client = client.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let count = {
+                    let mut sink = |message| {
+                        let _ = client.notify(message);
+                    };
+                    crate::index::index_jars(&artifacts, &mut sink)
+                };
+                let _ = client.notify(DriverMessage::StageDone {
+                    stage: Stage::Jars,
+                    count,
+                });
+            })
+            .await;
+        }
+    }
+}
+
+/// The JDK indexer: runs once at start, independent of the workspace, and emits
+/// its archives' entries and models, then the `Jdk` stage-done.
+async fn jdk_driver(_rx: mpsc::UnboundedReceiver<DriverMessage>, client: crate::bus::BusClient) {
+    let client = client.clone();
+    let _ = tokio::task::spawn_blocking(move || {
+        let count = {
+            let mut sink = |message| {
+                let _ = client.notify(message);
+            };
+            crate::index::index_jdk(&mut sink)
+        };
+        let _ = client.notify(DriverMessage::StageDone {
+            stage: Stage::Jdk,
+            count,
+        });
+    })
+    .await;
+}
+
+/// The source downloader: on the artifact list, fetches and indexes dependency
+/// sources, then the `Downloads` stage-done (which gates only the summary).
+async fn download_driver(
+    mut rx: mpsc::UnboundedReceiver<DriverMessage>,
+    client: crate::bus::BusClient,
+) {
+    while let Some(message) = rx.recv().await {
+        if let DriverMessage::Artifacts { artifacts } = message {
+            crate::sources::index_sources((*artifacts).clone(), client.clone()).await;
+            let _ = client.notify(DriverMessage::StageDone {
+                stage: Stage::Downloads,
+                count: 0,
+            });
+        }
+    }
+}
+
+/// Dispatches a command: filesystem commands go to the filesystem driver,
+/// mutations are applied inline in arrival order, and read-only queries are
+/// spawned so none can delay a later command.
 fn dispatch(
     command: Command,
     engine: &Arc<TreeSitterEngine>,
     events: &mpsc::UnboundedSender<EngineEvent>,
+    client: &crate::bus::BusClient,
 ) {
     match command {
-        Command::SetWorkspaceRoot(root) => engine.set_workspace_root(&root),
+        Command::SetWorkspaceRoot(root) => {
+            engine.set_workspace_root(&root);
+            client.notify(DriverMessage::FolderAdded { uri: root });
+        }
         Command::SetClientCapabilities {
             resource_operations,
-        } => engine.set_resource_operations(resource_operations),
+        } => {
+            engine.set_resource_operations(resource_operations);
+            client.notify(DriverMessage::ClientCapabilities {
+                resource_operations,
+            });
+        }
         Command::Open { uri, text, version } => {
-            engine.open(&uri, &text);
-            publish_diagnostics(engine, events, uri, Some(version));
+            engine.open(&uri, &text, version);
+            client.notify(DriverMessage::DocumentOpened {
+                uri,
+                text: Arc::new(text),
+                version,
+            });
         }
         Command::Change { uri, text, version } => {
-            engine.change(&uri, &text);
-            publish_diagnostics(engine, events, uri, Some(version));
+            engine.change(&uri, &text, version);
+            client.notify(DriverMessage::DocumentChanged {
+                uri,
+                text: Arc::new(text),
+                version,
+            });
         }
         Command::Close(uri) => {
             engine.close(&uri);
+            // Cheap, no analysis: clear the closed document inline, then let the
+            // sweep republish the rest off the dispatcher.
             let _ = events.send(EngineEvent::Diagnostics {
-                uri,
+                uri: uri.clone(),
                 version: None,
                 diagnostics: Vec::new(),
             });
+            client.notify(DriverMessage::DocumentClosed { uri });
+        }
+        Command::WatchedFiles { changes } => {
+            // Re-read the changed files into the core, then tell the bus so the
+            // diagnostics subsystem republishes the documents that can see the
+            // change.
+            engine.watched_files(&changes);
+            for (uri, change) in changes {
+                client.notify(DriverMessage::FileEvent { uri, change });
+            }
         }
         Command::Hover {
             uri,
@@ -425,6 +555,15 @@ fn dispatch(
         } => read(
             engine,
             move |engine| engine.definition(&uri, position),
+            reply,
+        ),
+        Command::Implementation {
+            uri,
+            position,
+            reply,
+        } => read(
+            engine,
+            move |engine| engine.implementation(&uri, position),
             reply,
         ),
         Command::Completions {
@@ -486,11 +625,14 @@ fn dispatch(
             uri,
             diagnostics,
             reply,
-        } => read(
-            engine,
-            move |engine| engine.code_actions(&uri, &diagnostics),
-            reply,
-        ),
+        } => {
+            // The quick-fix module answers through the bus; blocking for the
+            // reply uses the blocking pool, so a runtime worker is never starved.
+            let client = client.clone();
+            tokio::task::spawn_blocking(move || {
+                let _ = reply.send(client.code_actions(&uri, diagnostics));
+            });
+        }
         Command::IndexedSymbols { reply } => read(engine, |engine| engine.indexed_symbols(), reply),
         Command::IndexReady { reply } => read(engine, |engine| engine.index_ready(), reply),
     }
@@ -509,73 +651,63 @@ fn read<T: Send + 'static>(
     });
 }
 
-/// Computes and emits diagnostics for a just-applied edit.
-fn publish_diagnostics(
-    engine: &TreeSitterEngine,
-    events: &mpsc::UnboundedSender<EngineEvent>,
-    uri: Url,
-    version: Option<i32>,
-) {
-    let diagnostics = engine.diagnostics(&uri);
-    let _ = events.send(EngineEvent::Diagnostics {
-        uri,
-        version,
-        diagnostics,
-    });
+/// A cheap, cloneable handle to the engine task.
+#[derive(Clone)]
+pub struct EngineHandle {
+    commands: mpsc::Sender<Command>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::IndexHandle;
 
     #[test]
-    fn reporter_forwards_progress_and_messages() {
+    fn the_index_subsystem_applies_messages_and_translate_emits_events() {
+        let index = IndexHandle::standalone();
         let (events, mut received) = mpsc::unbounded_channel();
-        let reporter = Reporter::attached(events);
+        let jar = Url::parse("file:///lib.jar").unwrap();
 
-        reporter.begin("java-lsp", "Indexing workspace");
-        reporter.update("Indexed 3 source files".to_string(), None);
-        reporter.update("Fetched 1/2 dependency sources".to_string(), Some(50));
-        reporter.message(MessageLevel::Info, "note".to_string());
-        reporter.end(Some("done".to_string()));
+        index.apply(DriverMessage::BaseArtifact {
+            uri: jar,
+            entries: Arc::new(Vec::new()),
+            types: Arc::new(crate::types::TypeModel::new()),
+        });
+        crate::messages::translate(
+            &DriverMessage::Progress(ProgressUpdate::Update {
+                message: "mid".to_string(),
+                percentage: Some(3),
+            }),
+            &events,
+        );
+        crate::messages::translate(
+            &DriverMessage::Notice {
+                level: MessageLevel::Info,
+                text: "note".to_string(),
+            },
+            &events,
+        );
+        index.apply(DriverMessage::Ready);
 
-        let mut kinds = Vec::new();
-        while let Ok(event) = received.try_recv() {
-            match event {
-                EngineEvent::Progress(ProgressUpdate::Begin { title, message }) => {
-                    assert_eq!(title, "java-lsp");
-                    assert_eq!(message, "Indexing workspace");
-                    kinds.push("begin");
-                }
-                EngineEvent::Progress(ProgressUpdate::Update {
-                    message,
-                    percentage,
-                }) => {
-                    let expected = message.starts_with("Fetched").then_some(50);
-                    assert_eq!(percentage, expected, "{message}");
-                    kinds.push("update");
-                }
-                EngineEvent::Progress(ProgressUpdate::End { message }) => {
-                    assert_eq!(message.as_deref(), Some("done"));
-                    kinds.push("end");
-                }
-                EngineEvent::Message { level, text } => {
-                    assert_eq!(level, MessageLevel::Info);
-                    assert_eq!(text, "note");
-                    kinds.push("message");
-                }
-                EngineEvent::Diagnostics { .. } => panic!("unexpected diagnostics"),
+        assert!(index.ready());
+        assert!(index.type_model().is_some());
+        match received.try_recv().expect("progress event") {
+            EngineEvent::Progress(ProgressUpdate::Update {
+                message,
+                percentage,
+            }) => {
+                assert_eq!(message, "mid");
+                assert_eq!(percentage, Some(3));
             }
+            other => panic!("unexpected event: {other:?}"),
         }
-        assert_eq!(kinds, vec!["begin", "update", "update", "message", "end"]);
-    }
-
-    #[test]
-    fn a_detached_reporter_is_silent() {
-        let reporter = Reporter::default();
-        reporter.begin("t", "m");
-        reporter.update("u".to_string(), None);
-        reporter.end(None);
-        reporter.message(MessageLevel::Warning, "w".to_string());
+        match received.try_recv().expect("notice event") {
+            EngineEvent::Message { level, text } => {
+                assert_eq!(level, MessageLevel::Info);
+                assert_eq!(text, "note");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(received.try_recv().is_err(), "no further events");
     }
 }

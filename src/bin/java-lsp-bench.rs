@@ -7,7 +7,8 @@
 //! - first-response time per feature after `didOpen` (and from process start),
 //! - request latency (hover RTT) during index warm-up, detected via the
 //!   server's own "workspace index warm-up complete" log line on stderr,
-//! - peak memory via `/proc/<pid>/status` `VmHWM` (Linux; `n/a` elsewhere),
+//! - peak memory: `/proc/<pid>/status` `VmHWM` on Linux, or `getrusage`
+//!   `ru_maxrss` on macOS,
 //!
 //! and prints one report (text table, or JSON with `--json`). std only —
 //! one driver thread plus one stderr-reader thread, no async runtime.
@@ -51,16 +52,29 @@ struct Args {
     json: bool,
     keep: bool,
     maven: bool,
+    /// Open this many documents before the responsiveness scenario.
+    open_docs: usize,
+    /// Send this many didChange edits to document 0 in the scenario.
+    edits: usize,
+    /// Issue a `textDocument/references` search on the shared `ping` member.
+    references: bool,
 }
 
 fn usage() -> String {
     "usage: java-lsp-bench [--files N] [--methods-per-class M] [--fields-per-class F] \
-     [--server PATH] [--json] [--keep] [--maven]
+     [--server PATH] [--json] [--keep] [--maven] [--open-docs K] [--edits M] [--references]
   --files N              fixture .java files to generate (default 200)
   --methods-per-class M  multi-line methods per fixture class (default 5)
   --fields-per-class F   fields per fixture class (default 3)
   --maven                lay the fixture out as a single-module Maven project
                          (pom.xml + src/main/java) instead of a flat root
+  --open-docs K          open K documents before the responsiveness scenario
+                         (default 1: only the report document)
+  --edits M              send M didChange edits to document 0, timing each until
+                         its diagnostics republish and the hover/definition sent
+                         alongside it (default 0)
+  --references           issue textDocument/references on the shared `ping`
+                         member and record its duration and result count
   --server PATH          java-lsp binary to drive (default: $JAVA_LSP_BIN,
                          then target/{release,debug}/java-lsp, else an auto
                          `cargo build --bin java-lsp` when run under cargo)
@@ -78,6 +92,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
         json: false,
         keep: false,
         maven: false,
+        open_docs: 1,
+        edits: 0,
+        references: false,
     };
     let mut i = 0;
     while i < argv.len() {
@@ -114,6 +131,17 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
             "--json" => args.json = true,
             "--keep" => args.keep = true,
             "--maven" => args.maven = true,
+            "--open-docs" => {
+                args.open_docs = next_value("--open-docs")?
+                    .parse()
+                    .map_err(|_| "--open-docs needs a number".to_string())?
+            }
+            "--edits" => {
+                args.edits = next_value("--edits")?
+                    .parse()
+                    .map_err(|_| "--edits needs a number".to_string())?
+            }
+            "--references" => args.references = true,
             "--help" | "-h" => return Err(usage()),
             other => return Err(format!("unknown flag `{other}`\n{}", usage())),
         }
@@ -121,6 +149,9 @@ fn parse_args(argv: &[String]) -> Result<Args, String> {
     }
     if args.files == 0 {
         return Err("--files must be at least 1".to_string());
+    }
+    if args.open_docs == 0 {
+        return Err("--open-docs must be at least 1".to_string());
     }
     Ok(args)
 }
@@ -144,9 +175,18 @@ fn class_name(i: usize) -> String {
     format!("BenchClass{i:05}")
 }
 
+/// The shared helper class every fixture file calls. One static member `ping`
+/// means a references search for `ping` must consider every file in the
+/// workspace — the worst case for a cross-file search.
+fn bench_shared_source() -> String {
+    "package bench;\n\npublic class BenchShared {\n    public static int ping(int x) {\n        return x;\n    }\n}\n"
+        .to_string()
+}
+
 /// One fixture file: a unique class with F fields and M multi-line methods,
 /// so document symbols, folding ranges, semantic tokens, and index entries
-/// all have material.
+/// all have material. The first method calls the shared `bench.BenchShared.ping`
+/// member, so every file mentions `ping` (the references worst case).
 fn fixture_source(class: &str, methods: usize, fields: usize) -> String {
     let methods = methods.max(1);
     let fields = fields.max(1);
@@ -159,6 +199,9 @@ fn fixture_source(class: &str, methods: usize, fields: usize) -> String {
     out.push('\n');
     for m in 0..methods {
         out.push_str(&format!("    public int method{m:02}(int a) {{\n"));
+        if m == 0 {
+            out.push_str("        BenchShared.ping(a);\n");
+        }
         out.push_str(&format!(
             "        int sum = a + this.field{:02};\n",
             m % fields
@@ -207,6 +250,11 @@ fn generate_fixture(
     } else {
         root.clone()
     };
+
+    // The shared helper is generated alongside the fixture classes, in the
+    // same source root and package, so `BenchShared.ping` resolves from every
+    // file.
+    fs::write(base.join("BenchShared.java"), bench_shared_source())?;
 
     let mut class_names = Vec::with_capacity(files);
     let mut uris = Vec::with_capacity(files);
@@ -485,21 +533,129 @@ struct Mem {
     rss_kb: Option<u64>,
 }
 
-/// Peak (VmHWM) and current (VmRSS) resident set of the server child, from
-/// the kernel-maintained `/proc/<pid>/status`. Linux-specific.
+/// Peak (VmHWM on Linux, `ru_maxrss` on macOS) and current resident set of the
+/// server child. Off the two supported platforms both are `None`.
 fn read_memory(pid: u32) -> Option<Mem> {
-    let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     Some(Mem {
-        peak_rss_kb: status_field(&status, "VmHWM"),
-        rss_kb: status_field(&status, "VmRSS"),
+        peak_rss_kb: peak_rss_kb(pid),
+        rss_kb: current_rss_kb(pid),
     })
 }
 
+/// The child's current resident set, in KiB. `/proc` on Linux; `None` elsewhere
+/// (macOS exposes no such file, and `ps` is not always available).
+fn current_rss_kb(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status_field(&status, "VmRSS")
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// The child's peak resident set in KiB: `/proc` `VmHWM` on Linux, or the
+/// kernel's `ru_maxrss` for already-reaped children on macOS. `None` elsewhere.
+fn peak_rss_kb(pid: u32) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let status = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+        status_field(&status, "VmHWM")
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let _ = pid;
+        children_peak_rss_kb()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn status_field(status: &str, key: &str) -> Option<u64> {
     status.lines().find_map(|line| {
         let rest = line.strip_prefix(key)?.trim().strip_prefix(':')?;
         rest.trim().split_whitespace().next()?.parse().ok()
     })
+}
+
+/// `getrusage(RUSAGE_CHILDREN)` — the peak RSS of the children this process has
+/// reaped, which is the server after `wait`. macOS reports max RSS in bytes, so
+/// the value is converted to KiB to match `VmHWM`. The kernel keeps only one
+/// maximum across all reaped children, so the bench must run a single child.
+#[cfg(target_os = "macos")]
+fn children_peak_rss_kb() -> Option<u64> {
+    #[repr(C)]
+    struct Timeval {
+        tv_sec: i64,
+        tv_usec: i32,
+        _pad: i32,
+    }
+
+    #[repr(C)]
+    #[allow(non_snake_case)]
+    struct RUsage {
+        ru_utime: Timeval,
+        ru_stime: Timeval,
+        ru_maxrss: i64,
+        ru_ixrss: i64,
+        ru_idrss: i64,
+        ru_isrss: i64,
+        ru_minflt: i64,
+        ru_majflt: i64,
+        ru_nswap: i64,
+        ru_inblock: i64,
+        ru_oublock: i64,
+        ru_msgsnd: i64,
+        ru_msgrcv: i64,
+        ru_nsignals: i64,
+        ru_nvcsw: i64,
+        ru_nivcsw: i64,
+    }
+
+    extern "C" {
+        fn getrusage(who: i32, usage: *mut RUsage) -> i32;
+    }
+
+    const RUSAGE_CHILDREN: i32 = -1;
+
+    let mut usage = RUsage {
+        ru_utime: Timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+            _pad: 0,
+        },
+        ru_stime: Timeval {
+            tv_sec: 0,
+            tv_usec: 0,
+            _pad: 0,
+        },
+        ru_maxrss: 0,
+        ru_ixrss: 0,
+        ru_idrss: 0,
+        ru_isrss: 0,
+        ru_minflt: 0,
+        ru_majflt: 0,
+        ru_nswap: 0,
+        ru_inblock: 0,
+        ru_oublock: 0,
+        ru_msgsnd: 0,
+        ru_msgrcv: 0,
+        ru_nsignals: 0,
+        ru_nvcsw: 0,
+        ru_nivcsw: 0,
+    };
+    let rc = unsafe { getrusage(RUSAGE_CHILDREN, &mut usage) };
+    if rc != 0 || usage.ru_maxrss <= 0 {
+        return None;
+    }
+    Some(usage.ru_maxrss as u64 / 1024)
 }
 
 // ---------------------------------------------------------------------------
@@ -530,6 +686,20 @@ struct Report {
     peak_rss_kb: Option<u64>,
     final_rss_kb: Option<u64>,
     total_ms: f64,
+    /// Documents open during the responsiveness scenario (opt-in).
+    open_docs: usize,
+    /// Edits sent in the scenario.
+    edits: usize,
+    /// Per edit: ms from `didChange` to that document's diagnostics republish.
+    edit_publish_ms: Vec<f64>,
+    /// Per edit: ms from `didChange` to the hover response sent alongside it.
+    edit_hover_ms: Vec<f64>,
+    /// Per edit: ms from `didChange` to the definition response sent alongside it.
+    edit_definition_ms: Vec<f64>,
+    /// Duration of the `textDocument/references` search, when requested.
+    references_ms: Option<f64>,
+    /// Number of locations the references search returned, when requested.
+    references_count: Option<usize>,
 }
 
 fn run_bench(server: &Path, fixture: &Fixture, args: &Args) -> Report {
@@ -686,6 +856,125 @@ fn run_bench(server: &Path, fixture: &Fixture, args: &Args) -> Report {
         "post-warm-up hover resolved nothing: {post}"
     );
 
+    // --- responsiveness scenario (opt-in; the defaults reproduce the
+    // one-document report unchanged) -------------------------------------
+    let mut edit_publish_ms: Vec<f64> = Vec::new();
+    let mut edit_hover_ms: Vec<f64> = Vec::new();
+    let mut edit_definition_ms: Vec<f64> = Vec::new();
+    let mut references_ms: Option<f64> = None;
+    let mut references_count: Option<usize> = None;
+
+    if args.open_docs > 1 || args.edits > 0 || args.references {
+        // Open the remaining documents one at a time, draining each one's
+        // publish, so exactly `open_docs` documents are open when the timed
+        // edits and the search start.
+        for i in 1..args.open_docs.min(fixture.uris.len()) {
+            let path =
+                fixture_base(fixture, args.maven).join(format!("{}.java", fixture.class_names[i]));
+            let text = fs::read_to_string(&path).expect("read fixture file");
+            server.notify(
+                "textDocument/didOpen",
+                json!({
+                    "textDocument": {
+                        "uri": fixture.uris[i],
+                        "languageId": "java",
+                        "version": 1,
+                        "text": text,
+                    }
+                }),
+            );
+            loop {
+                let msg = server.read_message();
+                if msg["method"] == "textDocument/publishDiagnostics"
+                    && msg["params"]["uri"] == json!(fixture.uris[i])
+                {
+                    break;
+                }
+            }
+        }
+
+        // (a)/(b) M edits: each `didChange`, immediately followed by a hover and
+        // a definition, timed until the document's diagnostics republish and
+        // until each query answers. The queries must answer while the sweep
+        // the edit triggered is still running.
+        let mut edit_text = open_text.clone();
+        for m in 0..args.edits {
+            edit_text.push_str(&format!("// edit {m}\n"));
+            let version = 2 + m as i32;
+            let sent = Instant::now();
+            server.notify(
+                "textDocument/didChange",
+                json!({
+                    "textDocument": { "uri": open_uri, "version": version },
+                    "contentChanges": [{ "text": edit_text }],
+                }),
+            );
+            let hover_id = id();
+            server.send(&json!({
+                "jsonrpc": "2.0",
+                "id": hover_id,
+                "method": "textDocument/hover",
+                "params": {
+                    "textDocument": { "uri": open_uri },
+                    "position": { "line": hover_pos.0, "character": hover_pos.1 },
+                }
+            }));
+            let def_id = id();
+            server.send(&json!({
+                "jsonrpc": "2.0",
+                "id": def_id,
+                "method": "textDocument/definition",
+                "params": {
+                    "textDocument": { "uri": open_uri },
+                    "position": { "line": hover_pos.0, "character": hover_pos.1 },
+                }
+            }));
+            let mut publish_at = None;
+            let mut hover_at = None;
+            let mut def_at = None;
+            while publish_at.is_none() || hover_at.is_none() || def_at.is_none() {
+                let msg = server.read_message();
+                if msg.get("method").is_none() {
+                    if msg.get("id") == Some(&json!(hover_id)) {
+                        assert_ok(&msg, "hover during an edit");
+                        hover_at = Some(Instant::now());
+                    } else if msg.get("id") == Some(&json!(def_id)) {
+                        assert_ok(&msg, "definition during an edit");
+                        def_at = Some(Instant::now());
+                    }
+                } else if msg["method"] == "textDocument/publishDiagnostics"
+                    && msg["params"]["uri"] == json!(open_uri)
+                {
+                    publish_at = Some(Instant::now());
+                }
+            }
+            edit_publish_ms.push(ms(sent, publish_at).expect("publish recorded"));
+            edit_hover_ms.push(ms(sent, hover_at).expect("hover recorded"));
+            edit_definition_ms.push(ms(sent, def_at).expect("definition recorded"));
+        }
+
+        // (c) a references search on the shared `ping` member, from the call
+        // site in document 0, including the declaration. Every fixture file
+        // mentions `ping`, so this is the whole-workspace worst case.
+        if args.references {
+            let (line, character) =
+                ping_position(&open_text).expect("fixture has a BenchShared.ping call");
+            let sent = Instant::now();
+            let response = server.request(
+                id(),
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": open_uri },
+                    "position": { "line": line, "character": character },
+                    "context": { "includeDeclaration": true },
+                }),
+            );
+            assert_ok(&response, "references on the shared member");
+            references_ms = ms(sent, Some(Instant::now()));
+            references_count = response["result"].as_array().map(Vec::len);
+        }
+    }
+
     let memory = read_memory(pid);
 
     // Graceful shutdown, same rules as tests/stdio_smoke.rs.
@@ -702,6 +991,9 @@ fn run_bench(server: &Path, fixture: &Fixture, args: &Args) -> Report {
         }),
         (a, b) => a.or(b),
     };
+    // Off Linux there is no kernel peak counter; macOS reports the reaped
+    // child's `ru_maxrss`, so the post-wait read is the one that carries it.
+    let peak_rss_kb = memory.as_ref().and_then(|m| m.peak_rss_kb);
 
     Report {
         files: args.files,
@@ -722,9 +1014,16 @@ fn run_bench(server: &Path, fixture: &Fixture, args: &Args) -> Report {
         post_warmup_rtt_ms,
         completion_probe_found: probe_found,
         completion_probe_ms: probe_ms,
-        peak_rss_kb: memory.as_ref().and_then(|m| m.peak_rss_kb),
+        peak_rss_kb,
         final_rss_kb: memory.as_ref().and_then(|m| m.rss_kb),
         total_ms: start.elapsed().as_secs_f64() * 1000.0,
+        open_docs: args.open_docs,
+        edits: args.edits,
+        edit_publish_ms,
+        edit_hover_ms,
+        edit_definition_ms,
+        references_ms,
+        references_count,
     }
 }
 
@@ -787,6 +1086,32 @@ fn completion_offers(response: &Value, class: &str) -> bool {
 
 fn ms(from: Instant, to: Option<Instant>) -> Option<f64> {
     to.map(|to| to.saturating_duration_since(from).as_secs_f64() * 1000.0)
+}
+
+/// The line/character of the `ping` method name in the `BenchShared.ping(...)`
+/// call the fixture writes into every class's first method.
+fn ping_position(text: &str) -> Option<(u32, u32)> {
+    for (line, content) in text.lines().enumerate() {
+        if let Some(column) = content.find("BenchShared.ping") {
+            let ping = column + "BenchShared.".len();
+            return Some((line as u32, (ping + 1) as u32));
+        }
+    }
+    None
+}
+
+fn max_of(values: &[f64]) -> Option<f64> {
+    values.iter().cloned().reduce(f64::max)
+}
+
+fn mean_of(values: &[f64]) -> Option<f64> {
+    (!values.is_empty()).then(|| values.iter().sum::<f64>() / values.len() as f64)
+}
+
+fn fmt_ms(value: Option<f64>) -> String {
+    value
+        .map(|v| format!("{v:.1} ms"))
+        .unwrap_or_else(|| "n/a".into())
 }
 
 // ---------------------------------------------------------------------------
@@ -856,6 +1181,34 @@ fn print_report(report: &Report, server: &Path) {
         report.completion_probe_ms
     );
     println!();
+    if report.open_docs > 1 || report.edits > 0 || report.references_count.is_some() {
+        println!("responsiveness:");
+        println!("  open documents:            {}", report.open_docs);
+        if !report.edit_publish_ms.is_empty() {
+            println!(
+                "  edit -> publish:           max {}, mean {} ({} edits)",
+                fmt_ms(max_of(&report.edit_publish_ms)),
+                fmt_ms(mean_of(&report.edit_publish_ms)),
+                report.edit_publish_ms.len()
+            );
+            println!(
+                "  edit -> hover:             max {}",
+                fmt_ms(max_of(&report.edit_hover_ms))
+            );
+            println!(
+                "  edit -> definition:        max {}",
+                fmt_ms(max_of(&report.edit_definition_ms))
+            );
+        }
+        if let Some(count) = report.references_count {
+            println!(
+                "  references `ping`:         {} ({} locations)",
+                fmt_ms(report.references_ms),
+                count
+            );
+        }
+        println!();
+    }
     println!("memory:");
     println!(
         "  peak RSS (VmHWM):  {}",
@@ -901,6 +1254,16 @@ fn report_json(report: &Report) -> Value {
         "completion_probe": {
             "found": report.completion_probe_found,
             "ms": report.completion_probe_ms,
+        },
+        "responsiveness": {
+            "open_docs": report.open_docs,
+            "edits": report.edits,
+            "edit_publish_max_ms": max_of(&report.edit_publish_ms),
+            "edit_publish_mean_ms": mean_of(&report.edit_publish_ms),
+            "edit_hover_max_ms": max_of(&report.edit_hover_ms),
+            "edit_definition_max_ms": max_of(&report.edit_definition_ms),
+            "references_ms": report.references_ms,
+            "references_count": report.references_count,
         },
         "memory": {
             "peak_rss_kb": report.peak_rss_kb,
@@ -979,6 +1342,10 @@ mod tests {
         for m in 0..3 {
             assert!(source.contains(&format!("public int method{m:02}(int a) {{")));
         }
+        // The first method calls the shared member, so every fixture file
+        // mentions `ping`.
+        assert!(source.contains("        BenchShared.ping(a);\n"));
+        assert_eq!(source.matches("BenchShared.ping(a);").count(), 1);
         // Methods are multi-line: a body with a for loop and a return.
         assert_eq!(
             source
@@ -1014,7 +1381,24 @@ mod tests {
         for class in &fixture.class_names {
             assert!(fixture.root.join(format!("{class}.java")).is_file());
         }
+        // The shared helper is generated alongside them, so `ping` resolves.
+        let shared = fixture.root.join("BenchShared.java");
+        assert!(shared.is_file());
+        assert!(fs::read_to_string(&shared)
+            .expect("read shared source")
+            .contains("int ping(int x)"));
         fs::remove_dir_all(&fixture.root).expect("clean up fixture");
+    }
+
+    #[test]
+    fn ping_position_finds_the_call_site() {
+        let source = fixture_source("BenchClass00000", 2, 2);
+        let (line, character) = ping_position(&source).expect("call site");
+        let content = source.lines().nth(line as usize).expect("line");
+        assert!(content.contains("BenchShared.ping(a);"));
+        // The cursor sits inside the four characters `ping`.
+        assert!(content[..character as usize].ends_with("p"));
+        assert!(content[..(character + 3) as usize].ends_with("ping"));
     }
 
     #[test]
@@ -1023,6 +1407,9 @@ mod tests {
         assert_eq!(args.files, 200);
         assert_eq!(args.methods_per_class, 5);
         assert_eq!(args.fields_per_class, 3);
+        assert_eq!(args.open_docs, 1);
+        assert_eq!(args.edits, 0);
+        assert!(!args.references);
         assert!(args.server.is_none());
         assert!(!args.json);
         assert!(!args.keep);
@@ -1035,6 +1422,10 @@ mod tests {
             "2".to_string(),
             "--json".to_string(),
             "--keep".to_string(),
+            "--open-docs=20".to_string(),
+            "--edits".to_string(),
+            "5".to_string(),
+            "--references".to_string(),
             "--server".to_string(),
             "/tmp/java-lsp".to_string(),
         ])
@@ -1042,6 +1433,9 @@ mod tests {
         assert_eq!(args.files, 7);
         assert_eq!(args.methods_per_class, 9);
         assert_eq!(args.fields_per_class, 2);
+        assert_eq!(args.open_docs, 20);
+        assert_eq!(args.edits, 5);
+        assert!(args.references);
         assert!(args.json);
         assert!(args.keep);
         assert_eq!(args.server, Some(PathBuf::from("/tmp/java-lsp")));
@@ -1049,6 +1443,7 @@ mod tests {
         assert!(parse_args(&["--nope".to_string()]).is_err());
         assert!(parse_args(&["--files".to_string(), "0".to_string()]).is_err());
         assert!(parse_args(&["--files".to_string()]).is_err());
+        assert!(parse_args(&["--open-docs".to_string(), "0".to_string()]).is_err());
     }
 
     #[test]

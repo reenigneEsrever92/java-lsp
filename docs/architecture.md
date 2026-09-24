@@ -1,7 +1,7 @@
 ---
 type: Architecture
 title: Architecture
-description: Crate layout, the LSP shell to engine message boundary, and the data flow inside java-lsp.
+description: Crate layout, the LSP shell to engine message boundary, and the data flow inside java-lsp, including the engine-owned driver bus that indexes the workspace.
 tags: [architecture, lsp, rust]
 status: draft
 ---
@@ -23,18 +23,35 @@ src/
   lib.rs      — library root so integration tests can drive the shell
   server.rs   — JavaLanguageServer: the LSP shell (all editor-facing handlers)
   document.rs — DocumentStore: URI -> { version, bytes }, incremental text sync
-  index.rs    — WorkspaceIndex: workspace-wide symbol entries, background scan
+  index.rs    — the index subsystem: WorkspaceIndex (workspace symbol entries
+                and the append-only declared-type base), the producers that warm
+                it (project walk, source scan, jar/JDK index), and IndexHandle,
+                the message-based handle whose thread owns the index
+  base_cache.rs — the cross-run cache of the class-file base (jars, JDK): one
+                guarded file per archive, read on demand
+  bus.rs      — the engine bus: BusClient (notify + hub-routed request/response),
+                the modules' channels, and the hub thread that broadcasts
+                notifications and routes requests
   types.rs    — declared-type model (R7): types, members, hierarchies, binding
   project.rs  — Maven project model: pom discovery, modules, source roots
   resolve.rs  — static Maven dependency resolution (effective poms, closure)
   classfile.rs— minimal jar (ZIP) + class-file reader for dependency indexing
   jdk.rs      — standard-library indexing: JDK discovery, jmods/src.zip/rt.jar
-  sources.rs  — dependency sources: fetch -sources.jar, extract, index them
-  engine.rs   — the shell <-> engine boundary: Command / EngineEvent /
-                EngineHandle and the dispatcher task that owns the core
-  analysis.rs — the engine core (TreeSitterEngine): parse trees, diagnostics,
-                symbols, folding, semantic tokens, completions, navigation,
-                inlay hints
+  sources.rs  — dependency sources: fetches -sources.jar, extracts, and
+                publishes them through the bus
+  messages.rs — the engine's message vocabulary: Command, EngineEvent, and the
+                subsystem DriverMessage
+  engine.rs   — the shell <-> engine boundary and the driver bus: EngineHandle,
+                the dispatcher, the hub task that routes and relays, and the drivers
+  diagnostics.rs — the diagnostics subsystem: its own parser and open-document
+                state, computing syntax and unresolved-symbol diagnostics and
+                reporting them to the hub, plus a queryable cache of the latest
+                pass per open document
+  quickfix.rs — the quick-fix subsystem: its own parser and open-document text,
+                generating the create/import/rename fixes from the symbol index
+                and the diagnostics cache
+  analysis.rs — the engine core (TreeSitterEngine): parse trees, symbols,
+                folding, semantic tokens, completions, navigation, inlay hints
 tests/
   harness.rs      — drives JavaLanguageServer through tower_lsp::LspService
   stdio_smoke.rs  — drives the real binary over stdio with raw LSP JSON-RPC
@@ -52,27 +69,46 @@ graph LR
     EH --> DISP{{engine.rs dispatcher}}
     DISP -- mutations, inline --> TS[analysis.rs: TreeSitterEngine]
     DISP -- queries, spawned --> TS
-    TS -- EngineEvent: diagnostics --> S
-    TS -- declarations --> WI[(WorkspaceIndex)]
-    TS -- declared types --> TL[(TypeModel)]
-    WI -- background warm-up --> P[ProjectModel]
-    P -- source roots --> WS[workspace .java files]
-    P -- dependency closure --> JV[local repo jars]
-    JV -- class files --> WI
-    P -- dependency closure --> SR[sources.rs: fetch + extract + parse]
-    SR -- source-backed entries --> WI
-    SR -- real signatures --> TL
+    DISP -- document events --> DSUB{{diagnostics subsystem}}
+    DSUB -- Diagnostics --> HUB
+    DSUB -- index queries --> IDX
+    DISP -- code actions --> QF{{quick-fix subsystem}}
+    QF -- index queries --> IDX
+    QF -- diagnostics cache --> DSUB
+    TS -- index queries and updates --> IDX{{index subsystem}}
+    TS -- declared types --> TL[(type base + source models)]
+    DISP -- root, watched files --> FS{{engine.rs fs driver}}
+    FS -- FolderAdded / FileEvent --> HUB{{engine.rs hub}}
+    HUB -- relays every DriverMessage --> DR{{project, dependency, source, jar, JDK, download drivers}}
+    DR -- DriverMessage --> HUB
+    HUB -- index messages --> IDX
+    IDX -- owns --> WI[(WorkspaceIndex)]
+    IDX -- base + source types --> TL
+    HUB -- EngineEvent: progress, diagnostics, notices --> S
+    HUB -- tracing logs (sender, latency) --> E[(stderr)]
+    DR -- source scan --> WS[workspace .java files]
+    DR -- class files --> JV[local repo jars]
+    DR -- archives --> ARCH[JDK jmods / src.zip]
+    DR -- download + extract --> SR[sources cache]
     S -- versioned text --> D[(DocumentStore)]
 ```
 
 - **LSP shell** (`server.rs`): implements `tower_lsp::LanguageServer`.
   `initialize` advertises incremental text sync, hover, definition,
-  completions, signature help, document symbols, workspace symbols, folding
+  declaration, implementation, completions, signature help, document symbols, workspace
+  symbols, folding
   ranges, semantic tokens, references, rename, code actions (kind `quickfix`),
   and inlay hints.
   `didOpen`/`didChange`/`didClose` update the document store and send the
   matching command; the engine's diagnostics come back as events, which the
-  shell's drain task publishes. Query handlers await the engine handle. That
+  shell's drain task publishes. `initialized` also registers
+  `workspace/didChangeWatchedFiles` for `**/*.java` when the client advertises
+  `workspace.didChangeWatchedFiles.dynamicRegistration` — a fire-and-forget
+  `client/registerCapability`, so the handshake never waits on the client — and
+  the `didChangeWatchedFiles` handler forwards each created/changed/deleted
+  event to the engine; without the capability the watcher is simply skipped and
+  everything else stands (D6).
+  Query handlers await the engine handle. That
   same drain task renders the engine's progress events as
   `window/workDoneProgress/create` plus `$/progress` — one status-bar item
   titled `java-lsp`, whose message names the current phase and whose percentage
@@ -88,29 +124,65 @@ graph LR
   only place position semantics are handled on the way in.
 - **Engine boundary** (`engine.rs`): the shell never touches the core directly.
   It holds an `EngineHandle` (cheap, cloneable) and sends a `Command` per LSP
-  handler — `SetWorkspaceRoot`, `Open`/`Change`/`Close`, and one variant per
-  query, each carrying a `oneshot` reply — to a single dispatcher task that owns
+  handler — `SetWorkspaceRoot`, `Open`/`Change`/`Close`, `WatchedFiles`, and one
+  variant per query (the queries carrying a `oneshot` reply) — to a single
+  dispatcher task that owns
   the core. The dispatcher applies mutations and orchestration **inline, in
   arrival order** (the one place ordering matters: an edit must land before the
   query the client sends at the new cursor) and hands read-only queries to
   **spawned tasks**, so a slow `references` never delays typing — the
-  concurrency the old read-locked handle gave, made explicit. `EngineEvent` is
+  concurrency the old read-locked handle gave, made explicit. It does **not**
+  compute diagnostics: a mutation only forwards the document to the
+  **diagnostics subsystem**, so an edit and the queries that follow it are never
+  queued behind a diagnostics sweep. `EngineEvent` is
   the reverse channel the previous `&self` trait could not express:
   `Diagnostics { uri, version, diagnostics }`, emitted after an applied
-  open/change (and an empty one after a close), and — from the background
-  warm-up — `Progress(ProgressUpdate)` (begin/update/end with a phase message, a
-  count, and an optional download percentage) and `Message { level, text }`. The
-  shell owns a drain task that
+  open/change, after a close (an empty event clears the closed document, and
+  the other open documents are republished), and after a watched-file event
+  that changed the index or model — each pass covering **every** open document,
+  the just-edited one first, so a referring file's squiggles clear without an
+  edit of its own (D3). The sweep runs in the diagnostics subsystem, off the
+  dispatcher and on the blocking pool: a burst of edits collapses to one sweep of
+  the latest state.
+  From the background
+  warm-up come
+  `Progress(ProgressUpdate)` (begin/update/end with a phase message, a
+  count, and an optional download percentage) and `Message { level, text }`; the
+  engine hub emits both — and the warm-up's `tracing` lines — from the
+  drivers' `DriverMessage`s. The shell owns a drain task that
   turns each into a client notification (the events channel is unbounded, so a
-  slow client can never stall the engine). The warm-up reports through a small
-  cloneable `Reporter` — a typed wrapper over the same event sender — which is
-  detached (a no-op) for inline scans and unit tests. A dropped reply — the
+  slow client can never stall the engine). A dropped reply — the
   engine task
   gone — yields the empty result rather than an error. The core itself:
+- **Diagnostics subsystem** (`diagnostics.rs`): owns a `tree-sitter-java` parser
+  and the open documents' text, parses each open buffer itself, and computes the
+  pass — syntax errors, or the unresolved-symbol checks — reading the workspace
+  symbol index and declared-type layer from the **index subsystem** through
+  `IndexHandle`. A sweep reads the index through one `SweepIndex`: the
+  declared-type overlay, the workspace layer, and the readiness gate are fetched
+  once per sweep (not per document), and the names every open document's pass
+  will look up — type names, unbound symbolic identifiers, import simple names
+  and static-import owners — are prefetched in one `IndexQueryNames` request,
+  with wildcard-import packages checked in one `IndexHasPackages`. Lookups are
+  served from that per-sweep cache; a name the prefetch missed costs one cached
+  `IndexQueryName`. A new sweep starts from empty caches, so index changes are
+  seen on the next sweep. It reports one `DriverMessage::Diagnostics` per open document;
+  the hub translates that to `EngineEvent::Diagnostics`. A document event
+  forwards the text and version; a close drops the document (the hub sends the
+  inline clear); a watched-file event asks for a re-sweep. The latest pass per
+  open document is kept in a **cache** that the quick-fix subsystem queries
+  (`DiagnosticsHandle::diagnostics`), so a fix never recomputes it.
+- **Quick-fix subsystem** (`quickfix.rs`): owns a `tree-sitter-java` parser and
+  the open documents' text, parses the buffer itself, and turns the
+  unresolved-symbol diagnostics into `CodeAction`s — add an import, change to a
+  near member, or create a stub type/member. It reads the **symbol index**
+  through `IndexHandle` and the **diagnostics cache** through `DiagnosticsHandle`
+  (falling back to it when a request carries no diagnostics), so it holds no
+  index or diagnostics state. The engine dispatches `codeActions` to it on the
+  blocking pool.
 - **Engine core** (`analysis.rs`, `TreeSitterEngine`): parses each open document with
-  `tree-sitter-java` and keeps one tree (plus the text) per URI. Parse errors
-  (`ERROR`/missing nodes) become error diagnostics, so squiggles appear on
-  broken code and clear on fix. Declaration nodes become hierarchical
+  `tree-sitter-java` and keeps one tree (plus the text) per URI, for the query
+  features. Declaration nodes become hierarchical
   document symbols (class/interface/enum/record/constructor/method/field);
   declarations and brace blocks spanning multiple lines become folding
   ranges; a curated node-kind mapping produces delta-encoded semantic tokens
@@ -139,19 +211,29 @@ graph LR
   is inferred and each of its members is offered — every overload of a method
   keeping its own item, labelled with the full signature and inserting `name(`,
   fields keeping their name and their type in `detail` (inherited members
-  included for workspace types) — while an uninferrable receiver still returns
-  an empty list, claiming nothing a type-free engine
-  cannot verify. The receiver of a `.` is normally the tree's member access, but
-  an incomplete `receiver.` at the end of a line can parse the dot into the next
-  token (a following `var` line reads `gson.var` as a scoped type identifier);
-  then the receiver is recovered from the source as the expression ending at the
-  last non-whitespace byte before the dot, so the same members are offered.
+  included for workspace types), an enum's constants offered as enum members,
+  and — when the receiver names a type — its nested types offered alongside its
+  static members, and a receiver that names a package its top-level types
+  (`java.util.Li` → `List`) — while an uninferrable receiver still returns an
+  empty list, claiming nothing a type-free engine
+  cannot verify. The receiver's members come from the model layered with
+  **all** open buffers (see the `types.rs` bullet), so a member added to
+  another open file — or to a file a watcher event re-read — is offered without
+  reopening this one. The receiver of a `.` is the expression ending at the dot
+  before the name being typed — normally the tree's member access, but a partial
+  name the parser reads as a type (`Greeter.Inn` in a declaration, `new
+SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
+  at the end of a line can parse the dot into the next token (a following `var`
+  line reads `gson.var` as a scoped type identifier) — so it is recovered from
+  the source as the expression ending at the last non-whitespace byte before that
+  dot, and the same members are offered whether or not the name is already typed.
   **Signature help** serves `textDocument/signatureHelp` from the same type
   layer: for the call the cursor sits in it offers the callee's overloads,
   rendered with their declared parameters, and marks the argument the cursor is
   in as `activeParameter`, returning nothing when the callee or the receiver's
-  type cannot be resolved. Constructors are not modelled, so `new T(...)`
-  answers nothing.
+  type cannot be resolved. A `new T(...)` is answered from the created type's
+  constructors, its overloads listed and the active argument marked the same
+  way.
   Auto-import: every index-sourced item whose symbol lives outside the open
   file's package carries an `additionalTextEdits` inserting
   `import <fqcn>;` (after the last import, else after the `package`
@@ -174,7 +256,12 @@ graph LR
   the call's argument types select the overload (types first, then arity),
   landing `x.add(1)` on `add(int)` rather than the first same-named
   declaration, and falling back to the name-only answer when the receiver or an
-  argument cannot be pinned down. Workspace declarations and source-backed library declarations (see
+  argument cannot be pinned down. A `new T(...)` resolves the same way to its
+  selected constructor's declaration, falling back to the type itself when the
+  constructor is implicit or lives in a jar.
+  `textDocument/declaration` is answered by the same resolution: Java has no
+  declaration/definition split, so both requests land on the same place.
+  Workspace declarations and source-backed library declarations (see
   the dependency-sources bullet) both qualify; a class-file jar declaration does
   not, since its location is not openable. A single candidate — or several sharing one file (method overloads,
   same-file repeats), resolved to the first by position — is an answer;
@@ -184,7 +271,18 @@ graph LR
   the innermost container as `container_name`, the selection range as the
   location — with an empty query returning everything indexed for the client
   to filter. Like completions, both serve partial results during warm-up and
-  never block (R6). **Hover** resolves the symbol under the cursor through the
+  never block (R6). **Go to implementation** answers
+  `textDocument/implementation` from the same binding and the declared-type
+  hierarchy: a cursor on a type lists every workspace source type whose
+  supertype closure reaches it — sub-interfaces and abstract intermediates
+  included, the contract itself excluded — and a cursor on a method lists every
+  workspace subtype that declares an override of the same name and parameter
+  types (a subtype that only inherits the member is not listed). The contract
+  may be a library or JDK type — a cursor on `Runnable` lists the workspace
+  classes that implement it — since every result is a workspace declaration;
+  dependency and JDK declarations are never returned, and a field, constructor,
+  or local cursor, or a contract with no workspace implementation, yields
+  nothing. **Hover** resolves the symbol under the cursor through the
   type layer and renders its declaration as Markdown — a member's signature, a
   type's declaration, or a local's declared type — returning nothing when the
   symbol is unresolved or ambiguous. Documented v1 limitations: a bare name is
@@ -192,13 +290,15 @@ graph LR
   resolved through its receiver and arguments, above), so an unqualified `foo`
   may hit a same- or cross-file declaration by name or return nothing; overload
   selection covers only the assignability relation's conversions and refuses
-  when they are inconclusive; and scanned-file ranges reflect the last disk
-  scan, not a live watcher.
+  when they are inconclusive; and a watched file's indexed ranges reflect its
+  last re-read, not a live document.
   **References and rename** resolve the symbol under the cursor the way hover
   does — a member's declaring type coming from the receiver's type, identified
-  by simple name *and* package so a same-named type elsewhere is never touched —
+  by simple name _and_ package so a same-named type elsewhere is never touched —
   and then search the workspace's `.java` files (each pre-filtered by a
-  substring check before being parsed, on demand, on the request path) for
+  substring check before being parsed, on demand, on the request path, with a
+  private parser taken from a small pool rather than the shared parse mutex, so
+  a search never blocks typing or another search) for
   occurrences that can be attributed with confidence: a type only in files that
   can see it (its own file, its package, an import, or a fully-qualified use), a
   member access only where the receiver's type resolves the name back to the
@@ -224,26 +324,61 @@ graph LR
   their generic arguments kept as written, and type variables — and keeps each
   type's package, kind, supertypes (`extends`/`implements`), fields, and
   methods with their declared types (source-declared methods also keep their
-  parameter names, which class-file descriptors cannot supply). A source
+  parameter names, which class-file descriptors cannot supply), and its
+  constructors. A constructor is a member of its declaring type but is kept
+  apart from `methods`, so it never appears in a `.`-completion listing; a
+  record's canonical constructor and a class's implicit no-arg one are
+  synthesized from the source. A source declaration's Lombok annotations are read
+  syntactically (by simple annotation name — no annotation processor, and
+  `lombok.config` is ignored): `@Getter`/`@Setter`/`@With`, `@Data`/`@Value`,
+  `@Accessors`, `@Builder` (a nested `TBuilder`), the log-field family, and the
+  constructor annotations append the members Lombok would generate, so
+  `.`-completion, hover, signature help, inlay hints, and the unresolved-member
+  diagnostic see them; `equals`/`hashCode`/`toString` are deliberately not
+  synthesized. A source
   record's components are modelled as accessor methods — the component's type
   with no parameters — so an outside receiver sees `x()` and never the private
   backing field, while inside the record the bare component name resolves as
-  that field would. The model is built in two layers during warm-up: source
-  files contribute full `TypeInfo`s (member types and supertypes) from the
-  trees the scan already parses, and the resolved jars and
-  JDK contribute `TypeInfo`s with real signatures and supertypes, parsed from
-  their class files (or, for a source-only JDK, from `lib/src.zip` through the
-  same tree-sitter extractor). Member
+  that field would. A source enum's constants are modelled as static members
+  typed as the enum (kind `EnumConstant`, so they complete as `enumMember` and a
+  chained `TYPE_1.rank()` resolves), and the enum's `;`-introduced declaration
+  section is walked, so its own fields, methods, and constructors are members
+  too. The model has two parts. A **non-source base** holds the
+  resolved jars, the JDK, and extracted dependency sources as `TypeInfo`s with
+  real signatures and supertypes, parsed from their class files (or, for a
+  source-only JDK, from `lib/src.zip` through the same tree-sitter extractor);
+  it grows append-only, one layer per artifact URI, as each producer's jars, JDK
+  archives, and extracted sources land, and is read through a cached,
+  name-indexed view. Each workspace source file keeps its own
+  model, built from the tree the scan already parses, so one file can be
+  forgotten by dropping its own model rather than rebuilding the base. Member
   lookup walks supertypes breadth-first, cycle-guarded, first declaration
-  winning, so inherited members are found.
+  winning, so inherited members are found. The type layer is not frozen at
+  warm-up: the engine reads the base **through a cached layered view**
+  (`ModelLayers`) over the current per-source models, with a **dirty** overlay —
+  every open buffer, plus any file a watcher event or a close re-read from
+  disk — replacing its file's warm-up model per URI. The base view is a
+  name-indexed `SourceLayerIndex` cached by `WorkspaceIndex` behind a
+  source-model generation, so it is rebuilt only when the sources change, not
+  per request; a lookup consults only the layers that declare the name rather
+  than scanning all of them. The view holds the per-file models behind their
+  `Arc`s and answers in precedence order, so a request never re-merges (copies)
+  the workspace model; the per-file split
+  is what keeps a deleted file forgettable by a single map removal
+  (`large-project-memory`). So completion, hover, signature help, inlay hints, and
+  semantic diagnostics answer from unsaved edits to any open file (the same
+  edits `definition` reaches through the index), and a file deleted on disk is
+  forgotten from the index and the model at once (D4, D5).
   **Binding** turns a cursor position into an answer: it collects the names
   visible there (locals and parameters with their declared types — an
   enhanced-for binding written `var` taking its iterable's element type and a
   try-with-resources `resource` binding collected like a local — the enclosing
   type's fields, type parameters, imports including `.*`, and the file's
   package) and then resolves a simple name in Java's precedence order, or
-  infers the type of a `.`-receiver (`identifier`, `this`/`super`, `new T(...)`,
-  chained field/method access, and — as a `var` initializer — a conditional
+  infers the type of a `.`-receiver (`identifier`, `this`/`super`, a dotted
+  nested or package-qualified type name such as `Outer.Inner` or `java.util.List`,
+  `new T(...)`, chained field/method access, and — as a `var` initializer — a
+  conditional
   (a lone `null` yielding the other branch), array creation, `instanceof`, or
   `switch` expression). Everything the layer cannot pin to a single
   answer is `Unknown`, and callers treat that as "no answer".
@@ -253,7 +388,7 @@ graph LR
   identifier that resolves nowhere; and an `import` whose target the index
   cannot supply (a single type, a best-effort `.*` wildcard, or a `static`
   import). A name known in the index but not visible here (no import, another
-  package) is reported on its *usage*, with a quick fix to add the import; a
+  package) is reported on its _usage_, with a quick fix to add the import; a
   name nowhere in the index offers a create-stub fix; an unresolved member
   offers a did-you-mean rename. All of it is gated on the model actually
   vouching for `java.lang` (an indexed JDK) and on the file parsing cleanly, so
@@ -270,8 +405,11 @@ graph LR
   across packages (e.g. `java.util.List` vs `java.awt.List`) is resolved only
   when the file pins it down; a nested type is keyed by its innermost simple
   name with its enclosing chain recorded (so two `Inner`s in one package
-  coexist rather than overwrite each other), and a class file's `Outer$Inner`
-  descriptor reaches it as `Inner`; a qualified reference, and a supertype, are
+  coexist rather than overwrite each other); a dotted reference with no `$`
+  (`Outer.Inner`) is resolved nested-first — the prefix as an in-scope type,
+  then the last segment among that type's nested types — before falling back to
+  reading the prefix as a package (`java.util.List`), and a class file's
+  `Outer$Inner` descriptor reaches the type as `Inner`; a supertype is
   looked up in the package the name carries, so a class-file base whose simple
   name is shared across packages still resolves; a call's type arguments are
   inferred from its arguments (a method's own type parameters and the
@@ -309,7 +447,7 @@ graph LR
   arguments (names from bare identifiers), the return type from the
   assignment/declaration/`return` context, the local's or field's type from its
   initializer — falling back to `Object`/`void`. An unresolved member on a
-  *workspace* receiver type offers "Create method/field in `T`", which inserts
+  _workspace_ receiver type offers "Create method/field in `T`", which inserts
   the stub into `T`'s file (the open buffer, else disk) as an unversioned
   `changes` edit; a jar/JDK receiver offers nothing, since its source is not the
   user's to edit.
@@ -341,45 +479,79 @@ graph LR
   computed while the model is still warming simply appears on the client's next
   request (R6).
 - **WorkspaceIndex** (`index.rs`): a workspace-wide, in-memory index of Java
-  declarations and imports, owned by the engine core (`TreeSitterEngine`). Entries are flat
+  declarations and imports, owned by the index subsystem thread and reached only
+  through its `IndexHandle`. Entries are flat
   `SymbolEntry`s (name, kind, package, enclosing-type container chain,
   ranges, `dependency` flag) — no trees, no text — so memory stays
-  proportional to workspace size. A source record's header components are
+  proportional to workspace size. Each entry is allocated once and shared
+  (`Arc`) between the per-file and per-name maps, and a file's URI, package, and
+  container chain are shared across its entries, so the name lookups hand back
+  shared handles rather than clones (`large-project-memory`). A source record's header components are
   indexed too, as method entries at their declared positions with the record as
   their container, so definition, references, rename, and `workspace/symbol`
-  can target the accessor. The package (from the file's
+  can target the accessor, and an enum's constants are indexed as
+  `EnumConstant` entries — a member-like kind, not a type — with the enum as
+  their container, so a constant resolves like any member. Lombok-generated members are indexed as
+  `synthetic` entries anchored at the field they derive from (or the type's own
+  name): they resolve `definition` and `references` for a generated member, are
+  filtered out of `workspace/symbol` and ordinary completion, and `rename`
+  refuses them. The package (from the file's
   `package_declaration`, or the class's internal name for jars) is what
   lets completions auto-import accepted symbols. The shell captures `rootUri` (or the first workspace
-  folder) in `initialize` and hands it to the engine in `initialized`; the
-  engine spawns the warm-up onto tokio's blocking pool: build the project
-  model, scan the source roots (or the whole root for non-Maven workspaces)
-  for `*.java`, resolve each module's dependency closure, and index the
-  resolved jars — the request path is never involved (R6). The same pass also
-  builds the declared-type model (`types.rs`), which the engine holds alongside
-  the index. Edits to open
+  folder) in `initialize` and hands it to the engine in `initialized`; the engine
+  tells its **filesystem driver**, which re-announces it as an added folder on the
+  bus. Every subsystem is a **driver** spawned at start — the filesystem (the root
+  and the client's watched-file events), the project walker, the dependency
+  resolver, the source scanner, the jar indexer, the JDK indexer, and the source
+  downloader — and each speaks only the engine's `DriverMessage`s. The index is
+  itself a subsystem (`index.rs`): the engine's hub task hands it the
+  index-affecting messages, relays every message to every driver, and is the sole
+  emitter of the warm-up's client events and log lines — the request path is never
+  involved (R6).
+  The base grows append-only, one layer per artifact, so library types resolve
+  while the source scan is still running; the project driver (the warm-up
+  coordinator) flips `ready` once the source, jar, and JDK stages report done.
+  The jar and JDK class-file parses are cached across runs (`base_cache.rs`),
+  one file per archive keyed by a schema version and the archive's path, size,
+  and mtime, read only when that archive is indexed and written only when it is
+  reparsed, so a restart re-parses only what changed; a missing, corrupt, or
+  version-mismatched
+  cache falls back to a full parse (best-effort, never a source of a wrong or
+  partial base).
+  Edits to open
   documents re-extract that file's entries from its already parsed tree; on
   `didClose`, a file inside any source root is re-read from disk (disk truth
-  wins), anything else drops its entries. `index_ready()` flips when warm-up
+  wins), anything else drops its entries. A watched-file event does the same
+  for a file the editor never opened: a created or changed `.java` file inside
+  a source root is re-read and re-indexed from disk, a deleted one loses its
+  entries, and a file the editor currently has open is skipped because its
+  `didChange` is authoritative (D2). Every such change also refreshes the
+  declared-type model and republishes the open documents' diagnostics (see the
+  engine-boundary and type-layer bullets). `index_ready()` flips when warm-up
   completes so index-backed features can report themselves briefly
   unavailable during warm-up instead of blocking; completions consume the
   index via `query_prefix` (see the engine-core bullet above), and
   go-to-definition and `workspace/symbol` are backed by the same two lookups
   — `query_name` for exact-name definition targets, `query_prefix` for
   workspace symbols — with dependency-jar entries filtered out of both (see
-  the project-model bullet). Known v1 limitations: there is no file watcher,
-  so out-of-editor disk changes are picked up on close re-reads only, and a
-  scanned file's indexed ranges reflect the last disk scan. Extracted dependency
+  the project-model bullet). Known v1 limitation: a watched file's indexed
+  ranges reflect its last re-read rather than a live document (the index
+  changes only when the client reports an event). A file deleted on disk is
+  forgotten from both the index and the model: the watcher drops its entries
+  and its per-source type model, so no model-based feature resolves it any more
+  (see the type-layer bullet). Extracted dependency
   sources (see the dependency-sources bullet) are indexed as ordinary `.java`
   files under the cache, but their entries carry `library_source`;
   `source_files()` — the candidate set for references and rename — excludes
   them, so a search never reads the cache and a rename never edits it.
 - **Maven project model** (`project.rs` + `resolve.rs` + `classfile.rs`):
-  the warm-up builds a model of the workspace before scanning it. POM
-  discovery walks the root (hidden dirs, `target/`, `build/` skipped) and
-  every `pom.xml` becomes a module whose source roots are the standard
+  the project driver builds a model of the workspace — it reacts to the added
+  folder, walks the root (hidden dirs, `target/`, `build/` skipped), and every
+  `pom.xml` becomes a module whose source roots are the standard
   `src/main/java`/`src/test/java` unless `<build>` overrides them; roots that
   don't exist are dropped, and a workspace with no poms falls back to
-  scanning the whole root (non-Maven projects keep working).
+  scanning the whole root (non-Maven projects keep working). The model and the
+  source inventory ride the bus; the dependency driver resolves the jar list.
   **Dependency resolution** (`resolve.rs`) is static and strictly offline —
   it reads the local repository (`$MAVEN_REPO` if set, else
   `~/.m2/repository`) and never invokes `mvn` or the network. Each pom is
@@ -396,13 +568,15 @@ graph LR
   pom prunes its branch with a warning while the rest of the closure
   continues. Resolved jars are parsed by a minimal ZIP reader (central
   directory, STORED/DEFLATE via `flate2`) and class-file parser (constant
-  pool, access flags, member tables with each member's descriptor type, plus
+  pool, access flags, member tables with each member's descriptor type, a
+  public `<init>` as a constructor named after its type — `<clinit>`, private,
+  and synthetic members are skipped — plus
   the superclass and interfaces), producing
   index entries flagged `dependency: true`: offered in completions with the
   usual `Container.name` labels, but excluded from definition and
   `workspace/symbol`, since a class-file jar location cannot be opened by an
   editor (no result beats a wrong result); a dependency whose sources were
-  indexed instead carries source-backed entries that definition *does* admit
+  indexed instead carries source-backed entries that definition _does_ admit
   (see the dependency-sources bullet). Known v1 limitations: no profile activation,
   no plugin-contributed roots or dependencies, no transitive version-range
   handling, `-SNAPSHOT` metadata is ignored (the local file is used as-is),
@@ -410,9 +584,10 @@ graph LR
   be offered in main sources). The bench's `--maven` mode measures open-to-
   responsive on a Maven-layout fixture.
 - **Standard library** (`jdk.rs`): the installed JDK's `java.*`/`javax.*`
-  declarations are indexed during warm-up, right after dependency jars, and
-  flow through the same dependency path — offered in completions with
-  auto-import edits, filtered out of definition and `workspace/symbol`.
+  declarations are indexed at start by the JDK driver — concurrently with the
+  rest, through the same dependency path — offered in
+  completions with auto-import edits, filtered out of definition and
+  `workspace/symbol`.
   Discovery order: `$JAVA_LSP_JDK` (an explicit override pointing at an
   unusable home disables JDK indexing entirely — deterministic opt-out),
   `$JAVA_HOME`, then common locations including SDKMAN's
@@ -429,10 +604,11 @@ graph LR
   warm-up ≈ 5.5 s and peak RSS ≈ 165 MB in release — both on the background
   task; hover RTT during warm-up stayed ≤ 1.6 ms (R6 holds; see the bench
   baseline in the changelog).
-- **Dependency sources** (`sources.rs`): after the workspace and class-file jars
-  are indexed and `ready` has flipped, each resolved artifact that has a jar has
-  its sources fetched — reusing an existing `<a>-<v>-sources.jar` in the local
-  repository, otherwise downloading it from `$JAVA_LSP_MAVEN_CENTRAL_URL`
+- **Dependency sources** (`sources.rs`): the download driver starts on the
+  artifact list, alongside the workspace source scan — not after `ready` — and
+  fetches each resolved artifact's
+  sources, reusing an existing `<a>-<v>-sources.jar` in the local repository and
+  otherwise downloading it from `$JAVA_LSP_MAVEN_CENTRAL_URL`
   (default `https://repo1.maven.org/maven2`) into the repository at Maven's
   standard path, with the published `.sha1` verified when present. Downloads run
   on the runtime with bounded concurrency (a semaphore caps at 8); extraction
@@ -440,11 +616,11 @@ graph LR
   (R6). Each sources jar is unpacked under `$JAVA_LSP_SOURCES_CACHE` (default
   `$XDG_CACHE_HOME/java-lsp/sources`, else `~/.cache/java-lsp/sources`), its
   `.java` entries parsed by the same tree-sitter extractor the JDK's `src.zip`
-  uses, and indexed as source-backed dependency entries (real ranges) while the
-  artifact's class-file entries are dropped first, so two declarations of one
-  type never coexist and make `definition` ambiguous. The source-derived types
-  overlay the class-derived ones (`TypeModel::insert` replaces by
-  `(name, package, kind, nested)`), so hover, `.`-completion, and inlay hints
+  uses, and published as source-backed dependency entries (real ranges) while the
+  artifact's class-file entries and layer are dropped first, so two declarations
+  of one type never coexist and make `definition` ambiguous. Their source-derived
+  types are added as later base layers, so they win over the class-derived ones
+  by (name, package, kind, enclosing chain), and hover, `.`-completion, and inlay hints
   gain real signatures and parameter names, and `definition` resolves a library
   declaration to its extracted source — an ordinary openable `file://` URI.
   `references` and `rename` are unchanged for libraries: `source_files()` omits
@@ -466,6 +642,61 @@ graph LR
   queries run concurrently (preserving R6); a strict single-task actor was
   rejected because it would serialize every request behind the slowest one
   (`message-based-engine`).
+- **Every subsystem is a driver on one engine-owned bus** (`messages.rs`,
+  `engine.rs`) — all messages live in `messages.rs`: `Command` in, `EngineEvent`
+  out, and the `DriverMessage` the drivers use. The drivers are spawned at start,
+  none scheduled by a pre-step, and each reacts to the messages it cares about:
+  the filesystem driver announces the root and relays watched-file events; the
+  project driver walks for the model and inventory (and coordinates `ready` and
+  the summary); the dependency driver resolves the jars; the source scanner, jar
+  indexer, JDK indexer, and source downloader produce the index data. The engine
+  hub hands every index-affecting message to the index subsystem (the sole writer
+  of the index) and turns the reporting ones into client events — no subsystem
+  talks to the editor. The hub also logs every message it carries at `debug`
+  (`RUST_LOG=java_lsp::bus=debug`): each line is prefixed with the sender's name,
+  and a request's reply is logged with the module that answered it and the time
+  it took, so the whole flow is attributable from one place. The high-cardinality,
+  per-item notifications (a source file, an artifact, a progress tick) are logged
+  at `trace` (`RUST_LOG=java_lsp::bus=trace`) so `debug` shows the flow rather than
+  thousands of per-item lines.
+  This supersedes the earlier "one driver that discovers, then spawns producers"
+  shape and the `Reporter` indirection it threaded through the producers
+  (`incremental-indexing-pipeline`).
+- **The index is its own subsystem** (`index.rs`) — the symbol index is
+  owned by a dedicated subsystem thread and reached only through `IndexHandle`, a
+  cheap, message-based handle: each call is one message to the subsystem (and a
+  reply for a query), so no component holds the index state directly and the
+  subsystem is its single reader and writer. The hub hands it the index-affecting
+  `DriverMessage`s; the analysis core uses the handle for its symbol lookups and
+  edits. A query is an ordinary bus request: the hub routes it to the index
+  subsystem and that subsystem's reply is routed back through the hub (which logs
+  and times it), so the hub never calls the index synchronously and cannot
+  deadlock on it.
+- **The diagnostics engine is its own subsystem** (`diagnostics.rs`) — it owns a
+  parser and the open documents' text and computes the pass itself, reading the
+  index and declared-type layer from the index subsystem only through
+  `IndexHandle` and reporting to the hub as messages. The hub forwards document
+  events to it and is the sole translator of its reports; a retired
+  `DiagnosticsPublisher` no longer reaches into the core. It keeps a queryable
+  cache of each open document's latest pass.
+- **The quick-fix subsystem is its own subsystem** (`quickfix.rs`) — it generates
+  the create/import/rename fixes from its own parse of the buffer, querying the
+  symbol index (`IndexHandle`) and the diagnostics cache (`DiagnosticsHandle`).
+  The engine dispatches `codeActions` to it on the blocking pool, so a fix never
+  blocks a runtime worker.
+- **The index is ordered by name for prefix queries** — `by_name` is a
+  `BTreeMap`, so `query_prefix` (completions on every keystroke, and
+  `workspace/symbol`) is a range scan over the matching names rather than a scan
+  of every name; the key set is unchanged, so the index does not grow.
+- **The engine runtime is built with an explicit thread stack size** — analysis is
+  deeply recursive (the warm-up source scan, the open-document parse/extract on
+  the dispatcher, and the diagnostics sweep all walk the AST and the type model
+  recursively), and on a large workspace that overflows the standard library's
+  default 2 MiB per thread, aborting the process with `has overflowed its stack`.
+  `main.rs` builds the runtime with `Builder::thread_stack_size`, which tokio
+  applies to worker threads and the blocking pool, so the server is safe by
+  default without depending on the `RUST_MIN_STACK` environment variable the
+  editor extension does not set (`runtime-stack-overflow`).
 - **Process lifecycle**: `shutdown`/`exit` stop the service (further requests
   are rejected with `ExitedError`); the process itself terminates when the
   client closes stdin (EOF), which is tower-lsp's transport semantics and what
@@ -517,10 +748,10 @@ Two harnesses drive the server with raw JSON-RPC, both plain `cargo test`:
 - `src/bin/java-lsp-bench.rs` is the performance harness (see
   `docs/dev/backlog/perf-benchmarks.md`): one command —
   `cargo run --release --bin java-lsp-bench -- --files 500
-  --methods-per-class 10` — generates a fixture Java workspace in a temp dir,
+--methods-per-class 10` — generates a fixture Java workspace in a temp dir,
   spawns the real `java-lsp` binary (resolved from `--server`, `$JAVA_LSP_BIN`,
   then `target/{release,debug}/java-lsp`, with an auto `cargo build --bin
-  java-lsp` when run under cargo), and drives it over raw stdio JSON-RPC. It
+java-lsp` when run under cargo), and drives it over raw stdio JSON-RPC. It
   measures per-feature first-response time after `didOpen`, hover RTT sampled
   on a 25 ms tick during index warm-up (detected via the server's own
   "workspace index warm-up complete" log line on stderr), and peak RSS from

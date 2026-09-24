@@ -13,6 +13,7 @@ tree-sitter = "0.27"
 tree-sitter-java = "0.23"
 roxmltree = "0.20"
 flate2 = "1"
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 sha1 = "0.10"

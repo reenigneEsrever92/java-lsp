@@ -64,7 +64,7 @@ Key decisions and tradeoffs:
   `--server <path>` flag, then `JAVA_LSP_BIN` env, then
   `<manifest>/target/{release,debug}/java-lsp`; if none exists and it is
   running under cargo (`CARGO` env set), it spawns `cargo build
-  [--release] --bin java-lsp` first so the single command stays true, and
+[--release] --bin java-lsp` first so the single command stays true, and
   otherwise exits with build instructions.
 - **Real stdio binary, not in-process `LspService`.** In-process driving
   (like `tests/harness.rs`) would exclude process startup, transport framing,
@@ -77,11 +77,11 @@ Key decisions and tradeoffs:
   filter — the bench spawns the server with stderr piped and a reader thread
   watches for that line. Alternatives rejected: polling `workspace/symbol`
   (not implemented — no workspace-symbol capability yet); a completion probe
-  as the *primary* signal (a completion only proves one symbol got indexed,
+  as the _primary_ signal (a completion only proves one symbol got indexed,
   not that the scan finished — nondeterministic for large fixtures). The log
   line is emitted by the scan itself, deterministic, and additionally yields
   the scan's own `files`/`elapsed_ms` stats for the report. A completion
-  probe is still run *after* warm-up as a sanity check that index data
+  probe is still run _after_ warm-up as a sanity check that index data
   actually reaches a feature.
 - **Latency during warm-up**: right after `initialized` (scan starts) the
   bench `didOpen`s one fixture file, times the first response per feature
@@ -92,13 +92,14 @@ Key decisions and tradeoffs:
   but the harness asserts every request got a successful response, which is
   exactly AC3 (syntax features respond while indexing runs). Large `--files`
   values make the warm-up window long enough to accumulate samples.
-- **Memory via `/proc/<pid>/status` `VmHWM`** of the server child, read with
-  plain `std::fs` after warm-up and again before shutdown. `VmHWM` is the
-  kernel-maintained peak RSS — the same metric `/usr/bin/time -v` reports,
-  but without an external tool, process wrapping, or parsing its output, and
-  it stays available for the whole child lifetime (no final-read race).
-  Linux-specific: on other targets the report says `memory: n/a` rather than
-  failing. `/usr/bin/time -v` is kept as a documented manual fallback.
+- **Memory via the child's peak RSS** — `/proc/<pid>/status` `VmHWM` on Linux,
+  read with plain `std::fs`; `getrusage(RUSAGE_CHILDREN)` `ru_maxrss` on macOS
+  (the kernel's peak for the reaped child, since macOS keeps no `VmHWM` and the
+  sandbox may block `ps`). `VmHWM` is the same metric `/usr/bin/time -v`
+  reports, but without an external tool, process wrapping, or parsing its
+  output, and it stays available for the whole child lifetime (no final-read
+  race). On a platform with neither, the report says `memory: n/a` rather than
+  failing; `/usr/bin/time -v` is kept as a documented manual fallback.
 - **No criterion.** The harness measures end-to-end wall-clock medians/max of
   a handful of requests per run; a statistical benchmarking framework adds a
   heavy dependency and produces noise-free microbenchmarks that don't model the
@@ -130,7 +131,7 @@ Key decisions and tradeoffs:
       (AC1 — configurable fixture size from a single command.)
 - [x] Implement server-binary resolution (`--server` > `JAVA_LSP_BIN` >
       `target/{release,debug}/java-lsp`, with auto `cargo build --bin
-      java-lsp` under cargo and a clear error otherwise) and the stdio JSON-RPC
+    java-lsp` under cargo and a clear error otherwise) and the stdio JSON-RPC
       client (framing, request/response correlation, notification skipping —
       same pattern as `tests/stdio_smoke.rs`, including no-`params` for
       `shutdown`/`exit`), spawning the server with `RUST_LOG=java_lsp=info`
@@ -155,7 +156,7 @@ Key decisions and tradeoffs:
       during-warm-up RTT count/max/mean, post-warm-up RTT, peak RSS, and the
       scan's own `files`/`elapsed_ms` from the log line. Verify end-to-end
       with `cargo run --release --bin java-lsp-bench -- --files 500
-      --methods-per-class 10` and spot-check a small run (`--files 5`) and a
+    --methods-per-class 10` and spot-check a small run (`--files 5`) and a
       `--json` run; `cargo test` still passes. (AC1 — a single command
       produces the timing/memory report for a chosen fixture size.)
 - [x] Document the harness in `docs/architecture.md` under **"Verifying

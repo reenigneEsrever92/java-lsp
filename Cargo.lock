@@ -589,6 +589,7 @@ dependencies = [
  "futures",
  "reqwest",
  "roxmltree",
+ "serde",
  "serde_json",
  "sha1",
  "tokio",

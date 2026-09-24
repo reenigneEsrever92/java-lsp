@@ -26,6 +26,13 @@
       <artifactId>gson</artifactId>
       <version>2.10.1</version>
     </dependency>
+    <!-- Source: https://mvnrepository.com/artifact/org.apache.commons/commons-lang3 -->
+    <dependency>
+        <groupId>org.apache.commons</groupId>
+        <artifactId>commons-lang3</artifactId>
+        <version>3.20.0</version>
+        <scope>compile</scope>
+    </dependency>
     <!-- Version comes from the parent's dependencyManagement. -->
     <dependency>
       <groupId>junit</groupId>

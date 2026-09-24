@@ -6,17 +6,24 @@ use std::sync::{Arc, Mutex};
 
 use tokio::sync::{mpsc, RwLock};
 use tower_lsp::jsonrpc::Result;
+use tower_lsp::lsp_types::request::{
+    GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
+    GotoImplementationResponse,
+};
 use tower_lsp::lsp_types::{
     notification::Progress, request::WorkDoneProgressCreate, CodeActionKind, CodeActionOptions,
     CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
-    CompletionOptions, CompletionParams, CompletionResponse, DidChangeTextDocumentParams,
-    DidCloseTextDocumentParams, DidOpenTextDocumentParams, DocumentSymbolParams,
-    DocumentSymbolResponse, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
-    GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams, HoverProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, InlayHint, InlayHintParams, Location,
-    MessageType, NumberOrString, OneOf, ProgressParams, ProgressParamsValue, ReferenceParams,
-    RenameParams, ResourceOperationKind, SemanticTokenModifier, SemanticTokensFullOptions,
-    SemanticTokensLegend, SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
+    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
+    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
+    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
+    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
+    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
+    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
+    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
+    InitializedParams, InlayHint, InlayHintParams, Location, MessageType, NumberOrString, OneOf,
+    ProgressParams, ProgressParamsValue, ReferenceParams, Registration, RenameParams,
+    ResourceOperationKind, SemanticTokenModifier, SemanticTokensFullOptions, SemanticTokensLegend,
+    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
     SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
     SignatureHelpParams, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
     WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
@@ -25,10 +32,14 @@ use tower_lsp::lsp_types::{
 use tower_lsp::{Client, LanguageServer};
 
 use crate::document::DocumentStore;
-use crate::engine::{self, EngineEvent, EngineHandle, MessageLevel, ProgressUpdate};
+use crate::engine::{self, EngineHandle};
+use crate::messages::{EngineEvent, MessageLevel, ProgressUpdate, WatchedChange};
 
 /// The single background job's progress token.
 const PROGRESS_TOKEN: &str = "java-lsp/warm-up";
+
+/// The dynamic registration id for the watched-file capability.
+const WATCHER_REGISTRATION_ID: &str = "java-lsp/watched-files";
 
 /// The legend for the semantic tokens the engine emits; keep in sync with
 /// `analysis::SEMANTIC_TOKEN_TYPES`.
@@ -84,10 +95,15 @@ async fn send_progress(client: &Client, token: NumberOrString, update: ProgressU
 pub struct JavaLanguageServer {
     documents: Arc<RwLock<DocumentStore>>,
     engine: EngineHandle,
+    /// The client, so `initialized` can register the watched-file capability.
+    client: Client,
     workspace_root: Mutex<Option<Url>>,
     /// Whether the client advertised `window.workDoneProgress`, read in
     /// `initialize`; progress and notices are dropped when it is false.
     progress: Arc<AtomicBool>,
+    /// Whether the client supports dynamic registration of
+    /// `workspace/didChangeWatchedFiles`, read in `initialize` (D6).
+    watched_files: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for JavaLanguageServer {
@@ -142,8 +158,10 @@ impl JavaLanguageServer {
         Self {
             documents: Arc::new(RwLock::new(DocumentStore::default())),
             engine: engine::spawn(events),
+            client,
             workspace_root: Mutex::new(None),
             progress,
+            watched_files: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -156,6 +174,29 @@ impl JavaLanguageServer {
     pub fn engine(&self) -> EngineHandle {
         self.engine.clone()
     }
+
+    /// Registers `workspace/didChangeWatchedFiles` for `**/*.java` (D1).
+    /// Fire-and-forget, like the progress item: the handshake must never block
+    /// on a client that does not answer the registration request.
+    fn register_watcher(&self) {
+        let options = DidChangeWatchedFilesRegistrationOptions {
+            watchers: vec![FileSystemWatcher {
+                glob_pattern: GlobPattern::String("**/*.java".to_string()),
+                kind: None,
+            }],
+        };
+        let client = self.client.clone();
+        tokio::spawn(async move {
+            let registration = Registration {
+                id: WATCHER_REGISTRATION_ID.to_string(),
+                method: "workspace/didChangeWatchedFiles".to_string(),
+                register_options: serde_json::to_value(options).ok(),
+            };
+            if let Err(error) = client.register_capability(vec![registration]).await {
+                tracing::warn!(%error, "watched-file registration failed");
+            }
+        });
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -165,31 +206,43 @@ impl LanguageServer for JavaLanguageServer {
         let progress_supported = params
             .capabilities
             .window
+            .as_ref()
             .and_then(|window| window.work_done_progress)
             .unwrap_or(false);
         self.progress.store(progress_supported, Ordering::Relaxed);
         // The create-type quick fix needs the client to accept a `CreateFile`
         // resource operation; without it, those actions are withheld.
-        let resource_operations = params
-            .capabilities
-            .workspace
-            .and_then(|workspace| workspace.workspace_edit)
-            .and_then(|edit| edit.resource_operations)
+        let workspace = params.capabilities.workspace.as_ref();
+        let resource_operations = workspace
+            .and_then(|workspace| workspace.workspace_edit.as_ref())
+            .and_then(|edit| edit.resource_operations.as_ref())
             .is_some_and(|operations| operations.contains(&ResourceOperationKind::Create));
         self.engine
             .set_resource_operations(resource_operations)
             .await;
+        // The watched-file fix is only registered with a client that supports
+        // dynamic registration (D6); without it the rest of the fix stands.
+        let watched_files = workspace
+            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
+            .and_then(|capabilities| capabilities.dynamic_registration)
+            .unwrap_or(false);
+        self.watched_files.store(watched_files, Ordering::Relaxed);
         let root = params.root_uri.or_else(|| {
             params
                 .workspace_folders
                 .as_ref()
                 .and_then(|folders| folders.first().map(|folder| folder.uri.clone()))
         });
-        if let Some(root) = root {
-            tracing::info!(root = %root, "workspace root");
-            if let Ok(mut slot) = self.workspace_root.lock() {
-                *slot = Some(root);
+        match root {
+            Some(root) => {
+                tracing::info!(root = %root, "workspace root");
+                if let Ok(mut slot) = self.workspace_root.lock() {
+                    *slot = Some(root);
+                }
             }
+            // No root means no workspace scan: say so, so an empty index is
+            // attributable to the handshake instead of a silent failure.
+            None => tracing::warn!("no workspace root; workspace indexing is disabled"),
         }
         Ok(InitializeResult {
             capabilities: ServerCapabilities {
@@ -198,6 +251,8 @@ impl LanguageServer for JavaLanguageServer {
                 )),
                 hover_provider: Some(HoverProviderCapability::Simple(true)),
                 definition_provider: Some(OneOf::Left(true)),
+                declaration_provider: Some(DeclarationCapability::Simple(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 completion_provider: Some(CompletionOptions {
                     trigger_characters: Some(vec![".".to_string()]),
                     ..CompletionOptions::default()
@@ -235,6 +290,17 @@ impl LanguageServer for JavaLanguageServer {
 
     async fn initialized(&self, _: InitializedParams) {
         tracing::info!("java-lsp initialized");
+        // One dynamic registration, when the client supports it: without a
+        // watcher the server never learns about files the editor did not open.
+        let watched = self.watched_files.load(Ordering::Relaxed);
+        tracing::debug!(
+            watched_files = watched,
+            "client capability: workspace.didChangeWatchedFiles.dynamicRegistration"
+        );
+        if watched {
+            tracing::debug!("registering workspace/didChangeWatchedFiles for **/*.java");
+            self.register_watcher();
+        }
         // The background workspace scan starts once the handshake completes;
         // it never blocks text sync or request handling (R6).
         let root = self
@@ -245,6 +311,25 @@ impl LanguageServer for JavaLanguageServer {
         if let Some(root) = root {
             self.engine.set_workspace_root(root).await;
         }
+    }
+
+    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
+        tracing::debug!(changes = params.changes.len(), "didChangeWatchedFiles");
+        let changes = params
+            .changes
+            .into_iter()
+            .map(|event| {
+                let change = if event.typ == FileChangeType::CREATED {
+                    WatchedChange::Created
+                } else if event.typ == FileChangeType::DELETED {
+                    WatchedChange::Deleted
+                } else {
+                    WatchedChange::Changed
+                };
+                (event.uri, change)
+            })
+            .collect();
+        self.engine.watched_files(changes).await;
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -327,6 +412,38 @@ impl LanguageServer for JavaLanguageServer {
             .definition(uri, position)
             .await
             .map(GotoDefinitionResponse::Scalar))
+    }
+
+    // Java has no separate declaration/definition split (no headers or
+    // forward declarations), so a declaration request lands where a
+    // definition request does.
+    async fn goto_declaration(
+        &self,
+        params: GotoDeclarationParams,
+    ) -> Result<Option<GotoDeclarationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        Ok(self
+            .engine
+            .definition(uri, position)
+            .await
+            .map(GotoDeclarationResponse::Scalar))
+    }
+
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> Result<Option<GotoImplementationResponse>> {
+        let uri = params.text_document_position_params.text_document.uri;
+        let position = params.text_document_position_params.position;
+        let locations = self.engine.implementation(uri, position).await;
+        // An empty result is a refusal as much as a "none found": report null
+        // rather than claiming the contract has no implementations.
+        if locations.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(GotoImplementationResponse::Array(locations)))
+        }
     }
 
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {

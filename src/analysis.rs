@@ -1,6 +1,6 @@
 //! Tree-sitter backed engine core: one Java syntax tree per open document,
 //! feeding parse-error diagnostics, document symbols, folding ranges, and
-//! semantic tokens, plus a workspace-wide symbol index ([`WorkspaceIndex`])
+//! semantic tokens, plus a workspace-wide symbol index ([`IndexHandle`])
 //! warmed by a background scan and answering go-to-definition and
 //! workspace-symbol queries.
 //!
@@ -16,26 +16,23 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
-use serde_json::json;
 use tower_lsp::lsp_types::{
-    CodeAction, CodeActionKind, CompletionItem, CompletionItemKind, CompletionResponse, CreateFile,
-    CreateFileOptions, Diagnostic, DiagnosticSeverity, DocumentChangeOperation, DocumentChanges,
-    DocumentSymbol, FoldingRange, FoldingRangeKind, Hover, HoverContents, InlayHint, InlayHintKind,
-    InlayHintLabel, Location, MarkupContent, MarkupKind, NumberOrString, OneOf,
-    OptionalVersionedTextDocumentIdentifier, Position, Range, ResourceOp, SemanticToken,
-    SemanticTokenType, SemanticTokens, SignatureHelp, SignatureInformation, SymbolInformation,
-    SymbolKind, TextDocumentEdit, TextEdit, Url, WorkspaceEdit,
+    CodeAction, CompletionItem, CompletionItemKind, CompletionResponse, Diagnostic, DocumentSymbol,
+    FoldingRange, FoldingRangeKind, Hover, HoverContents, InlayHint, InlayHintKind, InlayHintLabel,
+    Location, MarkupContent, MarkupKind, Position, Range, SemanticToken, SemanticTokenType,
+    SemanticTokens, SignatureHelp, SignatureInformation, SymbolInformation, SymbolKind, TextEdit,
+    Url, WorkspaceEdit,
 };
 use tree_sitter::{Node, Parser, Tree};
 
-use crate::engine::Reporter;
-use crate::index::{
-    extract_entries, java_parser, scan_workspace, scan_workspace_async, IndexKind, SymbolEntry,
-    WorkspaceIndex,
+use crate::diagnostics::semantic_diagnostics_enabled;
+use crate::index::{extract_entries, java_parser, IndexHandle, IndexKind, NameLookup, SymbolEntry};
+use crate::messages::{EngineEvent, WatchedChange};
+use crate::types::{
+    self, Member, ModelLayers, SourceLayerIndex, Ty, TypeInfo, TypeLookup, TypeModel, TypeQuery,
 };
-use crate::types::{self, Member, Ty, TypeLookup, TypeModel, TypeQuery};
 
 /// The legend for [`TreeSitterEngine::semantic_tokens`]; indexes into this
 /// list are what goes on the wire.
@@ -68,15 +65,30 @@ const STRING: u32 = 10;
 const NUMBER: u32 = 11;
 const COMMENT: u32 = 12;
 
+/// The most parsers the search pool keeps for reuse. A burst of concurrent
+/// searches retains at most this many; a further search builds a fresh parser.
+const SEARCH_PARSER_POOL_MAX: usize = 4;
+
 struct ParsedDocument {
     tree: Tree,
     text: String,
+    /// The client's version for `text`, read under the same short lock that
+    /// clones the `Arc`, so a published `(version, diagnostics)` pair is
+    /// internally consistent.
+    version: i32,
 }
 
 pub struct TreeSitterEngine {
     parser: Mutex<Parser>,
-    documents: Mutex<HashMap<Url, ParsedDocument>>,
-    index: WorkspaceIndex,
+    /// Parsers reserved for workspace searches, so `collect_occurrences` never
+    /// takes `parser` — which `store_tree` needs on every didOpen/didChange. A
+    /// search takes one for its duration and returns it, so a warm pool avoids
+    /// reloading the grammar per request while typing stays unblocked.
+    search_parsers: Mutex<Vec<Parser>>,
+    documents: Mutex<HashMap<Url, Arc<ParsedDocument>>>,
+    /// The index subsystem handle: the workspace symbol index is owned by its
+    /// own subsystem and reached only through messages, never held here.
+    index: IndexHandle,
     workspace_root: Mutex<Option<Url>>,
     /// Whether semantic (unresolved-symbol) diagnostics are enabled; read from
     /// `JAVA_LSP_SEMANTIC_DIAGNOSTICS` at construction (on by default).
@@ -84,21 +96,35 @@ pub struct TreeSitterEngine {
     /// Whether the client advertised `workspace.workspaceEdit.resourceOperations`
     /// with `CreateFile`, so the create-type quick fix can be offered.
     resource_operations: AtomicBool,
-    /// Where the background warm-up reports progress; detached (a no-op) until
-    /// the shell installs one.
-    reporter: Mutex<Reporter>,
+    /// The shell's event channel, installed by the shell; the warm-up's indexing
+    /// task emits client events through it. `None` until the shell installs one.
+    events: Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineEvent>>>,
+    /// A test-only hook fired by [`Self::diagnostics`] after the document
+    /// snapshot is taken and the store lock released, so a test can prove the
+    /// lock is not held across the semantic pass.
+    #[cfg(test)]
+    analyze_hook: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
 }
 
 impl TreeSitterEngine {
     pub fn new() -> Self {
+        Self::with_index(IndexHandle::standalone())
+    }
+
+    /// Builds the core around an existing index subsystem handle, so the hub's
+    /// index and the core's are one and the same subsystem.
+    pub fn with_index(index: IndexHandle) -> Self {
         Self {
             parser: Mutex::new(java_parser()),
+            search_parsers: Mutex::new(Vec::new()),
             documents: Mutex::new(HashMap::new()),
-            index: WorkspaceIndex::new(),
+            index,
             workspace_root: Mutex::new(None),
             semantic_diagnostics: AtomicBool::new(semantic_diagnostics_enabled()),
             resource_operations: AtomicBool::new(false),
-            reporter: Mutex::new(Reporter::default()),
+            events: Mutex::new(None),
+            #[cfg(test)]
+            analyze_hook: Mutex::new(None),
         }
     }
 
@@ -114,27 +140,81 @@ impl TreeSitterEngine {
         self.semantic_diagnostics.store(enabled, Ordering::Relaxed);
     }
 
-    /// Installs the reporter the background warm-up reports through.
-    pub fn set_reporter(&self, reporter: Reporter) {
-        if let Ok(mut slot) = self.reporter.lock() {
-            *slot = reporter;
+    /// Installs the shell's event channel, which the warm-up's indexing task
+    /// emits progress, notices, and diagnostics through.
+    pub fn set_events(&self, events: tokio::sync::mpsc::UnboundedSender<EngineEvent>) {
+        if let Ok(mut slot) = self.events.lock() {
+            *slot = Some(events);
         }
     }
 
-    fn store_tree(&self, uri: &Url, text: &str) {
+    /// Snapshots an open document: clones the `Arc` under a short lock and drops
+    /// the guard, so a caller runs its analysis without holding the store and
+    /// never blocks `store_tree` for the length of a pass. A `None` means the
+    /// document is not open.
+    fn snapshot(&self, uri: &Url) -> Option<Arc<ParsedDocument>> {
+        let documents = self.documents.lock().ok()?;
+        documents.get(uri).map(Arc::clone)
+    }
+
+    /// A test-only hook installed by [`Self::set_analyze_hook`].
+    #[cfg(test)]
+    fn fire_analyze_hook(&self) {
+        let hook = self.analyze_hook.lock().ok().and_then(|slot| slot.clone());
+        if let Some(hook) = hook {
+            hook();
+        }
+    }
+
+    /// Installs the hook [`Self::diagnostics`] fires after dropping the store
+    /// lock (tests only).
+    #[cfg(test)]
+    fn set_analyze_hook(&self, hook: Arc<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.analyze_hook.lock() {
+            *slot = Some(hook);
+        }
+    }
+
+    /// Takes a parser for a workspace search from the pool, building one when the
+    /// pool is cold. Deliberately never `self.parser`: the search runs while
+    /// `store_tree` may need that on every edit, so sharing it would freeze
+    /// typing for the length of the search.
+    fn take_search_parser(&self) -> Parser {
+        if let Ok(mut pool) = self.search_parsers.lock() {
+            if let Some(parser) = pool.pop() {
+                return parser;
+            }
+        }
+        java_parser()
+    }
+
+    /// Returns a search parser to the pool for the next search, up to the cap; a
+    /// parser past the cap is dropped.
+    fn return_search_parser(&self, parser: Parser) {
+        if let Ok(mut pool) = self.search_parsers.lock() {
+            if pool.len() < SEARCH_PARSER_POOL_MAX {
+                pool.push(parser);
+            }
+        }
+    }
+
+    fn store_tree(&self, uri: &Url, text: &str, version: i32) {
         if let Ok(mut parser) = self.parser.lock() {
             if let Some(tree) = parser.parse(text.as_bytes(), None) {
                 let entries = extract_entries(uri, &tree, text);
+                let types = model_of(&tree, text);
                 if let Ok(mut documents) = self.documents.lock() {
                     documents.insert(
                         uri.clone(),
-                        ParsedDocument {
+                        Arc::new(ParsedDocument {
                             tree,
                             text: text.to_string(),
-                        },
+                            version,
+                        }),
                     );
                 }
                 self.index.upsert_file(uri, entries);
+                self.record_types(uri, types);
             }
         }
     }
@@ -145,10 +225,37 @@ impl TreeSitterEngine {
         let Some(path) = uri.to_file_path().ok() else {
             return false;
         };
+        if !self.is_workspace_source(&path) {
+            return false;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            self.index.remove_file(uri);
+            self.drop_types(uri);
+            return true;
+        };
+        self.index_source(uri, &text);
+        true
+    }
+
+    /// Parses `text` and replaces `uri`'s index entries and its contribution to
+    /// the analysis model, without touching the open-document map.
+    fn index_source(&self, uri: &Url, text: &str) {
+        let Ok(mut parser) = self.parser.lock() else {
+            return;
+        };
+        let Some(tree) = parser.parse(text.as_bytes(), None) else {
+            return;
+        };
+        self.index
+            .upsert_file(uri, extract_entries(uri, &tree, text));
+        self.record_types(uri, model_of(&tree, text));
+    }
+
+    /// Whether `path` lies in a workspace source root (or, before the scan has
+    /// set a project model, in the workspace root).
+    fn is_workspace_source(&self, path: &std::path::Path) -> bool {
         let roots = self.index.source_roots();
-        let inside = if roots.is_empty() {
-            // No scan has run (or no root was set): fall back to the raw
-            // workspace root check, matching pre-model behaviour.
+        if roots.is_empty() {
             self.workspace_root
                 .lock()
                 .ok()
@@ -157,23 +264,31 @@ impl TreeSitterEngine {
                 .is_some_and(|root_path| path.starts_with(root_path))
         } else {
             roots.iter().any(|root| path.starts_with(root))
-        };
-        if !inside {
-            return false;
         }
-        let Ok(text) = std::fs::read_to_string(&path) else {
-            self.index.remove_file(uri);
-            return true;
-        };
-        if let Ok(mut parser) = self.parser.lock() {
-            if let Some(tree) = parser.parse(text.as_bytes(), None) {
-                let entries = extract_entries(uri, &tree, &text);
-                self.index.upsert_file(uri, entries);
-                return true;
-            }
-        }
-        self.index.remove_file(uri);
-        true
+    }
+
+    fn record_types(&self, uri: &Url, types: TypeModel) {
+        self.index.record_dirty_type(uri, Arc::new(types));
+    }
+
+    fn drop_types(&self, uri: &Url) {
+        self.index.drop_dirty_type(uri);
+    }
+
+    /// The workspace source layers for a query: every source file's declared
+    /// types, with the dirty entry for a URI replacing its warm-up model (an
+    /// open buffer, a watched change, or a close re-read), plus any dirty-only
+    /// file created after warm-up. A deleted file is absent from both maps, so
+    /// its types vanish from every model-based feature.
+    ///
+    /// Returns a **view** over the index's cached, name-indexed base layers and
+    /// the engine's dirty overlay, both behind their `Arc`s — nothing is merged
+    /// or copied, so a request never rebuilds the workspace type model. See
+    /// `large-project-memory` for why the model is layered per file (deletion is
+    /// a map removal) and read through a view (a per-request merge would copy the
+    /// whole workspace).
+    fn type_layers(&self) -> ModelLayers {
+        self.index.type_layers()
     }
 
     /// Completion items for a member access after `.`: the receiver's inferred
@@ -189,17 +304,20 @@ impl TreeSitterEngine {
         let Some(object) = receiver_before_dot(&document.tree, text, offset) else {
             return Vec::new();
         };
-        let local = local_model(document);
+        let overlay = self.type_layers();
         let workspace = self.index.type_model();
-        let empty = TypeModel::new();
+        let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let scope = types::scope_at(object, text, &document.tree, &query);
 
-        let static_only = matches!(object.kind(), "identifier" | "type_identifier")
-            && types::resolve_name(&text[object.byte_range()], &scope, &query)
-                .map(|resolved| resolved.is_type)
-                .unwrap_or(false);
+        // A receiver that resolves to a type takes only its static members —
+        // whatever shape the parser gave it: a plain name, a dotted nested name
+        // (`Greeter.Inner` parses as a field access in expression position), or
+        // a scoped name.
+        let static_only = types::resolve_name(&text[object.byte_range()], &scope, &query)
+            .map(|resolved| resolved.is_type)
+            .unwrap_or(false);
 
         let ty = types::receiver_type(&object, text, &scope, &query);
         let mut items = Vec::new();
@@ -230,15 +348,70 @@ impl TreeSitterEngine {
                 if !seen.insert(member.name.clone()) {
                     continue;
                 }
+                let kind = if member.kind == IndexKind::EnumConstant {
+                    CompletionItemKind::ENUM_MEMBER
+                } else {
+                    CompletionItemKind::FIELD
+                };
                 items.push(CompletionItem {
                     label: member.name.clone(),
-                    kind: Some(CompletionItemKind::FIELD),
+                    kind: Some(kind),
                     detail: Some(member.signature()),
                     filter_text: Some(member.name.clone()),
                     insert_text: Some(member.name.clone()),
                     sort_text: Some(format!("0{}", member.name)),
                     ..Default::default()
                 });
+            }
+        }
+        // A type receiver also offers its directly nested types (`Greeter.`
+        // offers `Inner`); an instance receiver does not, so `greeter.` stays
+        // free of them.
+        if static_only {
+            if let Some(info) = query.lookup(&ty, scope.package.as_deref()) {
+                for nested in query.nested_types(&info.name, info.package.as_deref()) {
+                    if !nested.name.starts_with(prefix) {
+                        continue;
+                    }
+                    if !seen.insert(nested.name.clone()) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: nested.name.clone(),
+                        kind: completion_kind(nested.kind),
+                        detail: Some(kind_word(nested.kind).to_string()),
+                        filter_text: Some(nested.name.clone()),
+                        insert_text: Some(nested.name.clone()),
+                        sort_text: Some(format!("0{}", nested.name)),
+                        ..Default::default()
+                    });
+                }
+            }
+        }
+        // A receiver that names no type or value may name a package: offer that
+        // package's top-level types (`java.util.Li` → `List`). The qualifier is
+        // already written, so the simple name is inserted and no import is
+        // needed.
+        if matches!(ty, Ty::Unknown) {
+            let receiver = &text[object.byte_range()];
+            if receiver.contains('.') {
+                for info in query.types_in_package(receiver) {
+                    if !info.name.starts_with(prefix) {
+                        continue;
+                    }
+                    if !seen.insert(info.name.clone()) {
+                        continue;
+                    }
+                    items.push(CompletionItem {
+                        label: info.name.clone(),
+                        kind: completion_kind(info.kind),
+                        detail: Some(kind_word(info.kind).to_string()),
+                        filter_text: Some(info.name.clone()),
+                        insert_text: Some(info.name.clone()),
+                        sort_text: Some(format!("0{}", info.name)),
+                        ..Default::default()
+                    });
+                }
             }
         }
         items
@@ -256,11 +429,11 @@ impl TreeSitterEngine {
         let tree = &document.tree;
         let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
         let node = cursor_node(tree, node, text, offset);
-        let local = local_model(document);
+        let overlay = self.type_layers();
         let workspace = self.index.type_model();
-        let empty = TypeModel::new();
+        let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let scope = types::scope_at(node, text, tree, &query);
 
         // Inside an import declaration, the dotted path's last segment names the
@@ -298,6 +471,15 @@ impl TreeSitterEngine {
                 scope.package.as_deref(),
                 &self.index,
             ) {
+                return Some(target);
+            }
+        }
+
+        // `new T(...)`: the created type's constructor is the target, selected by
+        // the call's argument types, not the type itself. An unresolvable,
+        // library, or implicit constructor falls through to the type target.
+        if let Some(creation) = enclosing_creation_type(&node) {
+            if let Some(target) = self.constructor_target(uri, document, &creation) {
                 return Some(target);
             }
         }
@@ -395,10 +577,9 @@ impl TreeSitterEngine {
     /// Resolves the cursor to a target, returning it with the requested file's
     /// text so the caller can release the document lock before searching.
     fn name_target(&self, uri: &Url, position: Position) -> Option<(Target, String)> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let offset = byte_offset(&document.text, position);
-        let target = self.resolve_target(uri, document, offset)?;
+        let target = self.resolve_target(uri, &document, offset)?;
         Some((target, document.text.clone()))
     }
 
@@ -408,7 +589,7 @@ impl TreeSitterEngine {
     /// wildcard import still resolves. A dependency declaration is always
     /// refused — a jar cannot be written back.
     fn type_target_for(&self, name: &str, package: Option<&str>, strict: bool) -> Option<Target> {
-        let mut entries: Vec<SymbolEntry> = self
+        let mut entries: Vec<Arc<SymbolEntry>> = self
             .index
             .query_name(name)
             .into_iter()
@@ -419,7 +600,7 @@ impl TreeSitterEngine {
         }
         match package {
             Some(package) => {
-                let in_package: Vec<SymbolEntry> = entries
+                let in_package: Vec<Arc<SymbolEntry>> = entries
                     .iter()
                     .filter(|entry| entry.package.as_deref() == Some(package))
                     .cloned()
@@ -435,7 +616,7 @@ impl TreeSitterEngine {
             name: name.to_string(),
             kind: TargetKind::Type,
             owner: Some(name.to_string()),
-            package: entry.package.clone(),
+            package: entry.package.as_deref().map(str::to_string),
             local_span: None,
             declarations: vec![entry],
             local_declaration: None,
@@ -468,9 +649,9 @@ impl TreeSitterEngine {
         let declarations = member_declarations(
             name,
             if is_method {
-                IndexKind::Method
+                &[IndexKind::Method]
             } else {
-                IndexKind::Field
+                &[IndexKind::Field, IndexKind::EnumConstant]
             },
             &owner.name,
             owner.package.as_deref(),
@@ -488,8 +669,11 @@ impl TreeSitterEngine {
                 {
                     let params: Vec<Ty> =
                         member.params.iter().map(|param| param.ty.clone()).collect();
+                    // Target resolution, not a search: a throwaway parser, so it
+                    // neither contends with a search nor with `store_tree`.
+                    let mut parser = java_parser();
                     overload_declaration = self
-                        .match_declaration(&declarations, &params, uri, document)
+                        .match_declaration(&mut parser, &declarations, &params, uri, document)
                         .map(|(_, location)| location);
                     overload = Some(params);
                 }
@@ -512,22 +696,85 @@ impl TreeSitterEngine {
         })
     }
 
+    /// A `new T(...)` as a target: the created type must be a workspace source
+    /// and the call's argument types select the constructor. `None` when the
+    /// type is a library/unresolved or the arguments cannot pick a constructor,
+    /// so the caller falls back to the type target.
+    fn constructor_target(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        creation: &Node,
+    ) -> Option<Target> {
+        let text = &document.text;
+        let overlay = self.type_layers();
+        let workspace = self.index.type_model();
+        let empty = SourceLayerIndex::default();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &overlay);
+        let scope = types::scope_at(*creation, text, &document.tree, &query);
+        let ty = creation
+            .child_by_field_name("type")
+            .map(|ty| types::type_from_node(&ty, text))?;
+        let owner = query.lookup(&ty, scope.package.as_deref())?;
+        let owner_name = owner.name.clone();
+        let owner_package = owner.package.clone();
+        if !declared_in_workspace(&owner_name, owner_package.as_deref(), &self.index) {
+            return None;
+        }
+        let declarations = member_declarations(
+            &owner_name,
+            &[IndexKind::Method],
+            &owner_name,
+            owner_package.as_deref(),
+            &self.index,
+        );
+        let args = call_argument_types(creation, text, &scope, &query);
+        let selected =
+            types::constructor_for_arguments(&ty, &args, &query, scope.package.as_deref());
+        let mut overload = None;
+        let mut overload_declaration = None;
+        if declarations.len() > 1 {
+            if let Some(member) = &selected {
+                let params: Vec<Ty> = member.params.iter().map(|param| param.ty.clone()).collect();
+                // Target resolution, not a search: a throwaway parser.
+                let mut parser = java_parser();
+                overload_declaration = self
+                    .match_declaration(&mut parser, &declarations, &params, uri, document)
+                    .map(|(_, location)| location);
+                overload = Some(params);
+            }
+        }
+        Some(Target {
+            name: owner_name.clone(),
+            kind: TargetKind::Constructor,
+            owner: Some(owner_name),
+            package: owner_package,
+            local_span: None,
+            declarations,
+            local_declaration: None,
+            overload,
+            overload_declaration,
+        })
+    }
+
     /// The declaration entry that declares exactly `params`, with its location,
     /// read from the requested document or the entry's file on disk.
     fn match_declaration(
         &self,
-        declarations: &[SymbolEntry],
+        parser: &mut Parser,
+        declarations: &[Arc<SymbolEntry>],
         params: &[Ty],
         requested: &Url,
         requested_doc: &ParsedDocument,
-    ) -> Option<(SymbolEntry, Location)> {
+    ) -> Option<(Arc<SymbolEntry>, Location)> {
         declarations.iter().find_map(|entry| {
-            let entry_params = self.entry_method_params(entry, requested, requested_doc)?;
+            let entry_params = self.entry_method_params(parser, entry, requested, requested_doc)?;
             (entry_params.as_slice() == params).then(|| {
                 (
                     entry.clone(),
                     Location {
-                        uri: entry.uri.clone(),
+                        uri: (*entry.uri).clone(),
                         range: entry.selection_range,
                     },
                 )
@@ -536,14 +783,17 @@ impl TreeSitterEngine {
     }
 
     /// The parameter types the declaration `entry` actually declares, read from
-    /// the requested document when the entry lives in it, else from disk.
+    /// the requested document when the entry lives in it, else from disk parsed
+    /// with the caller's `parser`. A caller outside the search passes a throwaway
+    /// parser, so this never takes the shared `self.parser`.
     fn entry_method_params(
         &self,
+        parser: &mut Parser,
         entry: &SymbolEntry,
         requested: &Url,
         requested_doc: &ParsedDocument,
     ) -> Option<Vec<Ty>> {
-        if entry.uri == *requested {
+        if entry.uri.as_ref() == requested {
             return method_params_in(
                 &requested_doc.tree,
                 &requested_doc.text,
@@ -552,7 +802,7 @@ impl TreeSitterEngine {
         }
         let path = entry.uri.to_file_path().ok()?;
         let text = std::fs::read_to_string(path).ok()?;
-        let tree = self.parser.lock().ok()?.parse(text.as_bytes(), None)?;
+        let tree = parser.parse(text.as_bytes(), None)?;
         method_params_in(&tree, &text, entry.selection_range)
     }
 
@@ -568,15 +818,25 @@ impl TreeSitterEngine {
     ) -> (Vec<Location>, bool) {
         let mut out: Vec<Location> = Vec::new();
         let mut seen: HashSet<(String, u32, u32)> = HashSet::new();
-        let Ok(mut parser) = self.parser.lock() else {
-            return (Vec::new(), false);
-        };
+        // The search's own parser, taken for its duration and returned below. It
+        // is never `self.parser`, so reading and parsing every candidate cannot
+        // block `store_tree` (and thus typing) on a workspace-wide search.
+        let mut parser = self.take_search_parser();
         let mut complete = true;
 
         let mut candidates = self.index.source_files();
         if !candidates.iter().any(|uri| uri == requested) {
             candidates.push(requested.clone());
         }
+
+        // The workspace type model, built once for the whole search rather than
+        // per candidate file: a view over the per-file layers, so a receiver in
+        // any file still resolves the type its member belongs to.
+        let overlay = self.type_layers();
+        let workspace = self.index.type_model();
+        let empty = SourceLayerIndex::default();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &overlay);
 
         for uri in candidates {
             let text = if &uri == requested {
@@ -618,20 +878,18 @@ impl TreeSitterEngine {
                 }
                 TargetKind::Method | TargetKind::Field => {
                     self.collect_member_occurrences(
-                        &tree, &text, target, &uri, &mut out, &mut seen,
+                        &tree, &text, target, &uri, &query, &mut out, &mut seen,
+                    );
+                }
+                TargetKind::Constructor => {
+                    self.collect_constructor_occurrences(
+                        &tree, &text, target, &uri, &query, &mut out, &mut seen,
                     );
                 }
                 TargetKind::Local => {
                     if &uri != requested {
                         continue;
                     }
-                    let package = types::file_package(&tree, &text);
-                    let mut local = TypeModel::new();
-                    local.extend(types::collect_type_infos(package.as_deref(), &tree, &text));
-                    let workspace = self.index.type_model();
-                    let empty = TypeModel::new();
-                    let base = workspace.as_deref().unwrap_or(&empty);
-                    let query = TypeQuery::new(base, &local);
                     collect_local_occurrences(
                         &tree.root_node(),
                         &text,
@@ -653,30 +911,26 @@ impl TreeSitterEngine {
                 .then_with(|| a.range.start.line.cmp(&b.range.start.line))
                 .then_with(|| a.range.start.character.cmp(&b.range.start.character))
         });
+        self.return_search_parser(parser);
         (out, complete)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn collect_member_occurrences(
         &self,
         tree: &Tree,
         text: &str,
         target: &Target,
         uri: &Url,
+        model: &dyn TypeLookup,
         out: &mut Vec<Location>,
         seen: &mut HashSet<(String, u32, u32)>,
     ) {
         let package = types::file_package(tree, text);
-        let mut local = TypeModel::new();
-        local.extend(types::collect_type_infos(package.as_deref(), tree, text));
-        let workspace = self.index.type_model();
-        let empty = TypeModel::new();
-        let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
-
         // The declaring type's byte span in this file, when this is its file.
         let owner_span = target.owner.as_ref().and_then(|owner| {
             let entry = workspace_type_entry(owner, target.package.as_deref(), &self.index)?;
-            if entry.uri != *uri {
+            if entry.uri.as_ref() != uri {
                 return None;
             }
             Some((
@@ -690,9 +944,36 @@ impl TreeSitterEngine {
             text,
             tree,
             target,
-            &query,
+            model,
             package.as_deref(),
             owner_span,
+            uri,
+            out,
+            seen,
+        );
+    }
+
+    /// Records every `new T(...)` whose created type resolves to a constructor
+    /// target's owner, the `Constructor` analog of `collect_member_occurrences`.
+    #[allow(clippy::too_many_arguments)]
+    fn collect_constructor_occurrences(
+        &self,
+        tree: &Tree,
+        text: &str,
+        target: &Target,
+        uri: &Url,
+        model: &dyn TypeLookup,
+        out: &mut Vec<Location>,
+        seen: &mut HashSet<(String, u32, u32)>,
+    ) {
+        let package = types::file_package(tree, text);
+        collect_creation_nodes(
+            &tree.root_node(),
+            text,
+            tree,
+            target,
+            model,
+            package.as_deref(),
             uri,
             out,
             seen,
@@ -707,12 +988,12 @@ impl Default for TreeSitterEngine {
 }
 
 impl TreeSitterEngine {
-    pub fn open(&self, uri: &Url, text: &str) {
-        self.store_tree(uri, text);
+    pub fn open(&self, uri: &Url, text: &str, version: i32) {
+        self.store_tree(uri, text, version);
     }
 
-    pub fn change(&self, uri: &Url, text: &str) {
-        self.store_tree(uri, text);
+    pub fn change(&self, uri: &Url, text: &str, version: i32) {
+        self.store_tree(uri, text, version);
     }
 
     pub fn close(&self, uri: &Url) {
@@ -721,429 +1002,106 @@ impl TreeSitterEngine {
         }
         if !self.reindex_from_disk(uri) {
             self.index.remove_file(uri);
+            self.drop_types(uri);
         }
     }
 
-    pub fn diagnostics(&self, uri: &Url) -> Vec<Diagnostic> {
-        let Some(documents) = self.documents.lock().ok() else {
+    /// Applies watched filesystem events: re-indexes a created/changed file from
+    /// disk and drops a deleted one. A file the editor currently has open is
+    /// skipped — its `didChange` is authoritative (D2) — and so is a path
+    /// outside every source root. Reports whether anything changed, so the
+    /// caller can republish diagnostics for the open documents that can see it.
+    pub fn watched_files(&self, changes: &[(Url, WatchedChange)]) -> bool {
+        let mut changed = false;
+        for (uri, change) in changes {
+            if self.is_open(uri) {
+                continue;
+            }
+            match change {
+                WatchedChange::Deleted => {
+                    if uri
+                        .to_file_path()
+                        .is_ok_and(|path| self.is_workspace_source(&path))
+                    {
+                        self.index.remove_file(uri);
+                        self.drop_types(uri);
+                        changed = true;
+                    }
+                }
+                WatchedChange::Created | WatchedChange::Changed => {
+                    changed |= self.reindex_from_disk(uri);
+                }
+            }
+        }
+        changed
+    }
+
+    /// The URIs the editor currently has open, sorted — the set a diagnostics
+    /// republish covers.
+    pub fn open_documents(&self) -> Vec<Url> {
+        let Ok(documents) = self.documents.lock() else {
             return Vec::new();
         };
-        let Some(document) = documents.get(uri) else {
-            return Vec::new();
+        let mut uris: Vec<Url> = documents.keys().cloned().collect();
+        uris.sort();
+        uris
+    }
+
+    pub(crate) fn is_open(&self, uri: &Url) -> bool {
+        self.documents
+            .lock()
+            .map(|documents| documents.contains_key(uri))
+            .unwrap_or(false)
+    }
+
+    /// Diagnostics for an open document plus its version, taken from one
+    /// snapshot: the `Arc` is cloned under a short lock and the guard dropped
+    /// before the semantic pass, so no other handler blocks on the store for
+    /// the length of the analysis. A `None` version means the document is not
+    /// open.
+    pub fn diagnostics(&self, uri: &Url) -> (Option<i32>, Vec<Diagnostic>) {
+        let Some(document) = self.snapshot(uri) else {
+            return (None, Vec::new());
         };
-        let mut diagnostics = Vec::new();
-        if document.tree.root_node().has_error() {
-            collect_errors(&document.tree.root_node(), &document.text, &mut diagnostics);
-            // A file that does not parse yields no meaningful semantic findings;
-            // adding them would only pile noise onto broken code.
-            return diagnostics;
-        }
-        if self.semantic_diagnostics.load(Ordering::Relaxed) {
-            diagnostics.extend(semantic_diagnostics(document, uri, &self.index));
-        }
-        diagnostics
+        #[cfg(test)]
+        self.fire_analyze_hook();
+        let version = Some(document.version);
+        // The diagnostics subsystem computes the real pass from its own parse;
+        // this delegates to the same entry point so the core's tests keep a
+        // direct way in.
+        let diagnostics = crate::diagnostics::diagnostics_for(
+            &document.tree,
+            &document.text,
+            uri,
+            &self.index,
+            &self.type_layers(),
+            self.semantic_diagnostics.load(Ordering::Relaxed),
+        );
+        (version, diagnostics)
     }
 
     /// Quick fixes for the unresolved-symbol diagnostics the client is showing:
     /// add an import, change to a near member, or create a stub type/member.
-    /// Built from each diagnostic's `data`, so the fix matches what was
-    /// reported.
+    /// The quick-fix subsystem owns the generation; this delegates to the same
+    /// entry point, so the core's tests keep a direct way in.
     pub fn code_actions(&self, uri: &Url, diagnostics: &[Diagnostic]) -> Vec<CodeAction> {
-        let Ok(documents) = self.documents.lock() else {
+        let Some(document) = self.snapshot(uri) else {
             return Vec::new();
         };
-        let Some(document) = documents.get(uri) else {
-            return Vec::new();
-        };
-        // The type model, for inferring created signatures from the usage.
-        let local = local_model(document);
-        let workspace = self.index.type_model();
-        let empty = TypeModel::new();
-        let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
-        let mut actions = Vec::new();
-        for diagnostic in diagnostics {
-            if diagnostic.source.as_deref() != Some("java-lsp") {
-                continue;
-            }
-            let Some(data) = diagnostic.data.as_ref() else {
-                continue;
-            };
-            let name = data
-                .get("name")
-                .and_then(|value| value.as_str())
-                .unwrap_or("");
-            let Some(fixes) = data.get("fixes").and_then(|value| value.as_array()) else {
-                continue;
-            };
-            for fix in fixes {
-                match fix.get("fix").and_then(|value| value.as_str()) {
-                    Some(FIX_ADD_IMPORT) => {
-                        self.add_import_actions(uri, document, diagnostic, fix, &mut actions)
-                    }
-                    Some(FIX_RENAME) => {
-                        self.rename_member_action(uri, diagnostic, fix, &mut actions)
-                    }
-                    Some(FIX_CREATE_TYPE) => {
-                        self.create_type_actions(uri, document, diagnostic, name, &mut actions)
-                    }
-                    Some(FIX_CREATE_SYMBOL) => self.create_symbol_actions(
-                        uri,
-                        document,
-                        diagnostic,
-                        name,
-                        &query,
-                        &mut actions,
-                    ),
-                    Some(FIX_CREATE_RECEIVER_MEMBER) => self.create_receiver_member_action(
-                        uri,
-                        document,
-                        diagnostic,
-                        name,
-                        fix,
-                        &query,
-                        &mut actions,
-                    ),
-                    _ => {}
-                }
-            }
-        }
-        actions
-    }
-
-    /// One "Add import" action per importable candidate (the client shows a
-    /// picker when several are offered). Edits come from `import_edit`.
-    fn add_import_actions(
-        &self,
-        uri: &Url,
-        document: &ParsedDocument,
-        diagnostic: &Diagnostic,
-        data: &serde_json::Value,
-        actions: &mut Vec<CodeAction>,
-    ) {
-        let Some(candidates) = data.get("candidates").and_then(|value| value.as_array()) else {
-            return;
-        };
-        let root = document.tree.root_node();
-        let imports = collect_imports(&root, &document.text);
-        let package = types::file_package(&document.tree, &document.text);
-        let package_line = package_line(&document.tree);
-        for candidate in candidates {
-            let Some(target) = candidate.as_str() else {
-                continue;
-            };
-            let simple = target.rsplit('.').next().unwrap_or(target);
-            let Some(entry) = self
-                .index
-                .query_name(simple)
-                .into_iter()
-                .find(|entry| import_target(entry).as_deref() == Some(target))
-            else {
-                continue;
-            };
-            let edits = import_edit(
-                uri,
-                &entry,
-                package.as_deref(),
-                package_line,
-                &imports,
-                &self.index,
-            );
-            if edits.is_empty() {
-                continue;
-            }
-            actions.push(CodeAction {
-                title: format!("Add import `{target}`"),
-                kind: Some(CodeActionKind::QUICKFIX),
-                diagnostics: Some(vec![diagnostic.clone()]),
-                edit: Some(workspace_edit_changes(uri, edits)),
-                ..CodeAction::default()
-            });
-        }
-    }
-
-    /// A "Change to `x`" action for a member name close to a real one.
-    fn rename_member_action(
-        &self,
-        uri: &Url,
-        diagnostic: &Diagnostic,
-        data: &serde_json::Value,
-        actions: &mut Vec<CodeAction>,
-    ) {
-        let Some(replacement) = data
-            .get("replacement")
-            .and_then(|value| value.as_str())
-            .filter(|replacement| !replacement.is_empty())
-        else {
-            return;
-        };
-        actions.push(CodeAction {
-            title: format!("Change to `{replacement}`"),
-            kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: Some(vec![diagnostic.clone()]),
-            edit: Some(workspace_edit_changes(
-                uri,
-                vec![TextEdit {
-                    range: diagnostic.range,
-                    new_text: replacement.to_string(),
-                }],
-            )),
-            is_preferred: Some(true),
-            ..CodeAction::default()
-        });
-    }
-
-    /// Four "Create class/interface/enum/record `name`" actions, each writing a
-    /// stub file under the source root of the file's own package. Only offered
-    /// when the client supports the `CreateFile` resource operation.
-    fn create_type_actions(
-        &self,
-        uri: &Url,
-        document: &ParsedDocument,
-        diagnostic: &Diagnostic,
-        name: &str,
-        actions: &mut Vec<CodeAction>,
-    ) {
-        if !self.resource_operations.load(Ordering::Relaxed) || !is_java_identifier(name) {
-            return;
-        }
-        let package = types::file_package(&document.tree, &document.text);
-        let Some(new_file) = self.new_type_file_uri(uri, package.as_deref(), name) else {
-            return;
-        };
-        for kind in ["class", "interface", "enum", "record"] {
-            let contents = stub_type_source(package.as_deref(), kind, name);
-            let operations = vec![
-                DocumentChangeOperation::Op(ResourceOp::Create(CreateFile {
-                    uri: new_file.clone(),
-                    options: Some(CreateFileOptions {
-                        overwrite: None,
-                        ignore_if_exists: Some(true),
-                    }),
-                    annotation_id: None,
-                })),
-                DocumentChangeOperation::Edit(TextDocumentEdit {
-                    text_document: OptionalVersionedTextDocumentIdentifier {
-                        uri: new_file.clone(),
-                        version: None,
-                    },
-                    edits: vec![OneOf::Left(TextEdit {
-                        range: Range::new(Position::new(0, 0), Position::new(0, 0)),
-                        new_text: contents,
-                    })],
-                }),
-            ];
-            actions.push(CodeAction {
-                title: format!("Create {kind} `{name}`"),
-                kind: Some(CodeActionKind::QUICKFIX),
-                diagnostics: Some(vec![diagnostic.clone()]),
-                edit: Some(WorkspaceEdit {
-                    changes: None,
-                    document_changes: Some(DocumentChanges::Operations(operations)),
-                    change_annotations: None,
-                }),
-                is_preferred: Some(kind == "class"),
-                ..CodeAction::default()
-            });
-        }
-    }
-
-    /// Create-stub actions for a bare identifier: a method when it is called
-    /// unqualified, else a local variable (preferred) and a field, with the
-    /// signature inferred from the usage.
-    fn create_symbol_actions(
-        &self,
-        uri: &Url,
-        document: &ParsedDocument,
-        diagnostic: &Diagnostic,
-        name: &str,
-        model: &dyn TypeLookup,
-        actions: &mut Vec<CodeAction>,
-    ) {
-        if !is_java_identifier(name) {
-            return;
-        }
-        let Some(node) = node_at(&document.tree, &document.text, diagnostic.range) else {
-            return;
-        };
-        let text = &document.text;
-        let scope = types::scope_at(node, text, &document.tree, model);
-        // An unqualified call name becomes a method on the enclosing type.
-        let call = node.parent().filter(|parent| {
-            parent.kind() == "method_invocation"
-                && parent.child_by_field_name("object").is_none()
-                && parent
-                    .child_by_field_name("name")
-                    .is_some_and(|named| named.id() == node.id())
-        });
-        if let Some(call) = call {
-            let Some(body) = enclosing_type_body(&document.tree, node.start_byte()) else {
-                return;
-            };
-            let params = parameter_list(call, text, &scope, model);
-            let ret = return_type(call, text, &scope, model);
-            let stub = format!(
-                "    public {ret} {name}({}) {{\n    }}\n",
-                params.join(", ")
-            );
-            push_body_insert(
-                uri,
-                text,
-                diagnostic,
-                body,
-                stub,
-                format!("Create method `{name}`"),
-                actions,
-            );
-            return;
-        }
-        // A value use becomes a local variable (preferred) and a field.
-        let ty = value_type(node, text, &scope, model);
-        if let Some(block) = enclosing_block(node).filter(|_| enclosing_method(node).is_some()) {
-            let position = lsp_position(text, block.start_byte() + 1);
-            let edit = TextEdit {
-                range: Range::new(position, position),
-                new_text: format!("\n    {ty} {name};"),
-            };
-            actions.push(CodeAction {
-                title: format!("Create local variable `{name}`"),
-                kind: Some(CodeActionKind::QUICKFIX),
-                diagnostics: Some(vec![diagnostic.clone()]),
-                edit: Some(workspace_edit_changes(uri, vec![edit])),
-                is_preferred: Some(true),
-                ..CodeAction::default()
-            });
-        }
-        if let Some(body) = enclosing_type_body(&document.tree, node.start_byte()) {
-            push_body_insert(
-                uri,
-                text,
-                diagnostic,
-                body,
-                format!("    private {ty} {name};\n"),
-                format!("Create field `{name}`"),
-                actions,
-            );
-        }
-    }
-
-    /// A "Create method/field `name` in `T`" action for an unresolved member on
-    /// a workspace receiver: the stub is inserted into `T`'s file (the open
-    /// buffer when it is the current document, else read from disk) with the
-    /// signature inferred from the call site.
-    #[allow(clippy::too_many_arguments)]
-    fn create_receiver_member_action(
-        &self,
-        uri: &Url,
-        document: &ParsedDocument,
-        diagnostic: &Diagnostic,
-        name: &str,
-        fix: &serde_json::Value,
-        model: &dyn TypeLookup,
-        actions: &mut Vec<CodeAction>,
-    ) {
-        let Some(owner) = fix.get("owner").and_then(|value| value.as_str()) else {
-            return;
-        };
-        if !is_java_identifier(name) {
-            return;
-        }
-        let kind = fix
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .unwrap_or("method");
-        let simple = owner.rsplit('.').next().unwrap_or(owner);
-        let Some(entry) = self
-            .index
-            .query_name(simple)
-            .into_iter()
-            .find(|entry| !entry.dependency && import_target(entry).as_deref() == Some(owner))
-        else {
-            return;
-        };
-        let owner_uri = entry.uri.clone();
-        let owner_text = if &owner_uri == uri {
-            document.text.clone()
-        } else {
-            match owner_uri
-                .to_file_path()
-                .ok()
-                .and_then(|path| std::fs::read_to_string(path).ok())
-            {
-                Some(text) => text,
-                None => return,
-            }
-        };
-        // A fresh parser, so the shared parser lock is never taken while the
-        // documents lock is held (which would risk a lock-order deadlock).
-        let mut parser = java_parser();
-        let Some(tree) = parser.parse(owner_text.as_bytes(), None) else {
-            return;
-        };
-        let Some(body) = type_body_by_name(&tree, &owner_text, simple) else {
-            return;
-        };
-        // The signature comes from the call site in the current buffer.
-        let Some(node) = node_at(&document.tree, &document.text, diagnostic.range) else {
-            return;
-        };
-        let call_scope = types::scope_at(node, &document.text, &document.tree, model);
-        let stub = if kind == "method" {
-            let call = node
-                .parent()
-                .filter(|parent| parent.kind() == "method_invocation");
-            let params = call
-                .map(|call| parameter_list(call, &document.text, &call_scope, model))
-                .unwrap_or_default();
-            let ret = call
-                .map(|call| return_type(call, &document.text, &call_scope, model))
-                .unwrap_or_else(|| "void".to_string());
-            format!(
-                "    public {ret} {name}({}) {{\n    }}\n",
-                params.join(", ")
-            )
-        } else {
-            format!("    private Object {name};\n")
-        };
-        let close = lsp_position(&owner_text, body.end_byte().saturating_sub(1));
-        let edit = TextEdit {
-            range: Range::new(Position::new(close.line, 0), Position::new(close.line, 0)),
-            new_text: stub,
-        };
-        actions.push(CodeAction {
-            title: format!("Create {kind} `{name}` in `{simple}`"),
-            kind: Some(CodeActionKind::QUICKFIX),
-            diagnostics: Some(vec![diagnostic.clone()]),
-            edit: Some(workspace_edit_changes(&owner_uri, vec![edit])),
-            is_preferred: Some(true),
-            ..CodeAction::default()
-        });
-    }
-
-    /// The URI for a new `name.java`: under the deepest source root containing
-    /// the file, in the file's package, else beside the file.
-    fn new_type_file_uri(&self, uri: &Url, package: Option<&str>, name: &str) -> Option<Url> {
-        let path = uri.to_file_path().ok()?;
-        let base = self
-            .index
-            .source_roots()
-            .into_iter()
-            .filter(|root| path.starts_with(root))
-            .max_by_key(|root| root.components().count())
-            .or_else(|| path.parent().map(std::path::Path::to_path_buf))?;
-        let mut target = base;
-        if let Some(package) = package {
-            for segment in package.split('.') {
-                target.push(segment);
-            }
-        }
-        target.push(format!("{name}.java"));
-        Url::from_file_path(target).ok()
+        let overlay = self.type_layers();
+        crate::quickfix::QuickFix::new(
+            uri,
+            &document.tree,
+            &document.text,
+            &self.index,
+            &overlay,
+            self.resource_operations.load(Ordering::Relaxed),
+        )
+        .actions(diagnostics)
     }
 
     pub fn hover(&self, uri: &Url, position: Position) -> Option<Hover> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let text = &document.text;
         let offset = byte_offset(text, position);
         let node = document
@@ -1151,11 +1109,11 @@ impl TreeSitterEngine {
             .root_node()
             .descendant_for_byte_range(offset, offset)?;
         let node = cursor_node(&document.tree, node, text, offset);
-        let local = local_model(document);
+        let overlay = self.type_layers();
         let workspace = self.index.type_model();
-        let empty = TypeModel::new();
+        let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let value = hover_value(node, text, &document.tree, &query)?;
         Some(Hover {
             contents: HoverContents::Markup(MarkupContent {
@@ -1167,8 +1125,7 @@ impl TreeSitterEngine {
     }
 
     pub fn definition(&self, uri: &Url, position: Position) -> Option<Location> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let text = &document.text;
         let offset = byte_offset(text, position);
         let word = word_at(text, offset);
@@ -1196,7 +1153,7 @@ impl TreeSitterEngine {
                 if simple.is_empty() || simple == "*" {
                     return None;
                 }
-                let candidates: Vec<SymbolEntry> = self
+                let candidates: Vec<Arc<SymbolEntry>> = self
                     .index
                     .query_name(simple)
                     .into_iter()
@@ -1214,9 +1171,18 @@ impl TreeSitterEngine {
             ancestor = current.parent();
         }
 
+        // `new T(...)`: the created type's constructor declaration is the target
+        // when the type is a workspace source; otherwise the plain lookup below
+        // falls back to the type itself.
+        if let Some(creation) = enclosing_creation_type(&node) {
+            if let Some(location) = self.constructor_definition(uri, &document, &creation) {
+                return Some(location);
+            }
+        }
+
         // Plain identifier: exact-name lookup, narrowed by what the node kind
         // at the cursor says about the name, never an `Import` entry.
-        let candidates: Vec<SymbolEntry> = self
+        let candidates: Vec<Arc<SymbolEntry>> = self
             .index
             .query_name(word)
             .into_iter()
@@ -1224,15 +1190,16 @@ impl TreeSitterEngine {
             .filter(|entry| entry.kind != IndexKind::Import)
             .filter(|entry| match name_constraint(&node) {
                 NameConstraint::Type => is_type_kind(entry.kind),
-                NameConstraint::Member => {
-                    matches!(entry.kind, IndexKind::Method | IndexKind::Field)
-                }
+                NameConstraint::Member => matches!(
+                    entry.kind,
+                    IndexKind::Method | IndexKind::Field | IndexKind::EnumConstant
+                ),
                 NameConstraint::Any => true,
             })
             .collect();
         // A member call: the receiver's declaring type and the call's argument
         // types select the overload, so `x.add(1)` lands on `add(int)`.
-        if let Some(location) = self.call_definition(uri, document, &node, word) {
+        if let Some(location) = self.call_definition(uri, &document, &node, word) {
             return Some(location);
         }
         unique_location(candidates)
@@ -1257,11 +1224,11 @@ impl TreeSitterEngine {
         {
             return None;
         }
-        let local = local_model(document);
+        let overlay = self.type_layers();
         let workspace = self.index.type_model();
-        let empty = TypeModel::new();
+        let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let scope = types::scope_at(*node, text, &document.tree, &query);
         let receiver = match parent.child_by_field_name("object") {
             Some(object) => types::receiver_type(&object, text, &scope, &query),
@@ -1276,7 +1243,7 @@ impl TreeSitterEngine {
         let member =
             types::member_for_arguments(&receiver, name, &args, &query, scope.package.as_deref())?;
         let params: Vec<Ty> = member.params.iter().map(|param| param.ty.clone()).collect();
-        let candidates: Vec<SymbolEntry> = self
+        let candidates: Vec<Arc<SymbolEntry>> = self
             .index
             .query_name(name)
             .into_iter()
@@ -1284,10 +1251,66 @@ impl TreeSitterEngine {
             .filter(|entry| entry.kind == IndexKind::Method)
             .filter(|entry| {
                 entry.container.last().map(String::as_str) == Some(owner.name.as_str())
-                    && entry.package == owner.package
+                    && entry.package.as_deref() == owner.package.as_deref()
             })
             .collect();
-        self.match_declaration(&candidates, &params, uri, document)
+        // A Lombok-generated accessor has no declaration of its own: its single
+        // synthetic entry is anchored at the field, so land there.
+        if let [only] = candidates.as_slice() {
+            if only.synthetic {
+                return Some(Location {
+                    uri: (*only.uri).clone(),
+                    range: only.selection_range,
+                });
+            }
+        }
+        let mut parser = java_parser();
+        self.match_declaration(&mut parser, &candidates, &params, uri, document)
+            .map(|(_, location)| location)
+    }
+
+    /// The declaration a `new T(...)` targets: the created type's constructor,
+    /// selected by the call's argument types, located through the same
+    /// `match_declaration` path `call_definition` uses. `None` when the type is a
+    /// library/unresolved or has no source constructor declaration (an implicit
+    /// constructor), so `definition` falls back to the type.
+    fn constructor_definition(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        creation: &Node,
+    ) -> Option<Location> {
+        let text = &document.text;
+        let overlay = self.type_layers();
+        let workspace = self.index.type_model();
+        let empty = SourceLayerIndex::default();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &overlay);
+        let scope = types::scope_at(*creation, text, &document.tree, &query);
+        let ty = creation
+            .child_by_field_name("type")
+            .map(|ty| types::type_from_node(&ty, text))?;
+        let owner = query.lookup(&ty, scope.package.as_deref())?;
+        if !declared_in_workspace(&owner.name, owner.package.as_deref(), &self.index) {
+            return None;
+        }
+        let args = call_argument_types(creation, text, &scope, &query);
+        let member =
+            types::constructor_for_arguments(&ty, &args, &query, scope.package.as_deref())?;
+        let params: Vec<Ty> = member.params.iter().map(|param| param.ty.clone()).collect();
+        let candidates: Vec<Arc<SymbolEntry>> = self
+            .index
+            .query_name(&owner.name)
+            .into_iter()
+            .filter(|entry| !entry.dependency || entry.library_source)
+            .filter(|entry| entry.kind == IndexKind::Method)
+            .filter(|entry| {
+                entry.container.last().map(String::as_str) == Some(owner.name.as_str())
+                    && entry.package.as_deref() == owner.package.as_deref()
+            })
+            .collect();
+        let mut parser = java_parser();
+        self.match_declaration(&mut parser, &candidates, &params, uri, document)
             .map(|(_, location)| location)
     }
 
@@ -1314,11 +1337,211 @@ impl TreeSitterEngine {
         locations
     }
 
+    /// The implementations of the contract under the cursor: for a type, every
+    /// workspace type that implements or extends it; for a member, every
+    /// workspace subtype that overrides it. Empty when the cursor names no such
+    /// contract or nothing in the workspace implements it.
+    pub fn implementation(&self, uri: &Url, position: Position) -> Vec<Location> {
+        let Some(document) = self.snapshot(uri) else {
+            return Vec::new();
+        };
+        let offset = byte_offset(&document.text, position);
+        let Some(contract) = self.implementation_contract(uri, &document, offset) else {
+            return Vec::new();
+        };
+        let overlay = self.type_layers();
+        let workspace = self.index.type_model();
+        let empty = SourceLayerIndex::default();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &overlay);
+        let root = contract.root_name();
+        let mut locations: Vec<Location> = Vec::new();
+        for info in overlay.types() {
+            // The contract's own type is not its own implementation.
+            if contract.is_own_type(&info.name, info.package.as_deref()) {
+                continue;
+            }
+            let ty = Ty::reference(info.name.clone());
+            if !types::is_subtype_of(&ty, root, &query, info.package.as_deref()) {
+                continue;
+            }
+            match &contract {
+                Contract::Type { .. } => {
+                    if let Some(entry) =
+                        workspace_type_entry(&info.name, info.package.as_deref(), &self.index)
+                    {
+                        locations.push(Location {
+                            uri: (*entry.uri).clone(),
+                            range: entry.selection_range,
+                        });
+                    }
+                }
+                Contract::Method { name, params, .. } => {
+                    if let Some(location) =
+                        self.override_location(uri, &document, name, params.as_deref(), info)
+                    {
+                        locations.push(location);
+                    }
+                }
+            }
+        }
+        locations.sort_by(|a, b| {
+            a.uri
+                .as_str()
+                .cmp(b.uri.as_str())
+                .then_with(|| a.range.start.line.cmp(&b.range.start.line))
+                .then_with(|| a.range.start.character.cmp(&b.range.start.character))
+        });
+        locations.dedup();
+        locations
+    }
+
+    /// The contract a go-to-implementation cursor names — a type, or a member of
+    /// a type — resolved the way `definition` resolves its target, or `None` for
+    /// a cursor that names no such contract.
+    fn implementation_contract(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        offset: usize,
+    ) -> Option<Contract> {
+        if let Some(target) = self.resolve_target(uri, document, offset) {
+            return match target.kind {
+                TargetKind::Type => Some(Contract::Type {
+                    name: target.name,
+                    package: target.package,
+                }),
+                TargetKind::Method => Some(Contract::Method {
+                    owner: target.owner?,
+                    owner_package: target.package,
+                    name: target.name,
+                    params: target.overload,
+                }),
+                TargetKind::Field | TargetKind::Constructor | TargetKind::Local => None,
+            };
+        }
+        // `resolve_target` refuses a library/JDK owner; resolve the same cursor
+        // through the model instead, which carries jar and JDK types.
+        self.library_contract(document, offset)
+    }
+
+    /// The contract a cursor names when its owner is a library/JDK type: a
+    /// member call on a library receiver, or a type position naming a library
+    /// type. `None` for any other cursor.
+    fn library_contract(&self, document: &ParsedDocument, offset: usize) -> Option<Contract> {
+        let text = &document.text;
+        let tree = &document.tree;
+        let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+        let node = cursor_node(tree, node, text, offset);
+        let overlay = self.type_layers();
+        let workspace = self.index.type_model();
+        let empty = SourceLayerIndex::default();
+        let base = workspace.as_deref().unwrap_or(&empty);
+        let query = TypeQuery::new(base, &overlay);
+        let scope = types::scope_at(node, text, tree, &query);
+        let name = word_at(text, offset);
+        if name.is_empty() {
+            return None;
+        }
+        // A member call on a library receiver: the receiver's type names the
+        // owner, and the call's arguments select the overload.
+        if let Some(parent) = node.parent() {
+            if parent.kind() == "method_invocation"
+                && parent
+                    .child_by_field_name("name")
+                    .is_some_and(|named| named.id() == node.id())
+            {
+                let receiver = match parent.child_by_field_name("object") {
+                    Some(object) => types::receiver_type(&object, text, &scope, &query),
+                    None => scope
+                        .enclosing_type
+                        .clone()
+                        .map(Ty::reference)
+                        .unwrap_or(Ty::Unknown),
+                };
+                let owner = types::member_owner(&receiver, name, &query, scope.package.as_deref())?;
+                let args = call_argument_types(&parent, text, &scope, &query);
+                let params = types::member_for_arguments(
+                    &receiver,
+                    name,
+                    &args,
+                    &query,
+                    scope.package.as_deref(),
+                )
+                .map(|member| member.params.iter().map(|param| param.ty.clone()).collect());
+                return Some(Contract::Method {
+                    owner: owner.name,
+                    owner_package: owner.package,
+                    name: name.to_string(),
+                    params,
+                });
+            }
+        }
+        // A type position naming a library type.
+        if is_type_node(node.kind()) {
+            let ty = types::type_from_node(&node, text);
+            let info = query.lookup(&ty, scope.package.as_deref())?;
+            return Some(Contract::Type {
+                name: info.name.clone(),
+                package: info.package.clone(),
+            });
+        }
+        None
+    }
+
+    /// The declaration of `info`'s override of the method `name`, when `info`
+    /// declares one whose parameters match `contract_params` (any parameters,
+    /// when the contract overload could not be pinned down).
+    fn override_location(
+        &self,
+        uri: &Url,
+        document: &ParsedDocument,
+        name: &str,
+        contract_params: Option<&[Ty]>,
+        info: &TypeInfo,
+    ) -> Option<Location> {
+        let member = info.methods.iter().find(|member| {
+            member.name == name
+                && contract_params.is_none_or(|contract| {
+                    member
+                        .params
+                        .iter()
+                        .map(|param| param.ty.clone())
+                        .collect::<Vec<Ty>>()
+                        == contract
+                })
+        })?;
+        let params: Vec<Ty> = member.params.iter().map(|param| param.ty.clone()).collect();
+        let candidates = member_declarations(
+            name,
+            &[IndexKind::Method],
+            &info.name,
+            info.package.as_deref(),
+            &self.index,
+        );
+        if let [only] = candidates.as_slice() {
+            return Some(Location {
+                uri: (*only.uri).clone(),
+                range: only.selection_range,
+            });
+        }
+        let mut parser = java_parser();
+        self.match_declaration(&mut parser, &candidates, &params, uri, document)
+            .map(|(_, location)| location)
+    }
+
     pub fn rename(&self, uri: &Url, position: Position, new_name: &str) -> Option<WorkspaceEdit> {
         if !is_valid_identifier(new_name) {
             return None;
         }
         let (mut target, text) = self.name_target(uri, position)?;
+        // A constructor's name is its type's; there is no declaration of its own
+        // to rewrite. A Lombok-generated member likewise has none.
+        if matches!(target.kind, TargetKind::Constructor)
+            || target.declarations.iter().any(|entry| entry.synthetic)
+        {
+            return None;
+        }
         // Rename stays name-group-wide: it renames every overload of the name,
         // never a single overload (which could leave a call site behind).
         target.overload = None;
@@ -1352,16 +1575,18 @@ impl TreeSitterEngine {
             .query_prefix(query)
             .into_iter()
             .filter(|entry| !entry.dependency)
+            .filter(|entry| !is_constructor_entry(entry))
+            .filter(|entry| !entry.synthetic)
             .filter_map(|entry| {
                 let kind = symbol_kind(entry.kind)?;
                 Some(SymbolInformation {
-                    name: entry.name,
+                    name: entry.name.clone(),
                     kind,
                     tags: None,
                     #[allow(deprecated)]
                     deprecated: None,
                     location: Location {
-                        uri: entry.uri,
+                        uri: (*entry.uri).clone(),
                         range: entry.selection_range,
                     },
                     container_name: entry.container.last().cloned(),
@@ -1371,8 +1596,7 @@ impl TreeSitterEngine {
     }
 
     pub fn completions(&self, uri: &Url, position: Position) -> Option<CompletionResponse> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let offset = byte_offset(&document.text, position);
         let prefix = word_prefix(&document.text, offset);
         let before_prefix = offset - prefix.len();
@@ -1381,7 +1605,7 @@ impl TreeSitterEngine {
             // membership; an uninferrable receiver yields an empty list, never
             // a guess at what might be there.
             return Some(CompletionResponse::Array(
-                self.member_items(document, offset, prefix),
+                self.member_items(&document, offset, prefix),
             ));
         }
         if prefix.is_empty() {
@@ -1449,22 +1673,30 @@ impl TreeSitterEngine {
         let imports = collect_imports(&document.tree.root_node(), &document.text);
         let entries = self.index.query_prefix(prefix);
         let ambiguous = ambiguous_names(&entries);
-        // A type model layered with the open buffer, so a method's overloads
-        // reflect unsaved edits.
-        let local = local_model(document);
+        // A type model layered with every open buffer, so a method's overloads
+        // reflect unsaved edits — including edits to other files.
+        let overlay = self.type_layers();
         let workspace = self.index.type_model();
-        let empty = TypeModel::new();
+        let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         for entry in entries {
+            // A constructor is not a callable member, and a Lombok-generated
+            // member has no declaration of its own; both stay out of ordinary
+            // completion (`.`-completion reads the model).
+            if is_constructor_entry(&entry) || entry.synthetic {
+                continue;
+            }
             let Some(kind) = completion_kind(entry.kind) else {
                 continue;
             };
             let name = entry.name.clone();
             let sort_text = format!("2{name}");
             let container = entry.container.join(".");
-            let base_detail = if matches!(entry.kind, IndexKind::Method | IndexKind::Field)
-                && !container.is_empty()
+            let base_detail = if matches!(
+                entry.kind,
+                IndexKind::Method | IndexKind::Field | IndexKind::EnumConstant
+            ) && !container.is_empty()
             {
                 format!("{} of {container}", kind_word(entry.kind))
             } else {
@@ -1510,8 +1742,10 @@ impl TreeSitterEngine {
                     continue;
                 }
             }
-            let label = if matches!(entry.kind, IndexKind::Method | IndexKind::Field)
-                && !container.is_empty()
+            let label = if matches!(
+                entry.kind,
+                IndexKind::Method | IndexKind::Field | IndexKind::EnumConstant
+            ) && !container.is_empty()
             {
                 format!("{container}.{name}")
             } else {
@@ -1541,16 +1775,14 @@ impl TreeSitterEngine {
     }
 
     pub fn document_symbols(&self, uri: &Url) -> Option<Vec<DocumentSymbol>> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let mut symbols = Vec::new();
         collect_symbols(&document.tree.root_node(), &document.text, &mut symbols);
         Some(symbols)
     }
 
     pub fn folding_ranges(&self, uri: &Url) -> Option<Vec<FoldingRange>> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let mut ranges = Vec::new();
         let mut seen = HashSet::new();
         collect_folds(
@@ -1563,8 +1795,7 @@ impl TreeSitterEngine {
     }
 
     pub fn semantic_tokens(&self, uri: &Url) -> Option<SemanticTokens> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let mut raw = Vec::new();
         collect_tokens(&document.tree.root_node(), &document.text, &mut raw);
         raw.sort_by_key(|token| token.start_byte);
@@ -1596,10 +1827,7 @@ impl TreeSitterEngine {
     }
 
     pub fn inlay_hints(&self, uri: &Url, range: Range) -> Vec<InlayHint> {
-        let Ok(documents) = self.documents.lock() else {
-            return Vec::new();
-        };
-        let Some(document) = documents.get(uri) else {
+        let Some(document) = self.snapshot(uri) else {
             return Vec::new();
         };
         let text = &document.text;
@@ -1608,11 +1836,11 @@ impl TreeSitterEngine {
         if end <= start {
             return Vec::new();
         }
-        let local = local_model(document);
+        let overlay = self.type_layers();
         let workspace = self.index.type_model();
-        let empty = TypeModel::new();
+        let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
+        let query = TypeQuery::new(base, &overlay);
         let mut hints = Vec::new();
         collect_inlay_hints(
             document.tree.root_node(),
@@ -1633,60 +1861,86 @@ impl TreeSitterEngine {
 
     /// Signature help for the call the cursor sits in: the callee's overloads
     /// rendered with their declared parameters, and the active parameter taken
-    /// from the cursor's position among the arguments. `None` when there is no
-    /// enclosing call or the callee cannot be resolved; constructors are not
-    /// modelled, so `new T(...)` answers nothing.
+    /// from the cursor's position among the arguments. A `new T(...)` answers
+    /// with the created type's constructor overloads. `None` when there is no
+    /// enclosing call or the callee cannot be resolved.
     pub fn signature_help(&self, uri: &Url, position: Position) -> Option<SignatureHelp> {
-        let documents = self.documents.lock().ok()?;
-        let document = documents.get(uri)?;
+        let document = self.snapshot(uri)?;
         let text = &document.text;
         let offset = byte_offset(text, position);
-        let call = enclosing_call(&document.tree, offset)?;
-        let name_node = call.child_by_field_name("name")?;
-        let name = &text[name_node.byte_range()];
 
-        let local = local_model(document);
+        let overlay = self.type_layers();
         let workspace = self.index.type_model();
-        let empty = TypeModel::new();
+        let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
-        let query = TypeQuery::new(base, &local);
-        let scope = types::scope_at(name_node, text, &document.tree, &query);
+        let query = TypeQuery::new(base, &overlay);
 
-        let (receiver, static_only) = match call.child_by_field_name("object") {
-            Some(object) => {
-                let static_only = matches!(object.kind(), "identifier" | "type_identifier")
-                    && types::resolve_name(&text[object.byte_range()], &scope, &query)
-                        .map(|resolved| resolved.is_type)
-                        .unwrap_or(false);
-                (
-                    types::receiver_type(&object, text, &scope, &query),
-                    static_only,
-                )
+        // A method call: the callee's overloads, its name resolved through the
+        // receiver's type.
+        if let Some(call) = enclosing_call(&document.tree, offset) {
+            let name_node = call.child_by_field_name("name")?;
+            let name = &text[name_node.byte_range()];
+            let scope = types::scope_at(name_node, text, &document.tree, &query);
+            let (receiver, static_only) = match call.child_by_field_name("object") {
+                Some(object) => {
+                    let static_only = matches!(object.kind(), "identifier" | "type_identifier")
+                        && types::resolve_name(&text[object.byte_range()], &scope, &query)
+                            .map(|resolved| resolved.is_type)
+                            .unwrap_or(false);
+                    (
+                        types::receiver_type(&object, text, &scope, &query),
+                        static_only,
+                    )
+                }
+                None => (
+                    scope
+                        .enclosing_type
+                        .clone()
+                        .map(Ty::reference)
+                        .unwrap_or(Ty::Unknown),
+                    false,
+                ),
+            };
+            let overloads: Vec<Member> = query
+                .members_with_overloads(&receiver, scope.package.as_deref())
+                .into_iter()
+                .filter(|member| member.kind == IndexKind::Method && member.name == name)
+                .filter(|member| !static_only || member.is_static)
+                .collect();
+            if overloads.is_empty() {
+                return None;
             }
-            None => (
-                scope
-                    .enclosing_type
-                    .clone()
-                    .map(Ty::reference)
-                    .unwrap_or(Ty::Unknown),
-                false,
-            ),
-        };
+            let active = active_parameter(call, offset);
+            let signatures = overloads
+                .iter()
+                .map(|member| SignatureInformation {
+                    label: member.signature(),
+                    documentation: None,
+                    parameters: None,
+                    active_parameter: Some(active),
+                })
+                .collect();
+            return Some(SignatureHelp {
+                signatures,
+                active_signature: Some(0),
+                active_parameter: None,
+            });
+        }
 
-        let overloads: Vec<Member> = query
-            .members_with_overloads(&receiver, scope.package.as_deref())
-            .into_iter()
-            .filter(|member| member.kind == IndexKind::Method && member.name == name)
-            .filter(|member| !static_only || member.is_static)
-            .collect();
-        if overloads.is_empty() {
+        // A `new T(...)`: the created type's constructor overloads.
+        let creation = enclosing_object_creation(&document.tree, offset)?;
+        let type_node = creation.child_by_field_name("type")?;
+        let ty = types::type_from_node(&type_node, text);
+        let scope = types::scope_at(type_node, text, &document.tree, &query);
+        let constructors = query.constructors(&ty, scope.package.as_deref());
+        if constructors.is_empty() {
             return None;
         }
-        let active = active_parameter(call, offset);
-        let signatures = overloads
+        let active = active_parameter(creation, offset);
+        let signatures = constructors
             .iter()
-            .map(|member| SignatureInformation {
-                label: member.signature(),
+            .map(|ctor| SignatureInformation {
+                label: ctor.constructor_signature(),
                 documentation: None,
                 parameters: None,
                 active_parameter: Some(active),
@@ -1703,23 +1957,11 @@ impl TreeSitterEngine {
         if let Ok(mut slot) = self.workspace_root.lock() {
             *slot = Some(root.clone());
         }
-        let index = self.index.clone();
-        let root = root.clone();
-        let reporter = self
-            .reporter
-            .lock()
-            .map(|reporter| reporter.clone())
-            .unwrap_or_default();
-        // Off the request path: spawned onto the runtime when one is available
-        // (always true for the shell), inline otherwise. The runtime path also
-        // fetches dependency sources; without a runtime (tests) the sync core
-        // runs and the source pass is skipped.
-        match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                handle.spawn(scan_workspace_async(root, index, reporter));
-            }
-            Err(_) => scan_workspace(root, index),
-        }
+        // In the shell the engine hub drives the drivers from the root the
+        // filesystem driver announces; a unit test has no runtime and no hub, so
+        // it runs the same producers synchronously against the index.
+        #[cfg(test)]
+        crate::index::warm_up_sync(root, &self.index);
     }
 
     pub fn index_ready(&self) -> bool {
@@ -1764,6 +2006,9 @@ enum TargetKind {
     Method,
     Field,
     Local,
+    /// A constructor: its name is its type's, and its occurrences are
+    /// `new T(...)` sites rather than member accesses.
+    Constructor,
 }
 
 /// A resolved target: the symbol a request is about, and everything needed to
@@ -1779,7 +2024,7 @@ struct Target {
     /// The enclosing method's byte span, for a local or parameter.
     local_span: Option<(usize, usize)>,
     /// The index's declaration entries, for `include_declaration`.
-    declarations: Vec<SymbolEntry>,
+    declarations: Vec<Arc<SymbolEntry>>,
     /// A local's or parameter's own declaration, which the index does not hold.
     local_declaration: Option<Location>,
     /// For a method, the selected overload's parameter types, so occurrences are
@@ -1790,15 +2035,60 @@ struct Target {
     overload_declaration: Option<Location>,
 }
 
+/// What a go-to-implementation cursor names: a type, or a member of a type,
+/// whose workspace implementations are the answer.
+#[derive(Debug, Clone)]
+enum Contract {
+    Type {
+        name: String,
+        package: Option<String>,
+    },
+    Method {
+        owner: String,
+        owner_package: Option<String>,
+        name: String,
+        /// The selected overload's parameter types, or `None` when the name is
+        /// not overloaded (or the overload could not be pinned down), so an
+        /// override matches on the name alone.
+        params: Option<Vec<Ty>>,
+    },
+}
+
+impl Contract {
+    /// The simple name of the type whose subtypes are the implementations.
+    fn root_name(&self) -> &str {
+        match self {
+            Contract::Type { name, .. } => name,
+            Contract::Method { owner, .. } => owner,
+        }
+    }
+
+    /// Whether `(name, package)` is the contract's own type, which is not its
+    /// own implementation.
+    fn is_own_type(&self, name: &str, package: Option<&str>) -> bool {
+        match self {
+            Contract::Type {
+                name: own,
+                package: own_package,
+            } => name == own && package == own_package.as_deref(),
+            Contract::Method {
+                owner,
+                owner_package,
+                ..
+            } => name == owner && package == owner_package.as_deref(),
+        }
+    }
+}
+
 /// The workspace type declared with `name` in `package`, or `None` when it is a
 /// dependency (jar/JDK) or spread over several files — the ambiguity policy
 /// `definition` already applies.
 fn workspace_type_entry(
     name: &str,
     package: Option<&str>,
-    index: &WorkspaceIndex,
-) -> Option<SymbolEntry> {
-    let candidates: Vec<SymbolEntry> = index
+    index: &IndexHandle,
+) -> Option<Arc<SymbolEntry>> {
+    let candidates: Vec<Arc<SymbolEntry>> = index
         .query_name(name)
         .into_iter()
         .filter(|entry| !entry.dependency && is_type_kind(entry.kind))
@@ -1808,7 +2098,7 @@ fn workspace_type_entry(
 }
 
 /// True when a workspace source declares a type with this name in `package`.
-fn declared_in_workspace(name: &str, package: Option<&str>, index: &WorkspaceIndex) -> bool {
+fn declared_in_workspace(name: &str, package: Option<&str>, index: &IndexHandle) -> bool {
     index.query_name(name).into_iter().any(|entry| {
         !entry.dependency && is_type_kind(entry.kind) && entry.package.as_deref() == package
     })
@@ -1831,7 +2121,7 @@ fn preferred_type_package(scope: &types::Scope, name: &str) -> Option<String> {
         .or_else(|| scope.package.clone())
 }
 
-fn unique_entry(mut candidates: Vec<SymbolEntry>) -> Option<SymbolEntry> {
+fn unique_entry(mut candidates: Vec<Arc<SymbolEntry>>) -> Option<Arc<SymbolEntry>> {
     candidates.sort_by(|a, b| {
         a.uri
             .as_str()
@@ -1859,18 +2149,27 @@ fn unique_entry(mut candidates: Vec<SymbolEntry>) -> Option<SymbolEntry> {
 /// The index entries declaring `name` as a member of `owner` in `package`.
 fn member_declarations(
     name: &str,
-    kind: IndexKind,
+    kinds: &[IndexKind],
     owner: &str,
     package: Option<&str>,
-    index: &WorkspaceIndex,
-) -> Vec<SymbolEntry> {
+    index: &IndexHandle,
+) -> Vec<Arc<SymbolEntry>> {
     index
         .query_name(name)
         .into_iter()
-        .filter(|entry| !entry.dependency && entry.kind == kind)
+        .filter(|entry| !entry.dependency && kinds.contains(&entry.kind))
         .filter(|entry| entry.container.last().map(String::as_str) == Some(owner))
         .filter(|entry| entry.package.as_deref() == package)
         .collect()
+}
+
+/// True for an index entry that records a constructor. A source constructor is
+/// indexed as a `Method` entry named after its type, and a method can never
+/// share its class's name, so a method entry whose name equals its immediate
+/// container is a constructor.
+fn is_constructor_entry(entry: &SymbolEntry) -> bool {
+    entry.kind == IndexKind::Method
+        && entry.container.last().map(String::as_str) == Some(entry.name.as_str())
 }
 
 /// A declaration name under the cursor, resolved to its target.
@@ -1880,7 +2179,7 @@ fn declaration_target(
     parent: &Node,
     text: &str,
     package: Option<&str>,
-    index: &WorkspaceIndex,
+    index: &IndexHandle,
 ) -> Option<Target> {
     // Only the declaration's own name is a target; a sibling such as a
     // variable initializer or an enhanced-for iterable is not.
@@ -1902,7 +2201,7 @@ fn declaration_target(
                 name,
                 kind: TargetKind::Type,
                 owner: None,
-                package: entry.package.clone(),
+                package: entry.package.as_deref().map(str::to_string),
                 local_span: None,
                 declarations: vec![entry],
                 local_declaration: None,
@@ -1915,7 +2214,7 @@ fn declaration_target(
             let owner = enclosing_type_name(parent, text)?;
             workspace_type_entry(&owner, package, index)?;
             let declarations =
-                member_declarations(&name, IndexKind::Method, &owner, package, index);
+                member_declarations(&name, &[IndexKind::Method], &owner, package, index);
             // The declaration under the cursor is this specific overload.
             let range = lsp_range(text, &node);
             let (overload, overload_declaration) = if declarations.len() > 1 {
@@ -1927,7 +2226,7 @@ fn declaration_target(
                     .iter()
                     .find(|entry| entry.selection_range == range)
                     .map(|entry| Location {
-                        uri: entry.uri.clone(),
+                        uri: (*entry.uri).clone(),
                         range: entry.selection_range,
                     });
                 (Some(params), declaration)
@@ -1946,6 +2245,44 @@ fn declaration_target(
                 overload_declaration,
             })
         }
+        "constructor_declaration" => {
+            // A constructor is a `Method`-kind entry named after its type in the
+            // flat index, so its occurrences (`new T(...)`) attribute through a
+            // `Constructor` target that carries the type's name and package.
+            let name = text[node.byte_range()].to_string();
+            let owner = enclosing_type_name(parent, text)?;
+            workspace_type_entry(&owner, package, index)?;
+            let declarations =
+                member_declarations(&name, &[IndexKind::Method], &owner, package, index);
+            let range = lsp_range(text, &node);
+            let (overload, overload_declaration) = if declarations.len() > 1 {
+                let params: Vec<Ty> = types::parameter_list(parent, text)
+                    .into_iter()
+                    .map(|param| param.ty)
+                    .collect();
+                let declaration = declarations
+                    .iter()
+                    .find(|entry| entry.selection_range == range)
+                    .map(|entry| Location {
+                        uri: (*entry.uri).clone(),
+                        range: entry.selection_range,
+                    });
+                (Some(params), declaration)
+            } else {
+                (None, None)
+            };
+            Some(Target {
+                name,
+                kind: TargetKind::Constructor,
+                owner: Some(owner),
+                package: package.map(str::to_string),
+                local_span: None,
+                declarations,
+                local_declaration: None,
+                overload,
+                overload_declaration,
+            })
+        }
         "variable_declarator" => {
             let declaration = parent.parent()?;
             let name = text[node.byte_range()].to_string();
@@ -1954,7 +2291,7 @@ fn declaration_target(
                     let owner = enclosing_type_name(&declaration, text)?;
                     workspace_type_entry(&owner, package, index)?;
                     let declarations =
-                        member_declarations(&name, IndexKind::Field, &owner, package, index);
+                        member_declarations(&name, &[IndexKind::Field], &owner, package, index);
                     Some(Target {
                         name,
                         kind: TargetKind::Field,
@@ -1970,6 +2307,24 @@ fn declaration_target(
                 "local_variable_declaration" => local_target(uri, node, &name, text),
                 _ => None,
             }
+        }
+        "enum_constant" => {
+            let name = text[node.byte_range()].to_string();
+            let owner = enclosing_type_name(parent, text)?;
+            workspace_type_entry(&owner, package, index)?;
+            let declarations =
+                member_declarations(&name, &[IndexKind::EnumConstant], &owner, package, index);
+            Some(Target {
+                name,
+                kind: TargetKind::Field,
+                owner: Some(owner),
+                package: package.map(str::to_string),
+                local_span: None,
+                declarations,
+                local_declaration: None,
+                overload: None,
+                overload_declaration: None,
+            })
         }
         "formal_parameter" | "spread_parameter" | "enhanced_for_statement" => {
             let name = text[node.byte_range()].to_string();
@@ -2118,7 +2473,7 @@ fn type_visible_in(uri: &Url, target: &Target, text: &str, tree: &Tree) -> bool 
     let Some(entry) = target.declarations.first() else {
         return false;
     };
-    if entry.uri == *uri {
+    if entry.uri.as_ref() == uri {
         return true;
     }
     if types::file_package(tree, text) == target.package {
@@ -2245,14 +2600,18 @@ fn call_argument_types(
         .collect()
 }
 
-/// The parameter types of the `method_declaration` whose name sits at
-/// `selection` in `tree`, read from the declaration's own parameter list.
+/// The parameter types of the `method_declaration` or `constructor_declaration`
+/// whose name sits at `selection` in `tree`, read from the declaration's own
+/// parameter list.
 fn method_params_in(tree: &Tree, text: &str, selection: Range) -> Option<Vec<Ty>> {
     let offset = byte_offset(text, selection.start);
     let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
     let mut current = Some(node);
     while let Some(candidate) = current {
-        if candidate.kind() == "method_declaration" {
+        if matches!(
+            candidate.kind(),
+            "method_declaration" | "constructor_declaration"
+        ) {
             return Some(
                 types::parameter_list(&candidate, text)
                     .into_iter()
@@ -2331,6 +2690,64 @@ fn collect_member_nodes(
             &child, text, tree, target, model, package, owner_span, uri, out, seen,
         );
     }
+}
+
+/// Records every `object_creation_expression` whose created type resolves to the
+/// constructor target's owner, narrowed to the selected overload by the call's
+/// argument types. The `new T(...)` analog of `collect_member_nodes`.
+#[allow(clippy::too_many_arguments)]
+fn collect_creation_nodes(
+    node: &Node,
+    text: &str,
+    tree: &Tree,
+    target: &Target,
+    model: &dyn TypeLookup,
+    package: Option<&str>,
+    uri: &Url,
+    out: &mut Vec<Location>,
+    seen: &mut HashSet<(String, u32, u32)>,
+) {
+    if node.kind() == "object_creation_expression" {
+        if let Some(type_node) = node.child_by_field_name("type") {
+            let ty = types::type_from_node(&type_node, text);
+            if construction_matches(node, &ty, text, tree, model, package, target) {
+                push_location(&type_node, text, uri, out, seen);
+            }
+        }
+    }
+    let mut cursor = node.walk();
+    for child in node.named_children(&mut cursor) {
+        collect_creation_nodes(&child, text, tree, target, model, package, uri, out, seen);
+    }
+}
+
+/// Whether a `new T(...)` resolves to the target's declaring type, narrowed to
+/// the target's selected overload by the call's argument types.
+fn construction_matches(
+    node: &Node,
+    ty: &Ty,
+    text: &str,
+    tree: &Tree,
+    model: &dyn TypeLookup,
+    package: Option<&str>,
+    target: &Target,
+) -> bool {
+    let Some(owner) = model.lookup(ty, package) else {
+        return false;
+    };
+    if Some(owner.name.as_str()) != target.owner.as_deref() || owner.package != target.package {
+        return false;
+    }
+    let Some(params) = &target.overload else {
+        return true;
+    };
+    let scope = types::scope_at(*node, text, tree, model);
+    let actual = call_argument_types(node, text, &scope, model);
+    actual.len() == params.len()
+        && actual
+            .iter()
+            .zip(params)
+            .all(|(arg, param)| types::assignable(arg, param, model, package))
 }
 
 /// Whether `recv.name` resolves to the target's declaring type.
@@ -2441,7 +2858,7 @@ fn add_declarations(target: &Target, locations: &mut Vec<Location>) {
     }
     for entry in &target.declarations {
         add(Location {
-            uri: entry.uri.clone(),
+            uri: (*entry.uri).clone(),
             range: entry.selection_range,
         });
     }
@@ -2490,16 +2907,12 @@ fn is_type_node(kind: &str) -> bool {
     )
 }
 
-/// The declared-type model of one open document, to be layered over the
+/// The declared-type model of one parsed Java source, to be layered over the
 /// workspace model so unsaved edits are what features answer from.
-fn local_model(document: &ParsedDocument) -> TypeModel {
-    let package = types::file_package(&document.tree, &document.text);
+fn model_of(tree: &Tree, text: &str) -> TypeModel {
+    let package = types::file_package(tree, text);
     let mut model = TypeModel::new();
-    model.extend(types::collect_type_infos(
-        package.as_deref(),
-        &document.tree,
-        &document.text,
-    ));
+    model.extend(types::collect_type_infos(package.as_deref(), tree, text));
     model
 }
 
@@ -2590,10 +3003,10 @@ fn type_hover(ty: &Ty, model: &dyn TypeLookup, package: Option<&str>) -> Option<
 }
 
 fn member_hover(member: &Member, container: &Ty) -> String {
-    let kind = if member.kind == IndexKind::Method {
-        "method"
-    } else {
-        "field"
+    let kind = match member.kind {
+        IndexKind::Method => "method",
+        IndexKind::EnumConstant => "enum constant",
+        _ => "field",
     };
     let mut value = block(&member.signature());
     if matches!(container, Ty::Unknown) {
@@ -2696,6 +3109,44 @@ fn enclosing_call(tree: &Tree, offset: usize) -> Option<Node<'_>> {
     None
 }
 
+/// The innermost `new T(...)` whose argument list contains the cursor, the
+/// constructor analog of `enclosing_call`.
+fn enclosing_object_creation(tree: &Tree, offset: usize) -> Option<Node<'_>> {
+    let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
+    let mut current = Some(node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "object_creation_expression" {
+            if let Some(arguments) = candidate.child_by_field_name("arguments") {
+                if arguments.start_byte() <= offset && offset <= arguments.end_byte() {
+                    return Some(candidate);
+                }
+            }
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
+/// The `object_creation_expression` whose created `type` contains `node` (or is
+/// `node`), so a cursor on the constructed type — a plain `type_identifier` or a
+/// name inside a `generic_type` — is recognised, while one in the argument list
+/// is not.
+fn enclosing_creation_type<'a>(node: &Node<'a>) -> Option<Node<'a>> {
+    let mut current = Some(*node);
+    while let Some(candidate) = current {
+        if candidate.kind() == "object_creation_expression" {
+            return candidate
+                .child_by_field_name("type")
+                .filter(|ty| {
+                    ty.start_byte() <= node.start_byte() && node.end_byte() <= ty.end_byte()
+                })
+                .map(|_| candidate);
+        }
+        current = candidate.parent();
+    }
+    None
+}
+
 /// The index of the argument the cursor sits in: the number of argument nodes
 /// ending before the cursor, clamped to the last argument.
 fn active_parameter(call: Node, offset: usize) -> u32 {
@@ -2717,37 +3168,47 @@ fn active_parameter(call: Node, offset: usize) -> u32 {
     index.min(count.saturating_sub(1))
 }
 
+/// The receiver of the member access the `.` at `offset` introduces. The
+/// relevant dot is the one before the typed prefix — not necessarily before the
+/// cursor — so a partial name the parser reads as a type (`Greeter.Inn` in a
+/// declaration, `new Greeter.Inn`) still resolves its qualifier rather than the
+/// partial name itself.
 fn receiver_before_dot<'a>(tree: &'a Tree, text: &str, offset: usize) -> Option<Node<'a>> {
-    if offset == 0 {
+    let prefix = word_prefix(text, offset);
+    let dot = offset.checked_sub(prefix.len())?.checked_sub(1)?;
+    if text.as_bytes().get(dot) != Some(&b'.') {
         return None;
     }
-    let dot = tree
-        .root_node()
-        .descendant_for_byte_range(offset - 1, offset - 1)?;
-    let mut current = Some(dot);
-    while let Some(node) = current {
-        if matches!(node.kind(), "field_access" | "method_invocation") {
-            return node.child_by_field_name("object");
+    // A formed member access — the parser accepted the partial name as a value
+    // member — still names its receiver as the accessed object.
+    if let Some(node) = tree.root_node().descendant_for_byte_range(dot, dot) {
+        let mut current = Some(node);
+        while let Some(node) = current {
+            if matches!(node.kind(), "field_access" | "method_invocation") {
+                if let Some(object) = node.child_by_field_name("object") {
+                    if object.end_byte() == dot {
+                        return Some(object);
+                    }
+                }
+            }
+            current = node.parent();
         }
-        current = node.parent();
     }
-    receiver_before_dot_from_text(tree, text, offset)
+    receiver_before_dot_from_text(tree, text, dot)
 }
 
 /// Recovers the receiver of an incomplete `receiver.` from the source when the
-/// tree has not formed a member access. A dot at the end of a line can be
-/// absorbed into the following token — a `var` line makes the parser read
-/// `gson.var` as a scoped type identifier — so the receiver is taken as the
-/// outermost expression ending at the last non-whitespace byte before the dot.
-/// The node is a real node of the same tree, so callers can still locate its
+/// tree has not formed a member access, given the byte index of the dot. A dot
+/// at the end of a line can be absorbed into the following token — a `var` line
+/// makes the parser read `gson.var` as a scoped type identifier — so the receiver
+/// is the outermost expression ending at the last non-whitespace byte before the
+/// dot. The node is a real node of the same tree, so callers can still locate its
 /// enclosing scope.
-fn receiver_before_dot_from_text<'a>(
-    tree: &'a Tree,
-    text: &str,
-    offset: usize,
-) -> Option<Node<'a>> {
+fn receiver_before_dot_from_text<'a>(tree: &'a Tree, text: &str, dot: usize) -> Option<Node<'a>> {
     let bytes = text.as_bytes();
-    let mut end = offset.checked_sub(1)?;
+    // `end` is the receiver's exclusive end: the dot, backed up over any
+    // whitespace before it (`gson .` still resolves `gson`).
+    let mut end = dot;
     while end > 0 && bytes[end - 1].is_ascii_whitespace() {
         end -= 1;
     }
@@ -2838,6 +3299,7 @@ fn collect_inlay_hints(
             parameter_hints(&node, text, tree, model, out);
             chain_hint(&node, text, tree, model, out);
         }
+        "object_creation_expression" => constructor_parameter_hints(&node, text, tree, model, out),
         _ => {}
     }
     let mut cursor = node.walk();
@@ -2989,6 +3451,66 @@ fn parameter_hints(
     }
 }
 
+/// Parameter-name hints at a `new T(...)`: the constructed type's constructor is
+/// selected from the call's argument types (the confirmed overload only, so an
+/// unpinnable one yields no hint), and each argument is labelled with its
+/// parameter's name. A class-file constructor carries no parameter names, so it
+/// produces none.
+fn constructor_parameter_hints(
+    node: &Node,
+    text: &str,
+    tree: &Tree,
+    model: &dyn TypeLookup,
+    out: &mut Vec<InlayHint>,
+) {
+    let Some(type_node) = node.child_by_field_name("type") else {
+        return;
+    };
+    let Some(arguments) = node.child_by_field_name("arguments") else {
+        return;
+    };
+    let mut cursor = arguments.walk();
+    let call_arguments: Vec<Node> = arguments
+        .named_children(&mut cursor)
+        .filter(|child| !is_comment_node(child.kind()))
+        .collect();
+    let scope = types::scope_at(*node, text, tree, model);
+    let ty = types::type_from_node(&type_node, text);
+    let argument_types: Vec<Ty> = call_arguments
+        .iter()
+        .map(|argument| types::receiver_type(argument, text, &scope, model))
+        .collect();
+    let Some(ctor) = types::constructor_for_arguments_confirmed(
+        &ty,
+        &argument_types,
+        model,
+        scope.package.as_deref(),
+    ) else {
+        return;
+    };
+    if ctor.params.len() != call_arguments.len() {
+        return;
+    }
+    for (index, argument) in call_arguments.iter().enumerate() {
+        let Some(param) = ctor.params.get(index) else {
+            break;
+        };
+        let Some(param_name) = &param.name else {
+            continue;
+        };
+        out.push(InlayHint {
+            position: lsp_position(text, argument.start_byte()),
+            label: InlayHintLabel::String(format!("{param_name}:")),
+            kind: Some(InlayHintKind::PARAMETER),
+            tooltip: None,
+            text_edits: None,
+            padding_left: None,
+            padding_right: Some(true),
+            data: None,
+        });
+    }
+}
+
 /// The return type of each intermediate link in a chain: an invocation whose
 /// result is immediately dereferenced. The outermost call and a standalone call
 /// carry no such hint.
@@ -3057,586 +3579,9 @@ fn hint_label(hint: &InlayHint) -> &str {
     }
 }
 
-/// Marks a semantic diagnostic and the quick fix it carries; the code-action
-/// handler rebuilds the edit from the diagnostic's `data`.
-const CODE_UNRESOLVED_TYPE: &str = "unresolved-type";
-const CODE_UNRESOLVED_MEMBER: &str = "unresolved-member";
-const CODE_UNRESOLVED_SYMBOL: &str = "unresolved-symbol";
-const CODE_UNRESOLVED_IMPORT: &str = "unresolved-import";
-const FIX_ADD_IMPORT: &str = "add-import";
-const FIX_RENAME: &str = "rename";
-const FIX_CREATE_TYPE: &str = "create-type";
-const FIX_CREATE_SYMBOL: &str = "create-symbol";
-const FIX_CREATE_RECEIVER_MEMBER: &str = "create-receiver-member";
-
-/// Whether semantic diagnostics are enabled, from `JAVA_LSP_SEMANTIC_DIAGNOSTICS`:
-/// unset (or any value but `0`/`false`) keeps them on.
-fn semantic_diagnostics_enabled() -> bool {
-    semantic_diagnostics_setting(
-        std::env::var("JAVA_LSP_SEMANTIC_DIAGNOSTICS")
-            .ok()
-            .as_deref(),
-    )
-}
-
-/// The setting a `JAVA_LSP_SEMANTIC_DIAGNOSTICS` value denotes.
-fn semantic_diagnostics_setting(value: Option<&str>) -> bool {
-    match value {
-        Some(value) => !(value == "0" || value.eq_ignore_ascii_case("false")),
-        None => true,
-    }
-}
-
-/// Unresolved-symbol diagnostics for a document: type references, member
-/// accesses on a known receiver, bare identifiers, and import declarations, all
-/// at `ERROR` severity. Gated on the model actually vouching for `java.lang` and
-/// on the file parsing cleanly, so a missing JDK or a broken file never produces
-/// a wall of false positives.
-fn semantic_diagnostics(
-    document: &ParsedDocument,
-    uri: &Url,
-    index: &WorkspaceIndex,
-) -> Vec<Diagnostic> {
-    let Some(workspace) = index.type_model() else {
-        return Vec::new();
-    };
-    if !workspace.contains("Object") || !workspace.contains("String") {
-        return Vec::new();
-    }
-    let local = local_model(document);
-    let query = TypeQuery::new(&workspace, &local);
-    let mut check = SemanticCheck::new(uri, document, index, &query);
-    check.visit(document.tree.root_node());
-    check.out
-}
-
-/// The state of one diagnostics pass over an open document.
-struct SemanticCheck<'a> {
-    uri: &'a Url,
-    text: &'a str,
-    tree: &'a Tree,
-    index: &'a WorkspaceIndex,
-    model: &'a dyn TypeLookup,
-    imports: Vec<ExistingImport>,
-    package: Option<String>,
-    package_line: Option<u32>,
-    /// Every simple name bound anywhere in the file (locals, parameters,
-    /// fields, types, methods, lambda parameters, catch bindings, ...). A bare
-    /// identifier matching one of these is never reported: the scope collector
-    /// does not model every binding kind, and a false positive is worse than a
-    /// missed one.
-    declared_names: HashSet<String>,
-    out: Vec<Diagnostic>,
-}
-
-impl<'a> SemanticCheck<'a> {
-    fn new(
-        uri: &'a Url,
-        document: &'a ParsedDocument,
-        index: &'a WorkspaceIndex,
-        model: &'a dyn TypeLookup,
-    ) -> Self {
-        let root = document.tree.root_node();
-        let mut declared_names = HashSet::new();
-        collect_declared_names(root, &document.text, &mut declared_names);
-        Self {
-            uri,
-            text: &document.text,
-            tree: &document.tree,
-            index,
-            model,
-            imports: collect_imports(&root, &document.text),
-            package: types::file_package(&document.tree, &document.text),
-            package_line: package_line(&document.tree),
-            declared_names,
-            out: Vec::new(),
-        }
-    }
-
-    /// One pass over the tree, dispatching on the constructs that can carry an
-    /// unresolved symbol.
-    fn visit(&mut self, node: Node) {
-        match node.kind() {
-            "import_declaration" => self.check_import(node),
-            "object_creation_expression"
-            | "cast_expression"
-            | "field_declaration"
-            | "constant_declaration"
-            | "local_variable_declaration"
-            | "formal_parameter"
-            | "spread_parameter"
-            | "method_declaration"
-            | "enhanced_for_statement" => {
-                if let Some(ty) = node.child_by_field_name("type") {
-                    self.check_type(ty);
-                }
-            }
-            "superclass" => {
-                if let Some(ty) = node.named_child(0) {
-                    self.check_type(ty);
-                }
-            }
-            // An `implements`/`extends` clause wraps a `type_list`; checking the
-            // list's members is enough.
-            "type_list" => {
-                let mut cursor = node.walk();
-                let types: Vec<Node> = node.named_children(&mut cursor).collect();
-                for ty in types {
-                    self.check_type(ty);
-                }
-            }
-            "method_invocation" | "field_access" => self.check_member(node),
-            "identifier" => self.check_identifier(node),
-            _ => {}
-        }
-        let mut cursor = node.walk();
-        let children: Vec<Node> = node.named_children(&mut cursor).collect();
-        for child in children {
-            self.visit(child);
-        }
-    }
-
-    /// Flags a simple, unqualified type name that neither an import, a type
-    /// parameter, nor the file's visible types account for. Qualified names
-    /// (`scoped_type_identifier`) and `var` are left alone; generic arguments
-    /// are not inspected, only the type's base name.
-    fn check_type(&mut self, node: Node) {
-        let Some(name_node) = base_type_name(node) else {
-            return;
-        };
-        let name = &self.text[name_node.byte_range()];
-        if name.is_empty() || name == "var" {
-            return;
-        }
-        let scope = types::scope_at(name_node, self.text, self.tree, self.model);
-        if scope.type_params.iter().any(|param| param == name) {
-            return;
-        }
-        // A single-type or static import binds the name; the import check owns
-        // whether that binding resolves (D5).
-        if scope
-            .imports
-            .iter()
-            .any(|import| !import.is_wildcard && import.simple_name() == Some(name))
-        {
-            return;
-        }
-        if self.type_visible(name, &scope) {
-            return;
-        }
-        let candidates = self.type_candidates(name);
-        let fixes = if candidates.is_empty() {
-            json!([{ "fix": FIX_CREATE_TYPE }])
-        } else {
-            let importable = self.importable(&candidates);
-            if importable.is_empty() {
-                json!([])
-            } else {
-                json!([{ "fix": FIX_ADD_IMPORT, "candidates": importable }])
-            }
-        };
-        let data = json!({ "name": name, "fixes": fixes });
-        self.push(
-            name_node,
-            CODE_UNRESOLVED_TYPE,
-            format!("cannot resolve type `{name}`"),
-            data,
-        );
-    }
-
-    /// Whether a simple type name is visible here: declared in the file's
-    /// package, reached by a wildcard import, or in `java.lang`. Consulted
-    /// against both the index and the declared-type model.
-    fn type_visible(&self, name: &str, scope: &types::Scope) -> bool {
-        let in_package =
-            |package: Option<&str>| {
-                self.index.query_name(name).iter().any(|entry| {
-                    types::is_type_kind(entry.kind) && entry.package.as_deref() == package
-                }) || self.model.find_in_package(name, package).is_some()
-            };
-        if in_package(scope.package.as_deref()) {
-            return true;
-        }
-        for import in scope
-            .imports
-            .iter()
-            .filter(|import| import.is_wildcard && !import.is_static)
-        {
-            if in_package(import.package().as_deref()) {
-                return true;
-            }
-        }
-        in_package(Some("java.lang"))
-    }
-
-    fn type_candidates(&self, name: &str) -> Vec<SymbolEntry> {
-        self.index
-            .query_name(name)
-            .into_iter()
-            .filter(|entry| types::is_type_kind(entry.kind))
-            .collect()
-    }
-
-    /// The fully-qualified import targets among `candidates` that an `import`
-    /// edit can actually add — `import_edit` already excludes same-file,
-    /// same-package, `java.lang`, already-imported, and conflicting names.
-    fn importable(&self, candidates: &[SymbolEntry]) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        for entry in candidates {
-            if import_edit(
-                self.uri,
-                entry,
-                self.package.as_deref(),
-                self.package_line,
-                &self.imports,
-                self.index,
-            )
-            .is_empty()
-            {
-                continue;
-            }
-            if let Some(target) = import_target(entry) {
-                if !out.contains(&target) {
-                    out.push(target);
-                }
-            }
-        }
-        out
-    }
-
-    /// Flags a member the receiver's known type does not declare. The receiver
-    /// must be a modelled reference type (never `Unknown`, an array, or a type
-    /// variable), so a member the model cannot enumerate is never reported.
-    fn check_member(&mut self, node: Node) {
-        let (object, name_node, is_call) = match node.kind() {
-            "method_invocation" => (
-                node.child_by_field_name("object"),
-                node.child_by_field_name("name"),
-                true,
-            ),
-            "field_access" => (
-                node.child_by_field_name("object"),
-                node.child_by_field_name("field"),
-                false,
-            ),
-            _ => return,
-        };
-        let (Some(object), Some(name_node)) = (object, name_node) else {
-            return;
-        };
-        if matches!(
-            object.kind(),
-            "scoped_identifier" | "scoped_type_identifier"
-        ) {
-            return;
-        }
-        let name = &self.text[name_node.byte_range()];
-        if name.is_empty() {
-            return;
-        }
-        let scope = types::scope_at(node, self.text, self.tree, self.model);
-        let package = scope.package.as_deref();
-        let receiver = types::receiver_type(&object, self.text, &scope, self.model);
-        if matches!(receiver, Ty::Unknown | Ty::Array(_)) {
-            return;
-        }
-        if self.model.lookup(&receiver, package).is_none() {
-            return;
-        }
-        if types::member_of(&receiver, name, self.model, package).is_some() {
-            return;
-        }
-        if is_call {
-            let arg_count = node
-                .child_by_field_name("arguments")
-                .map(|args| args.named_child_count())
-                .unwrap_or(0);
-            if types::member_for_call(&receiver, name, arg_count, self.model, package).is_some() {
-                return;
-            }
-        }
-        let mut names: Vec<String> = self
-            .model
-            .members(&receiver, package)
-            .into_iter()
-            .map(|member| member.name)
-            .collect();
-        names.sort();
-        names.dedup();
-        let mut fixes: Vec<serde_json::Value> = Vec::new();
-        if let Some(replacement) = nearest_name(name, &names) {
-            fixes.push(json!({ "fix": FIX_RENAME, "replacement": replacement }));
-        }
-        if let Some(owner) = self.workspace_owner(&receiver, package) {
-            fixes.push(json!({
-                "fix": FIX_CREATE_RECEIVER_MEMBER,
-                "owner": owner,
-                "kind": if is_call { "method" } else { "field" },
-            }));
-        }
-        let data = json!({ "name": name, "fixes": fixes });
-        self.push(
-            name_node,
-            CODE_UNRESOLVED_MEMBER,
-            format!("cannot resolve `{name}`"),
-            data,
-        );
-    }
-
-    /// The fully-qualified name of `receiver`'s type when it is a workspace
-    /// source (never a jar/JDK declaration), so a member can be created in it.
-    fn workspace_owner(&self, receiver: &Ty, package: Option<&str>) -> Option<String> {
-        let info = self.model.lookup(receiver, package)?;
-        let entry = self
-            .index
-            .query_name(&info.name)
-            .into_iter()
-            .find(|entry| {
-                !entry.dependency
-                    && types::is_type_kind(entry.kind)
-                    && entry.package == info.package
-            })?;
-        import_target(&entry)
-    }
-
-    /// Flags a bare name used as a symbol reference that resolves to no local,
-    /// field, member, type, or import.
-    fn check_identifier(&mut self, node: Node) {
-        if !self.is_symbolic_identifier(node) {
-            return;
-        }
-        let name = &self.text[node.byte_range()];
-        if name.is_empty() {
-            return;
-        }
-        // A name bound anywhere in the file is left alone: lambda parameters,
-        // catch bindings, and pattern variables are not all modelled by
-        // `scope_at`, and a false positive is worse than a missed one.
-        if self.declared_names.contains(name) {
-            return;
-        }
-        let scope = types::scope_at(node, self.text, self.tree, self.model);
-        if scope.type_params.iter().any(|param| param == name) {
-            return;
-        }
-        if scope
-            .imports
-            .iter()
-            .any(|import| !import.is_wildcard && import.simple_name() == Some(name))
-        {
-            return;
-        }
-        if self.type_visible(name, &scope) {
-            return;
-        }
-        if let Some(resolved) = types::resolve_name(name, &scope, self.model) {
-            if !resolved.is_type {
-                return; // a local, field, parameter, or enclosing member
-            }
-        }
-        // A name the model knows as a type, used where a type is not expected,
-        // is a missing import; otherwise it is an unknown symbol with a stub.
-        let candidates = self.type_candidates(name);
-        let importable = self.importable(&candidates);
-        if !importable.is_empty() {
-            let data = json!({
-                "name": name,
-                "fixes": [{ "fix": FIX_ADD_IMPORT, "candidates": importable }],
-            });
-            self.push(
-                node,
-                CODE_UNRESOLVED_SYMBOL,
-                format!("cannot resolve `{name}`"),
-                data,
-            );
-            return;
-        }
-        // Any non-type declaration with this name elsewhere may be an
-        // outer-class field or a static-imported member this file cannot see; a
-        // wrong "create" would be worse than silence.
-        if self
-            .index
-            .query_name(name)
-            .iter()
-            .any(|entry| !types::is_type_kind(entry.kind))
-        {
-            return;
-        }
-        let data = json!({ "name": name, "fixes": [{ "fix": FIX_CREATE_SYMBOL }] });
-        self.push(
-            node,
-            CODE_UNRESOLVED_SYMBOL,
-            format!("cannot resolve `{name}`"),
-            data,
-        );
-    }
-
-    /// Whether `node` is a bare identifier used as a symbol reference: not a
-    /// declaration's own name, not a qualified-name segment, and not a member
-    /// the member check already owns, and in a recognized expression position.
-    fn is_symbolic_identifier(&self, node: Node) -> bool {
-        if node.kind() != "identifier" {
-            return false;
-        }
-        let Some(parent) = node.parent() else {
-            return false;
-        };
-        if is_declared_name(node, &parent) {
-            return false;
-        }
-        // The member check owns these two positions.
-        if parent.kind() == "field_access"
-            && parent
-                .child_by_field_name("field")
-                .is_some_and(|field| field.id() == node.id())
-        {
-            return false;
-        }
-        if parent.kind() == "method_invocation"
-            && parent.child_by_field_name("object").is_some()
-            && parent
-                .child_by_field_name("name")
-                .is_some_and(|named| named.id() == node.id())
-        {
-            return false;
-        }
-        matches!(
-            parent.kind(),
-            "argument_list"
-                | "assignment_expression"
-                | "binary_expression"
-                | "unary_expression"
-                | "parenthesized_expression"
-                | "ternary_expression"
-                | "array_access"
-                | "array_initializer"
-                | "return_statement"
-                | "throw_statement"
-                | "expression_statement"
-                | "if_statement"
-                | "while_statement"
-                | "do_statement"
-                | "enhanced_for_statement"
-                | "variable_declarator"
-                | "method_invocation"
-                | "field_access"
-        )
-    }
-
-    /// Flags an `import` whose target the index cannot supply: a single type by
-    /// package and name, a wildcard by package existence, a static import by
-    /// its type (and named member).
-    fn check_import(&mut self, node: Node) {
-        let raw = self.text[node.byte_range()].trim();
-        let raw = raw.strip_prefix("import").map_or(raw, str::trim);
-        let is_static = raw.starts_with("static");
-        let raw = raw.strip_prefix("static").map_or(raw, str::trim);
-        let path = raw.trim_end_matches(';').trim();
-        if path.is_empty() {
-            return;
-        }
-        let (path, is_wildcard) = match path.strip_suffix(".*") {
-            Some(head) => (head, true),
-            None => (path, false),
-        };
-        let resolved = if is_static {
-            self.static_import_resolves(path, is_wildcard)
-        } else if is_wildcard {
-            self.index.has_package(path)
-        } else {
-            self.type_import_resolves(path)
-        };
-        if resolved {
-            return;
-        }
-        self.push(
-            node,
-            CODE_UNRESOLVED_IMPORT,
-            format!("cannot resolve import `{path}`"),
-            json!({ "fix": "" }),
-        );
-    }
-
-    /// Whether an `import a.b.C;` (possibly a nested `a.b.Outer.Inner`) names a
-    /// type the index or the declared-type model holds.
-    fn type_import_resolves(&self, path: &str) -> bool {
-        let simple = path.rsplit('.').next().unwrap_or(path);
-        if self.index.query_name(simple).iter().any(|entry| {
-            types::is_type_kind(entry.kind) && import_target(entry).as_deref() == Some(path)
-        }) {
-            return true;
-        }
-        match path.rsplit_once('.') {
-            Some((package, _)) => self.model.find_in_package(simple, Some(package)).is_some(),
-            None => self.model.find_in_package(simple, None).is_some(),
-        }
-    }
-
-    fn static_import_resolves(&self, path: &str, is_wildcard: bool) -> bool {
-        let owner = if is_wildcard {
-            path
-        } else {
-            match path.rsplit_once('.') {
-                Some((owner, _)) => owner,
-                None => return false,
-            }
-        };
-        let owner_simple = owner.rsplit('.').next().unwrap_or(owner);
-        let owner_in_index = self.index.query_name(owner_simple).iter().any(|entry| {
-            types::is_type_kind(entry.kind) && import_target(entry).as_deref() == Some(owner)
-        });
-        let owner_in_model = match owner.rsplit_once('.') {
-            Some((package, _)) => self
-                .model
-                .find_in_package(owner_simple, Some(package))
-                .is_some(),
-            None => false,
-        };
-        if !(owner_in_index || owner_in_model) {
-            return false;
-        }
-        if is_wildcard {
-            return true;
-        }
-        let member = path.rsplit('.').next().unwrap_or(path);
-        let owner_ref = Ty::reference(owner);
-        types::member_of(&owner_ref, member, self.model, None).is_some()
-            || self
-                .model
-                .members(&owner_ref, None)
-                .iter()
-                .any(|candidate| candidate.name == member)
-    }
-
-    fn push(&mut self, node: Node, code: &str, message: String, data: serde_json::Value) {
-        self.out.push(Diagnostic {
-            range: lsp_range(self.text, &node),
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: Some(NumberOrString::String(code.to_string())),
-            code_description: None,
-            source: Some("java-lsp".to_string()),
-            message,
-            related_information: None,
-            tags: None,
-            data: Some(data),
-        });
-    }
-}
-
-/// The simple type name a type node denotes, looking through `generic_type` and
-/// `array_type`; a qualified (`scoped_type_identifier`) name is left alone.
-fn base_type_name(node: Node) -> Option<Node> {
-    match node.kind() {
-        "type_identifier" => Some(node),
-        "generic_type" => node.child_by_field_name("type").and_then(base_type_name),
-        "array_type" => node.child_by_field_name("element").and_then(base_type_name),
-        _ => None,
-    }
-}
-
 /// The line after the file's `package` declaration, where an import goes when
 /// there are none yet.
-fn package_line(tree: &Tree) -> Option<u32> {
+pub(crate) fn package_line(tree: &Tree) -> Option<u32> {
     let root = tree.root_node();
     let mut cursor = root.walk();
     let line = root
@@ -3646,331 +3591,8 @@ fn package_line(tree: &Tree) -> Option<u32> {
     line
 }
 
-/// Whether an identifier node is a declaration's own name rather than a use.
-fn is_declared_name(node: Node, parent: &Node) -> bool {
-    let is_name = parent
-        .child_by_field_name("name")
-        .is_some_and(|named| named.id() == node.id());
-    if !is_name {
-        return false;
-    }
-    matches!(
-        parent.kind(),
-        "variable_declarator"
-            | "method_declaration"
-            | "constructor_declaration"
-            | "class_declaration"
-            | "interface_declaration"
-            | "enum_declaration"
-            | "record_declaration"
-            | "annotation_type_declaration"
-            | "formal_parameter"
-            | "spread_parameter"
-            | "catch_formal_parameter"
-            | "lambda_parameter"
-            | "enhanced_for_statement"
-            | "local_variable_declaration"
-            | "field_declaration"
-            | "annotation_type_element_declaration"
-    )
-}
-
-/// Collects every simple name the document binds: any identifier that is a
-/// parent's `name` field, plus lambda parameters. Used as a conservative guard
-/// so an unmodelled binding is never reported as unknown.
-fn collect_declared_names(node: Node, text: &str, out: &mut HashSet<String>) {
-    if node.kind() == "identifier" {
-        let is_binding = node.parent().is_some_and(|parent| {
-            let is_name = parent
-                .child_by_field_name("name")
-                .is_some_and(|named| named.id() == node.id());
-            // A call's callee and a member access are uses, not bindings.
-            (is_name && !matches!(parent.kind(), "method_invocation" | "field_access"))
-                || matches!(parent.kind(), "inferred_parameters" | "lambda_parameters")
-                || (parent.kind() == "lambda_expression"
-                    && parent
-                        .child_by_field_name("parameters")
-                        .is_some_and(|params| params.id() == node.id()))
-        });
-        if is_binding {
-            out.insert(text[node.byte_range()].to_string());
-        }
-    }
-    let mut cursor = node.walk();
-    let children: Vec<Node> = node.named_children(&mut cursor).collect();
-    for child in children {
-        collect_declared_names(child, text, out);
-    }
-}
-
-/// The innermost type body enclosing `offset`, for inserting a created member.
-fn enclosing_type_body(tree: &Tree, offset: usize) -> Option<Node<'_>> {
-    let mut node = tree.root_node().descendant_for_byte_range(offset, offset)?;
-    loop {
-        if matches!(
-            node.kind(),
-            "class_body" | "interface_body" | "enum_body" | "record_body" | "annotation_type_body"
-        ) {
-            return Some(node);
-        }
-        node = node.parent()?;
-    }
-}
-
-/// The node covering an LSP range (the identifier a diagnostic points at).
-fn node_at<'a>(tree: &'a Tree, text: &str, range: Range) -> Option<Node<'a>> {
-    let start = byte_offset(text, range.start);
-    let end = byte_offset(text, range.end);
-    tree.root_node().descendant_for_byte_range(start, end)
-}
-
-/// The innermost `block` containing `node`.
-fn enclosing_block(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = Some(node);
-    while let Some(candidate) = current {
-        if candidate.kind() == "block" {
-            return Some(candidate);
-        }
-        current = candidate.parent();
-    }
-    None
-}
-
-/// The innermost method/constructor declaration containing `node`.
-fn enclosing_method(node: Node<'_>) -> Option<Node<'_>> {
-    let mut current = Some(node);
-    while let Some(candidate) = current {
-        if matches!(
-            candidate.kind(),
-            "method_declaration" | "constructor_declaration"
-        ) {
-            return Some(candidate);
-        }
-        current = candidate.parent();
-    }
-    None
-}
-
-/// The `body` of the top-level type declaration named `name` in a parsed file.
-fn type_body_by_name<'a>(tree: &'a Tree, text: &str, name: &str) -> Option<Node<'a>> {
-    let mut stack = vec![tree.root_node()];
-    while let Some(node) = stack.pop() {
-        if matches!(
-            node.kind(),
-            "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-        ) && node
-            .child_by_field_name("name")
-            .is_some_and(|named| &text[named.byte_range()] == name)
-        {
-            if let Some(body) = node.child_by_field_name("body") {
-                return Some(body);
-            }
-        }
-        let mut cursor = node.walk();
-        let children: Vec<Node> = node.named_children(&mut cursor).collect();
-        stack.extend(children);
-    }
-    None
-}
-
-/// A created method's parameter list: types inferred from the call's arguments,
-/// names from bare identifiers (else `argN`).
-fn parameter_list(
-    call: Node<'_>,
-    text: &str,
-    scope: &types::Scope,
-    model: &dyn TypeLookup,
-) -> Vec<String> {
-    let Some(arguments) = call.child_by_field_name("arguments") else {
-        return Vec::new();
-    };
-    let mut cursor = arguments.walk();
-    arguments
-        .named_children(&mut cursor)
-        .enumerate()
-        .map(|(index, argument)| {
-            let ty = display_type(&types::receiver_type(&argument, text, scope, model));
-            let name = if argument.kind() == "identifier" {
-                text[argument.byte_range()].to_string()
-            } else {
-                format!("arg{}", index + 1)
-            };
-            format!("{ty} {name}")
-        })
-        .collect()
-}
-
-/// The return type a created method needs, from the context its call sits in.
-fn return_type(call: Node<'_>, text: &str, scope: &types::Scope, model: &dyn TypeLookup) -> String {
-    let Some(parent) = call.parent() else {
-        return "Object".to_string();
-    };
-    match parent.kind() {
-        "expression_statement" => "void".to_string(),
-        "variable_declarator" => {
-            declared_type_of(parent, text).unwrap_or_else(|| "Object".to_string())
-        }
-        "assignment_expression" => parent
-            .child_by_field_name("left")
-            .map(|left| display_type(&types::receiver_type(&left, text, scope, model)))
-            .unwrap_or_else(|| "Object".to_string()),
-        "return_statement" => enclosing_method(call)
-            .and_then(|method| method.child_by_field_name("type"))
-            .map(|ty| text[ty.byte_range()].to_string())
-            .unwrap_or_else(|| "Object".to_string()),
-        _ => "Object".to_string(),
-    }
-}
-
-/// A declaration's written type, unless it is `var`.
-fn declared_type_of(declarator: Node<'_>, text: &str) -> Option<String> {
-    let declaration = declarator.parent()?;
-    if !matches!(
-        declaration.kind(),
-        "local_variable_declaration" | "field_declaration"
-    ) {
-        return None;
-    }
-    let ty = declaration.child_by_field_name("type")?;
-    let written = &text[ty.byte_range()];
-    (written != "var").then(|| written.to_string())
-}
-
-/// The type a created local/field needs, from the value's context.
-fn value_type(node: Node<'_>, text: &str, scope: &types::Scope, model: &dyn TypeLookup) -> String {
-    let Some(parent) = node.parent() else {
-        return "Object".to_string();
-    };
-    match parent.kind() {
-        "variable_declarator" => {
-            declared_type_of(parent, text).unwrap_or_else(|| "Object".to_string())
-        }
-        "assignment_expression" => {
-            let is_target = parent
-                .child_by_field_name("left")
-                .is_some_and(|left| left.id() == node.id());
-            if is_target {
-                return "Object".to_string();
-            }
-            parent
-                .child_by_field_name("left")
-                .map(|left| display_type(&types::receiver_type(&left, text, scope, model)))
-                .unwrap_or_else(|| "Object".to_string())
-        }
-        _ => "Object".to_string(),
-    }
-}
-
-/// A type for a generated stub; an unresolved type becomes `Object`.
-fn display_type(ty: &Ty) -> String {
-    match ty {
-        Ty::Unknown => "Object".to_string(),
-        other => other.display(),
-    }
-}
-
-/// Inserts a stub before a type body's closing brace, as a `changes` edit.
-fn push_body_insert(
-    uri: &Url,
-    text: &str,
-    diagnostic: &Diagnostic,
-    body: Node<'_>,
-    stub: String,
-    title: String,
-    actions: &mut Vec<CodeAction>,
-) {
-    let close = lsp_position(text, body.end_byte().saturating_sub(1));
-    let edit = TextEdit {
-        range: Range::new(Position::new(close.line, 0), Position::new(close.line, 0)),
-        new_text: stub,
-    };
-    actions.push(CodeAction {
-        title,
-        kind: Some(CodeActionKind::QUICKFIX),
-        diagnostics: Some(vec![diagnostic.clone()]),
-        edit: Some(workspace_edit_changes(uri, vec![edit])),
-        ..CodeAction::default()
-    });
-}
-
-/// A trivial source stub for a created type file.
-fn stub_type_source(package: Option<&str>, kind: &str, name: &str) -> String {
-    let body = match kind {
-        "interface" => format!("public interface {name} {{\n}}\n"),
-        "enum" => format!("public enum {name} {{\n}}\n"),
-        "record" => format!("public record {name}() {{\n}}\n"),
-        _ => format!("public class {name} {{\n}}\n"),
-    };
-    match package {
-        Some(package) => format!("package {package};\n\n{body}"),
-        None => body,
-    }
-}
-
-/// `name` if it is a legal Java identifier, so a create-stub cannot inject
-/// arbitrary text into a generated file or member.
-fn is_java_identifier(name: &str) -> bool {
-    let mut chars = name.chars();
-    match chars.next() {
-        Some(c) if c.is_alphabetic() || c == '_' || c == '$' => {}
-        _ => return false,
-    }
-    chars.all(|c| c.is_alphanumeric() || c == '_' || c == '$')
-}
-
-/// A workspace edit holding plain text changes for one document.
-fn workspace_edit_changes(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
-    WorkspaceEdit {
-        changes: Some(HashMap::from([(uri.clone(), edits)])),
-        document_changes: None,
-        change_annotations: None,
-    }
-}
-
-/// The closest candidate to `name` within a small edit distance, for a
-/// did-you-mean fix.
-fn nearest_name(name: &str, candidates: &[String]) -> Option<String> {
-    let mut best: Option<(usize, &String)> = None;
-    for candidate in candidates {
-        if candidate == name {
-            continue;
-        }
-        let distance = edit_distance(name, candidate);
-        if distance > 2 {
-            continue;
-        }
-        if best.is_none_or(|(best_distance, best_name)| {
-            distance < best_distance || (distance == best_distance && candidate < best_name)
-        }) {
-            best = Some((distance, candidate));
-        }
-    }
-    best.map(|(_, candidate)| candidate.clone())
-}
-
-fn edit_distance(a: &str, b: &str) -> usize {
-    let a: Vec<char> = a.chars().collect();
-    let b: Vec<char> = b.chars().collect();
-    let mut previous: Vec<usize> = (0..=b.len()).collect();
-    let mut current = vec![0usize; b.len() + 1];
-    for (i, ca) in a.iter().enumerate() {
-        current[0] = i + 1;
-        for (j, cb) in b.iter().enumerate() {
-            let cost = usize::from(ca != cb);
-            current[j + 1] = (previous[j + 1] + 1)
-                .min(current[j] + 1)
-                .min(previous[j] + cost);
-        }
-        std::mem::swap(&mut previous, &mut current);
-    }
-    previous[b.len()]
-}
-
 /// Converts a byte offset to an LSP position (line + UTF-16 code units).
-fn lsp_position(text: &str, byte_offset: usize) -> Position {
+pub(crate) fn lsp_position(text: &str, byte_offset: usize) -> Position {
     let mut offset = byte_offset.min(text.len());
     while offset > 0 && !text.is_char_boundary(offset) {
         offset -= 1;
@@ -3994,40 +3616,51 @@ pub(crate) fn lsp_range(text: &str, node: &Node) -> Range {
     }
 }
 
-/// Collects `ERROR` and missing nodes from subtrees that contain errors.
-fn collect_errors(node: &Node, text: &str, out: &mut Vec<Diagnostic>) {
-    if !node.has_error() {
-        return;
+/// A file's line-start byte offsets, built once so many byte offsets convert to
+/// LSP positions in `O(log n)` each instead of rescanning the text from the top
+/// per position (which is `O(offsets * text_len)` — quadratic, and the whole
+/// cost of indexing a large file or a whole dependency-source tree).
+#[derive(Clone)]
+pub(crate) struct LineIndex {
+    starts: Vec<usize>,
+}
+
+impl LineIndex {
+    pub(crate) fn new(text: &str) -> Self {
+        let mut starts = Vec::with_capacity(text.len() / 32 + 1);
+        starts.push(0);
+        starts.extend(
+            text.bytes()
+                .enumerate()
+                .filter(|(_, byte)| *byte == b'\n')
+                .map(|(i, _)| i + 1),
+        );
+        Self { starts }
     }
-    if node.is_error() {
-        let snippet: String = text[node.byte_range()].chars().take(32).collect();
-        out.push(Diagnostic {
-            range: lsp_range(text, node),
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: None,
-            code_description: None,
-            source: Some("java-lsp".to_string()),
-            message: format!("Syntax error near `{snippet}`"),
-            related_information: None,
-            tags: None,
-            data: None,
-        });
-    } else if node.is_missing() {
-        out.push(Diagnostic {
-            range: lsp_range(text, node),
-            severity: Some(DiagnosticSeverity::ERROR),
-            code: None,
-            code_description: None,
-            source: Some("java-lsp".to_string()),
-            message: format!("Syntax error: missing `{}`", node.kind()),
-            related_information: None,
-            tags: None,
-            data: None,
-        });
+
+    /// The LSP position (line + UTF-16 code units) of a byte offset.
+    pub(crate) fn position(&self, text: &str, byte_offset: usize) -> Position {
+        let mut offset = byte_offset.min(text.len());
+        while offset > 0 && !text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        let line = self.starts.partition_point(|&start| start <= offset) - 1;
+        let line_start = self.starts[line];
+        let character = text[line_start..offset]
+            .chars()
+            .map(|c| c.len_utf16() as u32)
+            .sum();
+        Position {
+            line: line as u32,
+            character,
+        }
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_errors(&child, text, out);
+
+    pub(crate) fn range(&self, text: &str, node: &Node) -> Range {
+        Range {
+            start: self.position(text, node.start_byte()),
+            end: self.position(text, node.end_byte()),
+        }
     }
 }
 
@@ -4318,7 +3951,7 @@ const JAVA_KEYWORDS: &[&str] = &[
 /// inverse of [`lsp_position`]. Out-of-range lines and columns clamp to the
 /// nearest valid offset; a column inside a surrogate pair clamps to the
 /// character containing it.
-fn byte_offset(text: &str, position: Position) -> usize {
+pub(crate) fn byte_offset(text: &str, position: Position) -> usize {
     let mut offset = 0usize;
     for _ in 0..position.line {
         match text[offset..].find('\n') {
@@ -4414,7 +4047,7 @@ fn is_type_kind(kind: IndexKind) -> bool {
 /// The ambiguity policy made concrete: a single candidate — or several that
 /// share one URI (method overloads, same-file repeats), resolved to the first
 /// by position — is an answer; anything spread across multiple files is not.
-fn unique_location(mut candidates: Vec<SymbolEntry>) -> Option<Location> {
+fn unique_location(mut candidates: Vec<Arc<SymbolEntry>>) -> Option<Location> {
     candidates.sort_by(|a, b| {
         a.uri.as_str().cmp(b.uri.as_str()).then_with(|| {
             a.full_range
@@ -4434,7 +4067,7 @@ fn unique_location(mut candidates: Vec<SymbolEntry>) -> Option<Location> {
         return None;
     }
     Some(Location {
-        uri: first.uri.clone(),
+        uri: (*first.uri).clone(),
         range: first.selection_range,
     })
 }
@@ -4579,6 +4212,15 @@ fn collect_type_fields(node: &Node, type_name: &str, text: &str, out: &mut Vec<S
                     });
                 }
             }
+            "enum_constant" => {
+                if let Some(name) = child.child_by_field_name("name") {
+                    out.push(ScopedName {
+                        name: text[name.byte_range()].to_string(),
+                        kind: CompletionItemKind::ENUM_MEMBER,
+                        detail: format!("constant of {type_name}"),
+                    });
+                }
+            }
             _ => collect_type_fields(&child, type_name, text, out),
         }
     }
@@ -4605,7 +4247,7 @@ fn file_header(root: &Node, text: &str) -> (Option<String>, Option<u32>) {
 
 /// One import statement in the open document.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExistingImport {
+pub(crate) struct ExistingImport {
     path: String,
     is_static: bool,
     is_wildcard: bool,
@@ -4613,7 +4255,7 @@ struct ExistingImport {
     line: u32,
 }
 
-fn collect_imports(root: &Node, text: &str) -> Vec<ExistingImport> {
+pub(crate) fn collect_imports(root: &Node, text: &str) -> Vec<ExistingImport> {
     let mut out = Vec::new();
     let mut cursor = root.walk();
     for child in root.children(&mut cursor) {
@@ -4642,10 +4284,13 @@ fn collect_imports(root: &Node, text: &str) -> Vec<ExistingImport> {
 /// The fully qualified name of the TYPE that must be imported for `entry`:
 /// for a type entry its own FQCN, for a member entry its enclosing type's.
 /// `None` when there is nothing importable (default package, orphan member).
-fn import_target(entry: &SymbolEntry) -> Option<String> {
+pub(crate) fn import_target(entry: &SymbolEntry) -> Option<String> {
     let package = entry.package.as_deref()?;
-    let mut segments = entry.container.clone();
-    if !matches!(entry.kind, IndexKind::Method | IndexKind::Field) {
+    let mut segments: Vec<String> = entry.container.to_vec();
+    if !matches!(
+        entry.kind,
+        IndexKind::Method | IndexKind::Field | IndexKind::EnumConstant
+    ) {
         segments.push(entry.name.clone());
     }
     if segments.is_empty() {
@@ -4658,8 +4303,9 @@ fn import_target(entry: &SymbolEntry) -> Option<String> {
 fn qualified_owner(entry: &SymbolEntry) -> String {
     let package = entry
         .package
-        .clone()
-        .unwrap_or_else(|| "the default package".to_string());
+        .as_deref()
+        .unwrap_or("the default package")
+        .to_string();
     if entry.container.is_empty() {
         package
     } else {
@@ -4675,7 +4321,7 @@ fn symbol_identity(entry: &SymbolEntry) -> String {
 
 /// The simple names claimed by more than one distinct symbol, so completions
 /// can label each such item with its owner.
-fn ambiguous_names(entries: &[SymbolEntry]) -> HashSet<String> {
+fn ambiguous_names(entries: &[Arc<SymbolEntry>]) -> HashSet<String> {
     let mut owners: HashMap<String, HashSet<String>> = HashMap::new();
     for entry in entries {
         if entry.kind == IndexKind::Import {
@@ -4696,18 +4342,18 @@ fn ambiguous_names(entries: &[SymbolEntry]) -> HashSet<String> {
 /// The `import ...;` edit for an index-sourced completion item, or none when
 /// the never-worsen rules say the file already resolves the name (or must
 /// not be touched: conflicts). Returns an empty vec when no edit is needed.
-fn import_edit(
+pub(crate) fn import_edit(
     document_uri: &Url,
     entry: &SymbolEntry,
     document_package: Option<&str>,
     package_line: Option<u32>,
     imports: &[ExistingImport],
-    index: &WorkspaceIndex,
+    index: &dyn NameLookup,
 ) -> Vec<TextEdit> {
     let Some(target) = import_target(entry) else {
         return Vec::new();
     };
-    if &entry.uri == document_uri {
+    if entry.uri.as_ref() == document_uri {
         return Vec::new(); // same file: the name already resolves
     }
     if entry.package.as_deref() == document_package {
@@ -4762,6 +4408,7 @@ fn completion_kind(kind: IndexKind) -> Option<CompletionItemKind> {
         IndexKind::Record => Some(CompletionItemKind::STRUCT),
         IndexKind::Method => Some(CompletionItemKind::METHOD),
         IndexKind::Field => Some(CompletionItemKind::FIELD),
+        IndexKind::EnumConstant => Some(CompletionItemKind::ENUM_MEMBER),
         IndexKind::Import => None,
     }
 }
@@ -4793,6 +4440,7 @@ fn symbol_kind(kind: IndexKind) -> Option<SymbolKind> {
         IndexKind::Record => Some(SymbolKind::STRUCT),
         IndexKind::Method => Some(SymbolKind::METHOD),
         IndexKind::Field => Some(SymbolKind::FIELD),
+        IndexKind::EnumConstant => Some(SymbolKind::ENUM_MEMBER),
         IndexKind::Import => None,
     }
 }
@@ -4805,6 +4453,7 @@ fn kind_word(kind: IndexKind) -> &'static str {
         IndexKind::Record => "record",
         IndexKind::Method => "method",
         IndexKind::Field => "field",
+        IndexKind::EnumConstant => "enum constant",
         IndexKind::Import => "import",
     }
 }
@@ -4842,6 +4491,7 @@ fn offer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tower_lsp::lsp_types::{DiagnosticSeverity, NumberOrString};
 
     const SAMPLE: &str = "\
 package com.example;
@@ -4869,8 +4519,14 @@ public class Sample {
 
     fn engine_with(text: &str) -> TreeSitterEngine {
         let engine = TreeSitterEngine::new();
-        engine.open(&uri(), text);
+        engine.open(&uri(), text, 1);
         engine
+    }
+
+    /// The diagnostics for a document, dropping the version — most tests only
+    /// care about the findings.
+    fn diagnostics_of(engine: &TreeSitterEngine, uri: &Url) -> Vec<Diagnostic> {
+        engine.diagnostics(uri).1
     }
 
     /// Converts an LSP position to a byte offset, for decoding semantic
@@ -4930,26 +4586,64 @@ public class Sample {
     #[test]
     fn valid_file_has_no_diagnostics() {
         let engine = engine_with(SAMPLE);
-        assert!(engine.diagnostics(&uri()).is_empty());
+        assert!(diagnostics_of(&engine, &uri()).is_empty());
+    }
+
+    /// The store lock must be released before the semantic pass, or every other
+    /// handler (and `store_tree`) blocks for the length of the analysis. The
+    /// hook rendezvouses with this thread *while the pass is in flight* and
+    /// parks there until the test has taken the store — a pass that held the
+    /// lock would deadlock the take.
+    #[test]
+    fn diagnostics_releases_the_documents_lock_before_the_semantic_pass() {
+        let engine = Arc::new(TreeSitterEngine::new());
+        engine.open(&uri(), SAMPLE, 1);
+
+        let ready = Arc::new(std::sync::Barrier::new(2));
+        let go = Arc::new(std::sync::Barrier::new(2));
+        {
+            let ready = Arc::clone(&ready);
+            let go = Arc::clone(&go);
+            engine.set_analyze_hook(Arc::new(move || {
+                // Park mid-pass until the test thread has taken the store lock.
+                ready.wait();
+                go.wait();
+            }));
+        }
+
+        let worker = Arc::clone(&engine);
+        let handle = std::thread::spawn(move || worker.diagnostics(&uri()));
+
+        // The hook has fired, so the pass is running; the store must be free.
+        ready.wait();
+        let acquired = engine.documents.try_lock().is_ok();
+        go.wait();
+
+        let (version, _) = handle.join().expect("diagnostics finishes");
+        assert!(
+            acquired,
+            "the documents lock must be released before the semantic pass"
+        );
+        assert_eq!(version, Some(1));
     }
 
     #[test]
     fn missing_semicolon_is_reported_and_clears_when_fixed() {
         let engine = engine_with("class Sample {\n    int x\n}\n");
-        let diagnostics = engine.diagnostics(&uri());
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert!(
             diagnostics.iter().any(|d| d.message.contains("missing")),
             "expected a missing-token diagnostic, got {diagnostics:?}"
         );
 
-        engine.change(&uri(), "class Sample {\n    int x;\n}\n");
-        assert!(engine.diagnostics(&uri()).is_empty());
+        engine.change(&uri(), "class Sample {\n    int x;\n}\n", 1);
+        assert!(diagnostics_of(&engine, &uri()).is_empty());
     }
 
     #[test]
     fn broken_construct_is_reported_as_error_node() {
         let engine = engine_with("class Sample {\n    int = ;\n}\n");
-        let diagnostics = engine.diagnostics(&uri());
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert!(
             diagnostics.iter().any(|d| d.message.contains("near")),
             "expected an ERROR-node diagnostic, got {diagnostics:?}"
@@ -5232,15 +4926,16 @@ public class Widget {
         .unwrap();
         let range = Range::new(Position::new(30, 13), Position::new(30, 17));
         let library_entry = SymbolEntry {
-            uri: cache_uri.clone(),
+            uri: std::sync::Arc::new(cache_uri.clone()),
             name: "Gson".to_string(),
             kind: IndexKind::Class,
-            package: Some("com.google.gson".to_string()),
-            container: Vec::new(),
+            package: Some("com.google.gson".into()),
+            container: std::sync::Arc::from(Vec::<String>::new()),
             full_range: range,
             selection_range: range,
             dependency: true,
             library_source: true,
+            synthetic: false,
         };
         engine.index.upsert_file(&cache_uri, vec![library_entry]);
 
@@ -5253,15 +4948,16 @@ public class Widget {
         // A plain class-file entry (no openable source) is still refused.
         let jar_uri = Url::parse("file:///repo/lib-1.0.jar").unwrap();
         let jar_entry = SymbolEntry {
-            uri: jar_uri.clone(),
+            uri: std::sync::Arc::new(jar_uri.clone()),
             name: "JarOnly".to_string(),
             kind: IndexKind::Class,
-            package: Some("demo".to_string()),
-            container: Vec::new(),
+            package: Some("demo".into()),
+            container: std::sync::Arc::from(Vec::<String>::new()),
             full_range: range,
             selection_range: range,
             dependency: true,
             library_source: false,
+            synthetic: false,
         };
         let jar_text = "class Use {\n    JarOnly x;\n}\n";
         let jar_engine = engine_with(jar_text);
@@ -5317,13 +5013,13 @@ class Widget {
     fn definition_resolves_import_targets_declared_elsewhere() {
         let engine = TreeSitterEngine::new();
         let decl_uri = Url::parse("file:///Widget.java").unwrap();
-        engine.open(&decl_uri, WIDGET);
+        engine.open(&decl_uri, WIDGET, 1);
         let text = "import demo.Widget;
 
 class Use {
 }
 ";
-        engine.open(&uri(), text);
+        engine.open(&uri(), text, 1);
 
         let location =
             location_at(&engine, text, "demo.Widget", 6).expect("import target must resolve");
@@ -5335,12 +5031,12 @@ class Use {
     fn definition_resolves_a_unique_cross_file_reference() {
         let engine = TreeSitterEngine::new();
         let decl_uri = Url::parse("file:///Widget.java").unwrap();
-        engine.open(&decl_uri, WIDGET);
+        engine.open(&decl_uri, WIDGET, 1);
         let text = "class Use {
     Widget w;
 }
 ";
-        engine.open(&uri(), text);
+        engine.open(&uri(), text, 1);
 
         let location = location_at(&engine, text, "Widget w", 2).expect("reference must resolve");
         assert_eq!(location.uri, decl_uri);
@@ -5350,13 +5046,13 @@ class Use {
     #[test]
     fn definition_of_an_ambiguous_name_is_none() {
         let engine = TreeSitterEngine::new();
-        engine.open(&Url::parse("file:///A.java").unwrap(), "class Dup {}\n");
-        engine.open(&Url::parse("file:///B.java").unwrap(), "class Dup {}\n");
+        engine.open(&Url::parse("file:///A.java").unwrap(), "class Dup {}\n", 1);
+        engine.open(&Url::parse("file:///B.java").unwrap(), "class Dup {}\n", 1);
         let text = "class Use {
     Dup d;
 }
 ";
-        engine.open(&uri(), text);
+        engine.open(&uri(), text, 1);
 
         assert!(
             location_at(&engine, text, "Dup d", 2).is_none(),
@@ -5533,7 +5229,7 @@ class Use {
     fn workspace_symbols_map_the_index_to_symbol_information() {
         let engine = TreeSitterEngine::new();
         let decl_uri = Url::parse("file:///Widget.java").unwrap();
-        engine.open(&decl_uri, WIDGET);
+        engine.open(&decl_uri, WIDGET, 1);
         let other_uri = Url::parse("file:///Other.java").unwrap();
         engine.open(
             &other_uri,
@@ -5544,6 +5240,7 @@ class Other {
     int flag;
 }
 ",
+            1,
         );
 
         // A prefix hit on a type: its class kind and its selection range.
@@ -5587,6 +5284,7 @@ class Carrier {
     int load;
 }
 ",
+            1,
         );
 
         let names_kinds: Vec<(String, SymbolKind)> = engine
@@ -5722,14 +5420,16 @@ class Main {
     fn completions_keep_same_named_types_from_different_packages_separate() {
         let open_text = "package com.a;\n\nclass Sample {\n    void m() {\n        Li;\n    }\n}\n";
         let engine = TreeSitterEngine::new();
-        engine.open(&uri(), open_text);
+        engine.open(&uri(), open_text, 1);
         engine.open(
             &Url::parse("file:///src/java/util/List.java").unwrap(),
             "package java.util;\n\npublic interface List {}\n",
+            1,
         );
         engine.open(
             &Url::parse("file:///src/java/awt/List.java").unwrap(),
             "package java.awt;\n\npublic class List {}\n",
+            1,
         );
 
         let offset = open_text.find("Li;").unwrap() + "Li".len();
@@ -5873,6 +5573,371 @@ class Use {
             }
             other => panic!("expected member items, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn completion_narrows_a_partial_nested_type_name() {
+        let text = "\
+class Greeter {
+    static class Inner {}
+    void m() {
+        Greeter.Inn a;
+        Object made = new Greeter.Inn;
+    }
+}
+";
+        let engine = engine_with(text);
+        for (needle, typed) in [
+            ("Greeter.Inn a;", "Greeter.Inn"),
+            ("new Greeter.Inn;", "new Greeter.Inn"),
+        ] {
+            let offset = text.find(needle).unwrap() + typed.len();
+            match engine.completions(&uri(), lsp_position(text, offset)) {
+                Some(CompletionResponse::Array(items)) => {
+                    let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                    assert!(names.contains(&"Inner"), "{needle}: {names:?}");
+                }
+                other => panic!("{needle}: expected an array, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn completion_through_a_nested_type_offers_its_members() {
+        let text = "\
+class Greeter {
+    static class Inner {
+        static final String CONST = \"c\";
+        int getVal() { return 1; }
+    }
+    void m() {
+        String a = Greeter.Inner.CON;
+        String b = Greeter.Inner.CONST;
+    }
+}
+";
+        let engine = engine_with(text);
+
+        // A partial static name after a dotted nested type narrows to the member.
+        let narrowed = text.find("Greeter.Inner.CON;").unwrap() + "Greeter.Inner.CON".len();
+        match engine.completions(&uri(), lsp_position(text, narrowed)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"CONST"), "{names:?}");
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+
+        // With the cursor on the dot the nested type is a *type* receiver, so
+        // only statics are offered, never the instance method.
+        let at_dot = text.find("Greeter.Inner.CONST;").unwrap() + "Greeter.Inner.".len();
+        match engine.completions(&uri(), lsp_position(text, at_dot)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"CONST"), "{names:?}");
+                assert!(
+                    !names.iter().any(|name| name.contains("getVal")),
+                    "a type receiver must not offer instance members: {names:?}"
+                );
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_narrows_a_partial_member_name() {
+        let text = "\
+class Greeter {
+    static int count(int n) { return n; }
+    int getVal() { return 1; }
+    void m() {
+        Greeter g = new Greeter();
+        int a = g.getV;
+        int b = Greeter.cou;
+    }
+}
+";
+        let engine = engine_with(text);
+        for (needle, typed, expected, absent) in [
+            ("g.getV;", "g.getV", "getVal", "count"),
+            ("Greeter.cou;", "Greeter.cou", "count", "getVal"),
+        ] {
+            let offset = text.find(needle).unwrap() + typed.len();
+            match engine.completions(&uri(), lsp_position(text, offset)) {
+                Some(CompletionResponse::Array(items)) => {
+                    let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                    assert!(
+                        names.iter().any(|name| name.contains(expected)),
+                        "{needle}: {names:?}"
+                    );
+                    assert!(
+                        !names.iter().any(|name| name.contains(absent)),
+                        "{needle}: {names:?}"
+                    );
+                }
+                other => panic!("{needle}: expected an array, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn type_receiver_completion_offers_same_kind_nested_types() {
+        // Two nested types of one kind in one package must both survive the
+        // model's scan (their names are part of the type identity).
+        let text = "\
+class Greeter {
+    static class Inner {}
+    static class Innermost {}
+    void m() {
+        Greeter.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("Greeter.\n").unwrap() + "Greeter.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"Inner"), "{names:?}");
+                assert!(names.contains(&"Innermost"), "{names:?}");
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn completion_after_a_package_qualifier_offers_its_types() {
+        let engine = engine_with_types(vec![
+            jdk_entry("List", IndexKind::Class, Some("java.util")),
+            jdk_entry("Map", IndexKind::Class, Some("java.util")),
+            jdk_entry("Other", IndexKind::Class, Some("a")),
+        ]);
+        let text = "\
+class Sample {
+    void m() {
+        java.util.Li x;
+    }
+}
+";
+        engine.open(&uri(), text, 1);
+        let offset = text.find("java.util.Li").unwrap() + "java.util.Li".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let names: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(names.contains(&"List"), "{names:?}");
+                assert!(!names.contains(&"Map"), "the prefix must narrow: {names:?}");
+                assert!(
+                    !names.contains(&"Other"),
+                    "another package's type: {names:?}"
+                );
+            }
+            other => panic!("expected an array, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn member_completions_offer_enum_constants_as_enum_members() {
+        let text = "\
+enum DataType { TYPE_1, TYPE_2 }
+class Sample {
+    void m() {
+        DataType.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("DataType.\n").unwrap() + "DataType.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(labels.contains(&"TYPE_1"), "{labels:?}");
+                assert!(labels.contains(&"TYPE_2"), "{labels:?}");
+                let item = items.iter().find(|item| item.label == "TYPE_1").unwrap();
+                assert_eq!(item.kind, Some(CompletionItemKind::ENUM_MEMBER));
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enum_constant_references_resolve_and_a_missing_constant_is_diagnosed() {
+        let engine = engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+        ]);
+        let text = "\
+class Sample {
+    void m() {
+        DataType ok = DataType.TYPE_1;
+        DataType bad = DataType.NOPE;
+    }
+}
+enum DataType { TYPE_1, TYPE_2 }
+";
+        engine.open(&uri(), text, 1);
+        let messages: Vec<String> = diagnostics_of(&engine, &uri())
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            !messages.iter().any(|message| message.contains("TYPE_1")),
+            "a real constant must not be flagged: {messages:?}"
+        );
+        assert!(
+            messages.iter().any(|message| message.contains("NOPE")),
+            "a missing constant must still be flagged: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn an_enum_constant_resolves_unqualified_inside_its_enum() {
+        let engine = engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+        ]);
+        let text = "enum Color {\n    RED, GREEN;\n    Color other() { return RED; }\n}\n";
+        engine.open(&uri(), text, 1);
+        let messages: Vec<String> = diagnostics_of(&engine, &uri())
+            .into_iter()
+            .map(|diagnostic| diagnostic.message)
+            .collect();
+        assert!(
+            !messages.iter().any(|message| message.contains("RED")),
+            "{messages:?}"
+        );
+    }
+
+    #[test]
+    fn enum_constant_definition_resolves_to_its_declaration() {
+        let text = "\
+class Sample {
+    void m() {
+        DataType x = DataType.TYPE_1;
+    }
+}
+enum DataType { TYPE_1, TYPE_2 }
+";
+        let engine = engine_with(text);
+        let offset = text.find("DataType.TYPE_1").unwrap() + "DataType.".len();
+        let location = engine
+            .definition(&uri(), lsp_position(text, offset))
+            .expect("definition of the constant");
+        assert_eq!(location.uri, uri());
+        assert_eq!(location.range.start.line, 5, "the enum's declaration line");
+    }
+
+    #[test]
+    fn enum_constant_references_and_rename_target_the_constant() {
+        let text = "\
+enum DataType { TYPE_1, TYPE_2 }
+class A {
+    DataType a = DataType.TYPE_1;
+}
+class B {
+    DataType b = DataType.TYPE_1;
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("DataType.TYPE_1").unwrap() + "DataType.".len();
+        let references = engine.references(&uri(), lsp_position(text, offset), true);
+        assert_eq!(
+            references.len(),
+            3,
+            "declaration plus two uses: {references:?}"
+        );
+
+        let edit = engine
+            .rename(&uri(), lsp_position(text, offset), "FIRST")
+            .expect("rename the constant");
+        let edits = edit
+            .changes
+            .expect("changes")
+            .into_values()
+            .flatten()
+            .count();
+        assert_eq!(edits, 3, "the rename rewrites every occurrence");
+    }
+
+    #[test]
+    fn member_completions_follow_a_dotted_nested_type() {
+        let text = "\
+class Greeter {
+    static class Inner {
+        int val;
+        int getVal() { return 1; }
+    }
+}
+class Use {
+    void m() {
+        Greeter.Inner i = new Greeter.Inner();
+        i.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("i.\n").unwrap() + "i.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(labels.contains(&"val"), "{labels:?}");
+                assert!(
+                    labels.iter().any(|label| label.starts_with("int getVal")),
+                    "{labels:?}"
+                );
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn type_receiver_completion_offers_nested_types() {
+        let text = "\
+class Greeter {
+    int size;
+    static class Inner {}
+}
+class Use {
+    void m() {
+        Greeter.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("Greeter.\n").unwrap() + "Greeter.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let inner = items
+                    .iter()
+                    .find(|item| item.label == "Inner")
+                    .expect("the nested type is offered");
+                assert_eq!(inner.kind, Some(CompletionItemKind::CLASS));
+                assert_eq!(inner.insert_text.as_deref(), Some("Inner"));
+            }
+            other => panic!("expected member items, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_dotted_nested_type_definition_resolves_through_the_receiver() {
+        let text = "\
+class Greeter {
+    static class Inner {
+        int getVal() { return 1; }
+    }
+}
+class Use {
+    void m() {
+        Greeter.Inner i = null;
+        i.getVal();
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("i.getVal()").unwrap() + "i.getVal".len();
+        let location = engine
+            .definition(&uri(), lsp_position(text, offset))
+            .expect("definition through the nested receiver");
+        assert_eq!(location.range.start.line, 2, "Inner.getVal's declaration");
     }
 
     #[test]
@@ -6207,7 +6272,7 @@ class Use {
     }
 }
 ";
-        engine.open(&uri(), text);
+        engine.open(&uri(), text, 1);
 
         // The inferred type renders as a hint.
         let hints = hints_in(&engine, full_range(text));
@@ -6413,8 +6478,8 @@ class Sample {
     String name;
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(diagnostics[0].message.contains("Missing"));
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
@@ -6442,8 +6507,8 @@ class Sample {
     String name;
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -6462,8 +6527,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(diagnostics[0].severity, Some(DiagnosticSeverity::ERROR));
         assert_eq!(
@@ -6491,8 +6556,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         let actions = engine.code_actions(&uri(), &diagnostics);
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert_eq!(actions[0].title, "Change to `size`");
@@ -6520,8 +6585,8 @@ class Sample {
     Widget field;
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].code,
@@ -6549,6 +6614,320 @@ class Sample {
     }
 
     #[test]
+    fn accepting_the_add_import_clears_the_diagnostic() {
+        let engine = engine_with_types(vec![
+            jdk_entry("Object", IndexKind::Class, Some("java.lang")),
+            jdk_entry("String", IndexKind::Class, Some("java.lang")),
+            jdk_entry("Widget", IndexKind::Class, Some("com.b")),
+        ]);
+        engine.open(&uri(), "class Sample {\n    Widget field;\n}\n", 1);
+        assert_eq!(diagnostics_of(&engine, &uri()).len(), 1);
+        engine.change(
+            &uri(),
+            "import com.b.Widget;\n\nclass Sample {\n    Widget field;\n}\n",
+            1,
+        );
+        assert!(
+            diagnostics_of(&engine, &uri()).is_empty(),
+            "{:?}",
+            diagnostics_of(&engine, &uri())
+        );
+    }
+
+    #[test]
+    fn a_method_created_in_the_open_file_completes_after_a_dot() {
+        let engine = unknown_symbol_engine();
+        let text = "class Sample {\n    public void newMethod() {\n    }\n\n    void m() {\n        Sample s = this;\n        s.newMethod();\n    }\n}\n";
+        engine.open(&uri(), text, 1);
+        let offset = text.find("s.newMethod").unwrap() + 2;
+        let response = engine
+            .completions(&uri(), lsp_position(text, offset))
+            .expect("completions");
+        let labels: Vec<String> = match response {
+            CompletionResponse::Array(items) => items
+                .into_iter()
+                .filter_map(|item| item.filter_text)
+                .collect(),
+            _ => Vec::new(),
+        };
+        assert!(
+            labels.iter().any(|label| label == "newMethod"),
+            "{labels:?}"
+        );
+    }
+
+    #[test]
+    fn a_method_added_to_another_open_file_completes_and_defines_alike() {
+        // The isolated asymmetry: the workspace model is built before the edit
+        // and the method arrives through `change` on another buffer. Definition
+        // already reached it through the index; completion must agree (D4/D5).
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "cross-file-model",
+            &[
+                ("a/Widget.java", "package a;\n\npublic class Widget {\n}\n"),
+                (
+                    "a/Use.java",
+                    "package a;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let widget_uri = Url::from_file_path(root.join("a/Widget.java")).unwrap();
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        let widget_text = std::fs::read_to_string(root.join("a/Widget.java")).unwrap();
+        engine.open(&use_uri, &use_text, 1);
+        engine.open(&widget_uri, &widget_text, 1);
+        // The edit lands on the *other* open file.
+        engine.change(
+            &widget_uri,
+            "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+            1,
+        );
+
+        let definition = engine
+            .definition(
+                &use_uri,
+                lsp_position(&use_text, use_text.find("w.run").unwrap() + 3),
+            )
+            .expect("definition resolves the added method");
+        assert_eq!(definition.uri, widget_uri);
+
+        let response = engine
+            .completions(
+                &use_uri,
+                lsp_position(&use_text, use_text.find("w.run").unwrap() + 2),
+            )
+            .expect("completions");
+        let CompletionResponse::Array(items) = response else {
+            panic!("expected an array after `.`");
+        };
+        let labels: Vec<String> = items
+            .into_iter()
+            .filter_map(|item| item.filter_text)
+            .collect();
+        assert!(labels.iter().any(|label| label == "run"), "{labels:?}");
+    }
+
+    #[test]
+    fn a_watched_create_is_indexed_and_a_delete_drops_it_again() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "watched-create",
+            &[(
+                "a/Use.java",
+                "package a;\n\nclass Use {\n    Widget w = null;\n}\n",
+            )],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text, 1);
+        assert!(engine.index.query_name("Widget").is_empty());
+
+        // A file created on disk, never opened, becomes visible.
+        let widget_path = root.join("a").join("Widget.java");
+        std::fs::write(&widget_path, "package a;\n\npublic class Widget {\n}\n").unwrap();
+        let widget_uri = Url::from_file_path(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri.clone(), WatchedChange::Created)]));
+        let entries = engine.index.query_name("Widget");
+        assert_eq!(entries.len(), 1, "{entries:?}");
+        assert_eq!(*entries[0].uri, widget_uri);
+
+        // A later disk change replaces its entries and its model contribution.
+        std::fs::write(
+            &widget_path,
+            "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+        )
+        .unwrap();
+        assert!(engine.watched_files(&[(widget_uri.clone(), WatchedChange::Changed)]));
+        assert!(engine
+            .index
+            .query_name("run")
+            .iter()
+            .any(|entry| *entry.uri == widget_uri));
+
+        // Deleting it drops its entries.
+        std::fs::remove_file(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]));
+        assert!(engine.index.query_name("Widget").is_empty());
+    }
+
+    #[test]
+    fn a_watched_event_for_an_open_buffer_is_ignored() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "watched-open",
+            &[("a/Widget.java", "package a;\n\npublic class Widget {\n}\n")],
+        );
+        let engine = scanned_engine(&root_uri);
+        let widget_path = root.join("a/Widget.java");
+        let widget_uri = Url::from_file_path(&widget_path).unwrap();
+        // The buffer holds an unsaved edit the watcher must not override (D2).
+        engine.open(
+            &widget_uri,
+            "package a;\n\npublic class Widget {\n    void unsaved() {}\n}\n",
+            1,
+        );
+        std::fs::write(
+            &widget_path,
+            "package a;\n\npublic class Widget {\n    void fromDisk() {}\n}\n",
+        )
+        .unwrap();
+
+        assert!(!engine.watched_files(&[(widget_uri.clone(), WatchedChange::Changed)]));
+        assert!(engine
+            .index
+            .query_name("unsaved")
+            .iter()
+            .any(|entry| *entry.uri == widget_uri));
+        assert!(engine.index.query_name("fromDisk").is_empty());
+    }
+
+    #[test]
+    fn a_deleted_warmup_source_is_forgotten() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "deleted-warmup",
+            &[
+                (
+                    "a/Widget.java",
+                    "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+                ),
+                (
+                    "a/Use.java",
+                    "package a;\n\nclass Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text, 1);
+
+        let labels = |engine: &TreeSitterEngine| -> Vec<String> {
+            let offset = use_text.find("w.run").unwrap() + 2;
+            match engine.completions(&use_uri, lsp_position(&use_text, offset)) {
+                Some(CompletionResponse::Array(items)) => items
+                    .into_iter()
+                    .filter_map(|item| item.filter_text)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        assert!(labels(&engine).contains(&"run".to_string()));
+
+        let widget_uri = Url::from_file_path(root.join("a/Widget.java")).unwrap();
+        std::fs::remove_file(root.join("a/Widget.java")).unwrap();
+        engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]);
+
+        assert!(engine.index.query_name("Widget").is_empty());
+        let after = labels(&engine);
+        assert!(
+            !after.contains(&"run".to_string()),
+            "deleted type still resolves: {after:?}"
+        );
+    }
+
+    #[test]
+    fn a_deleted_warmup_source_stops_resolving_in_hover() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "deleted-hover",
+            &[
+                (
+                    "a/Widget.java",
+                    "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+                ),
+                (
+                    "a/Use.java",
+                    "package a;\n\nclass Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text, 1);
+
+        let member_hover = lsp_position(&use_text, use_text.find("w.run").unwrap() + 2);
+        assert!(
+            engine.hover(&use_uri, member_hover).is_some(),
+            "the warm-up member must hover before the delete"
+        );
+
+        let widget_uri = Url::from_file_path(root.join("a/Widget.java")).unwrap();
+        std::fs::remove_file(root.join("a/Widget.java")).unwrap();
+        engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]);
+
+        assert!(
+            engine.hover(&use_uri, member_hover).is_none(),
+            "a deleted type's member must not hover"
+        );
+    }
+
+    #[test]
+    fn a_deleted_watched_only_source_leaves_nothing_behind() {
+        // A file that exists only in the dirty overlay — created after warm-up
+        // and never opened — must vanish from the model when it is deleted, not
+        // just from the index (the warm-up model never contained it).
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "deleted-dirty-only",
+            &[(
+                "a/Use.java",
+                "package a;\n\nclass Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n",
+            )],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text, 1);
+
+        let labels = |engine: &TreeSitterEngine| -> Vec<String> {
+            let offset = use_text.find("w.run").unwrap() + 2;
+            match engine.completions(&use_uri, lsp_position(&use_text, offset)) {
+                Some(CompletionResponse::Array(items)) => items
+                    .into_iter()
+                    .filter_map(|item| item.filter_text)
+                    .collect(),
+                _ => Vec::new(),
+            }
+        };
+        assert!(!labels(&engine).contains(&"run".to_string()));
+
+        // Created on disk, never opened: only the dirty overlay knows it.
+        let widget_path = root.join("a/Widget.java");
+        std::fs::write(
+            &widget_path,
+            "package a;\n\npublic class Widget {\n    public void run() {}\n}\n",
+        )
+        .unwrap();
+        let widget_uri = Url::from_file_path(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri.clone(), WatchedChange::Created)]));
+        assert!(
+            labels(&engine).contains(&"run".to_string()),
+            "the watched create must be visible cross-file"
+        );
+
+        std::fs::remove_file(&widget_path).unwrap();
+        assert!(engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]));
+        assert!(engine.index.query_name("Widget").is_empty());
+        let after = labels(&engine);
+        assert!(
+            !after.contains(&"run".to_string()),
+            "a deleted watched-only type still resolves: {after:?}"
+        );
+    }
+
+    #[test]
     fn a_create_type_action_needs_the_client_capability() {
         let engine = unknown_symbol_engine();
         let text = "\
@@ -6556,8 +6935,8 @@ class Sample {
     Widget field;
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
 
         // Without the client capability, no create-type action is offered.
@@ -6590,8 +6969,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].code,
@@ -6643,8 +7022,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         let foo = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message.contains("foo"))
@@ -6680,8 +7059,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         let compute = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message.contains("compute"))
@@ -6717,8 +7096,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         let text_diagnostic = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message.contains("text"))
@@ -6758,8 +7137,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         let member = diagnostics
             .iter()
             .find(|diagnostic| diagnostic.message.contains("newMethod"))
@@ -6802,8 +7181,8 @@ import com.b.Nope;
 class Sample {
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].code,
@@ -6821,8 +7200,8 @@ import com.unknown.*;
 class Sample {
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert_eq!(
             diagnostics[0].code,
@@ -6843,8 +7222,8 @@ import static java.util.Collections.sortt;
 class Sample {
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         assert!(diagnostics[0].message.contains("sortt"));
     }
@@ -6863,8 +7242,8 @@ class Sample {
     }
 }
 ";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
     }
 
@@ -6872,20 +7251,26 @@ class Sample {
     fn semantic_diagnostics_can_be_switched_off() {
         let engine = unknown_symbol_engine();
         let text = "class Sample {\n    Missing field;\n}\n";
-        engine.open(&uri(), text);
-        assert_eq!(engine.diagnostics(&uri()).len(), 1);
+        engine.open(&uri(), text, 1);
+        assert_eq!(diagnostics_of(&engine, &uri()).len(), 1);
         engine.set_semantic_diagnostics(false);
-        assert!(engine.diagnostics(&uri()).is_empty());
+        assert!(diagnostics_of(&engine, &uri()).is_empty());
     }
 
     #[test]
     fn the_semantic_diagnostics_setting_maps_the_environment_value() {
-        assert!(semantic_diagnostics_setting(None));
-        assert!(semantic_diagnostics_setting(Some("1")));
-        assert!(semantic_diagnostics_setting(Some("true")));
-        assert!(!semantic_diagnostics_setting(Some("0")));
-        assert!(!semantic_diagnostics_setting(Some("false")));
-        assert!(!semantic_diagnostics_setting(Some("FALSE")));
+        assert!(crate::diagnostics::semantic_diagnostics_setting(None));
+        assert!(crate::diagnostics::semantic_diagnostics_setting(Some("1")));
+        assert!(crate::diagnostics::semantic_diagnostics_setting(Some(
+            "true"
+        )));
+        assert!(!crate::diagnostics::semantic_diagnostics_setting(Some("0")));
+        assert!(!crate::diagnostics::semantic_diagnostics_setting(Some(
+            "false"
+        )));
+        assert!(!crate::diagnostics::semantic_diagnostics_setting(Some(
+            "FALSE"
+        )));
     }
 
     #[test]
@@ -6959,7 +7344,7 @@ class Sample {
         let engine = scanned_engine(&root_uri);
         let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
         let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&use_uri, &use_text);
+        engine.open(&use_uri, &use_text, 1);
         let cursor = lsp_position(&use_text, use_text.find("Widget w").unwrap() + 1);
 
         let references = engine.references(&use_uri, cursor, true);
@@ -7021,7 +7406,7 @@ class Sample {
         let engine = scanned_engine(&root_uri);
         let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
         let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&use_uri, &use_text);
+        engine.open(&use_uri, &use_text, 1);
         let cursor = lsp_position(&use_text, use_text.find("w.run()").unwrap() + 2);
 
         let references = engine.references(&use_uri, cursor, true);
@@ -7057,7 +7442,7 @@ class Sample {
         let (root, root_uri) = temp_workspace("local-refs", &[("a/Use.java", source)]);
         let engine = scanned_engine(&root_uri);
         let uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&uri, source);
+        engine.open(&uri, source, 1);
         let cursor = lsp_position(source, source.find("total = 1").unwrap() + 2);
 
         let references = engine.references(&uri, cursor, true);
@@ -7079,7 +7464,7 @@ class Sample {
         let (root, root_uri) = temp_workspace("ambiguous-local", &[("a/Use.java", source)]);
         let engine = scanned_engine(&root_uri);
         let uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&uri, source);
+        engine.open(&uri, source, 1);
         let cursor = lsp_position(source, source.find("total = 1").unwrap() + 2);
 
         assert!(engine.references(&uri, cursor, true).is_empty());
@@ -7089,22 +7474,23 @@ class Sample {
     fn synthetic_entry(name: &str, kind: IndexKind) -> SymbolEntry {
         let zero = Range::new(Position::new(0, 0), Position::new(0, 0));
         SymbolEntry {
-            uri: Url::parse("file:///jdk.jar").unwrap(),
+            uri: std::sync::Arc::new(Url::parse("file:///jdk.jar").unwrap()),
             name: name.to_string(),
             kind,
             package: None,
-            container: Vec::new(),
+            container: std::sync::Arc::from(Vec::<String>::new()),
             full_range: zero,
             selection_range: zero,
             dependency: true,
             library_source: false,
+            synthetic: false,
         }
     }
 
     /// A synthetic dependency entry in a given package.
     fn jdk_entry(name: &str, kind: IndexKind, package: Option<&str>) -> SymbolEntry {
         let mut entry = synthetic_entry(name, kind);
-        entry.package = package.map(str::to_string);
+        entry.package = package.map(std::sync::Arc::from);
         entry
     }
 
@@ -7117,6 +7503,10 @@ class Sample {
         engine
             .index
             .set_types(std::sync::Arc::new(TypeModel::from_entries(&entries)));
+        // A fully-built model is the post-scan world; mark it ready so the
+        // diagnostics gate (which waits for the source scan) does not suppress
+        // semantic diagnostics in these tests.
+        engine.index.set_ready();
         engine
     }
 
@@ -7143,7 +7533,64 @@ class Sample {
     fn engine_with_model(model: TypeModel) -> TreeSitterEngine {
         let engine = TreeSitterEngine::new();
         engine.index.set_types(std::sync::Arc::new(model));
+        engine.index.set_ready();
         engine
+    }
+
+    #[test]
+    fn semantic_diagnostics_wait_for_a_finished_scan() {
+        let engine = TreeSitterEngine::new();
+        engine.set_semantic_diagnostics(true);
+        engine
+            .index
+            .set_types(std::sync::Arc::new(TypeModel::from_entries(&[
+                synthetic_entry("Object", IndexKind::Class),
+                synthetic_entry("String", IndexKind::Class),
+            ])));
+        // The base vouches for java.lang, but the source scan has not finished:
+        // a referring file must not be flagged unresolved yet.
+        let text = "class Sample {\n    Missing m;\n}\n";
+        engine.open(&uri(), text, 1);
+        assert!(diagnostics_of(&engine, &uri()).is_empty());
+
+        // Once the scan finishes, the unresolved symbol is reported.
+        engine.index.set_ready();
+        assert!(!diagnostics_of(&engine, &uri()).is_empty());
+    }
+
+    /// A library (JDK/jar) member completes before the source scan finishes: the
+    /// base layers are served while `ready` is still false, so features answer
+    /// mid-scan.
+    #[test]
+    fn a_library_member_completes_before_the_source_scan_finishes() {
+        let engine = TreeSitterEngine::new();
+        // A JDK-like base, as the JDK producer publishes it before `ready` flips.
+        let source = "public final class String {\n    public int length() { return 0; }\n}\n";
+        let mut parser = java_parser();
+        let tree = parser.parse(source.as_bytes(), None).expect("parse");
+        let mut model = TypeModel::new();
+        model.extend(types::collect_type_infos(Some("java.lang"), &tree, source));
+        model.insert(types::TypeInfo::new(
+            "Object".to_string(),
+            Some("java.lang".to_string()),
+            IndexKind::Class,
+        ));
+        engine.index.set_types(std::sync::Arc::new(model));
+        assert!(!engine.index_ready());
+
+        let text = "class Use {\n    void m(String s) {\n        s.\n    }\n}\n";
+        engine.open(&uri(), text, 1);
+        let offset = text.find("s.\n").unwrap() + "s.".len();
+        match engine.completions(&uri(), lsp_position(text, offset)) {
+            Some(CompletionResponse::Array(items)) => {
+                let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+                assert!(
+                    labels.iter().any(|label| label.contains("length")),
+                    "{labels:?}"
+                );
+            }
+            other => panic!("expected a completion array, got {other:?}"),
+        }
     }
 
     fn list_model() -> TypeModel {
@@ -7186,8 +7633,8 @@ class Sample {
         helper_text: &str,
         prefix_len: usize,
     ) -> Vec<CompletionItem> {
-        engine.open(&uri(), open_text);
-        engine.open(helper_uri, helper_text);
+        engine.open(&uri(), open_text, 1);
+        engine.open(helper_uri, helper_text, 1);
         let Some(CompletionResponse::Array(items)) =
             engine.completions(&uri(), lsp_position(open_text, offset))
         else {
@@ -7288,7 +7735,7 @@ package com.a;\n\nclass Sample {\n    void m() {\n        Widget w;\n    }\n}\n"
         // Same file: the document's own class is indexed under the same uri
         // — no edit (and same package anyway).
         let engine = TreeSitterEngine::new();
-        engine.open(&uri(), open_text);
+        engine.open(&uri(), open_text, 1);
         let offset = open_text.find("Sample").unwrap() + "Sample".len();
         let Some(CompletionResponse::Array(items)) =
             engine.completions(&uri(), lsp_position(open_text, offset))
@@ -7370,10 +7817,13 @@ package com.a;\n\nclass Sample {\n    void m() {\n        String s = getNa;\n   
             "getNa".len(),
         );
 
+        // The helper buffer is part of the overlay (D4), so the model resolves
+        // the member: it is offered with its real signature, import included.
         let get_name = items
             .iter()
-            .find(|item| item.label == "Widget.getName")
+            .find(|item| item.filter_text.as_deref() == Some("getName"))
             .expect("member offered");
+        assert_eq!(get_name.label, "String getName()");
         let edits = get_name
             .additional_text_edits
             .as_ref()
@@ -7601,9 +8051,10 @@ class Widget {
                 synthetic_entry("Object", IndexKind::Class),
                 synthetic_entry("String", IndexKind::Class),
             ])));
+        engine.index.set_ready();
         let text = "class Sample implements Missing, Also {\n}\n";
-        engine.open(&uri(), text);
-        let diagnostics = engine.diagnostics(&uri());
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
         assert_eq!(diagnostics.len(), 2, "{diagnostics:?}");
         assert_eq!(
             diagnostics
@@ -7658,7 +8109,7 @@ public class Use {
         );
         let engine = scanned_engine(&root_uri);
         let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&use_uri, use_text);
+        engine.open(&use_uri, use_text, 1);
         let cursor = lsp_position(use_text, use_text.find("w.run()").unwrap() + 2);
 
         let references = engine.references(&use_uri, cursor, true);
@@ -7696,7 +8147,7 @@ public class Use {
         );
         let engine = scanned_engine(&root_uri);
         let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&use_uri, use_text);
+        engine.open(&use_uri, use_text, 1);
         let cursor = lsp_position(use_text, use_text.find("Widget w").unwrap() + 1);
 
         let with = engine.references(&use_uri, cursor, true);
@@ -7734,7 +8185,7 @@ public class Use {
         );
         let engine = scanned_engine(&root_uri);
         let uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&uri, use_text);
+        engine.open(&uri, use_text, 1);
         let cursor = lsp_position(
             use_text,
             use_text.find("import b").unwrap() + "import ".len(),
@@ -7765,7 +8216,7 @@ public class Use {
         model.insert(dep);
         engine.index.set_types(std::sync::Arc::new(model));
         let uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&uri, source);
+        engine.open(&uri, source, 1);
         let cursor = lsp_position(source, source.find("d.value()").unwrap() + 2);
         assert!(engine.references(&uri, cursor, true).is_empty());
         assert!(engine.rename(&uri, cursor, "amount").is_none());
@@ -7779,7 +8230,7 @@ public class Use {
         let (root, root_uri) = temp_workspace("initializer-use", &[("a/Use.java", source)]);
         let engine = scanned_engine(&root_uri);
         let uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
-        engine.open(&uri, source);
+        engine.open(&uri, source, 1);
         // Cursor on the initializer `a` of `int b = a;`.
         let cursor = lsp_position(source, source.find("b = a").unwrap() + "b = ".len());
 
@@ -7811,7 +8262,7 @@ public class Use {
         let engine = scanned_engine(&root_uri);
         let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
         let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
-        engine.open(&use_uri, &use_text);
+        engine.open(&use_uri, &use_text, 1);
         let cursor = lsp_position(&use_text, use_text.find("Widget w").unwrap() + 1);
 
         let references = engine.references(&use_uri, cursor, true);
@@ -7839,11 +8290,758 @@ public class Use {
         let engine = scanned_engine(&root_uri);
         let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
         let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
-        engine.open(&use_uri, &use_text);
+        engine.open(&use_uri, &use_text, 1);
         // A candidate file disappears after the scan, so it cannot be read.
         std::fs::remove_file(root.join("a/Widget.java")).unwrap();
         let cursor = lsp_position(&use_text, use_text.find("Widget w").unwrap() + 1);
 
         assert!(engine.rename(&use_uri, cursor, "Gadget").is_none());
+    }
+
+    /// The workspace search runs on its own parser, never the shared one: holding
+    /// `engine.parser` — as `store_tree` does for the length of a parse on every
+    /// edit — must not block `references` or `rename`. The method here is
+    /// overloaded, so target resolution also routes through `entry_method_params`,
+    /// which reads and parses a declaration in another file.
+    #[test]
+    fn a_search_runs_on_its_own_parser_not_the_shared_one() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let (root, root_uri) = temp_workspace(
+            "search-own-parser",
+            &[
+                (
+                    "a/Widget.java",
+                    "package a;\n\npublic class Widget {\n    public void run(int n) {}\n    public void run(String s) {}\n}\n",
+                ),
+                (
+                    "a/Use.java",
+                    "package a;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n        w.run(1);\n    }\n}\n",
+                ),
+            ],
+        );
+        let engine = std::sync::Arc::new(scanned_engine(&root_uri));
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, &use_text, 1);
+        let cursor = lsp_position(&use_text, use_text.find("w.run").unwrap() + 2);
+
+        // Hold the shared parser for the whole request, as an in-flight edit
+        // would for the length of its parse.
+        let guard = engine.parser.lock().expect("shared parser lock");
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::sync::Arc::clone(&engine);
+        let worker_uri = use_uri.clone();
+        let handle = std::thread::spawn(move || {
+            let references = worker.references(&worker_uri, cursor, true);
+            let renamed = worker.rename(&worker_uri, cursor, "execute").is_some();
+            let _ = sender.send((references, renamed));
+        });
+        let received = receiver.recv_timeout(std::time::Duration::from_secs(10));
+        // Release the shared parser first, so a regression cannot wedge the worker
+        // on the way out of a failed assertion.
+        drop(guard);
+        let Ok((references, renamed)) = received else {
+            panic!("the search blocked on the shared parser lock");
+        };
+        handle.join().expect("the search thread must finish");
+        assert!(renamed, "rename must not wait on the shared parser");
+        assert!(
+            !references.is_empty(),
+            "references must not wait on the shared parser"
+        );
+    }
+
+    /// A name shared across many files yields exactly the expected reference set:
+    /// every visible use, the declaration when asked, and nothing from a
+    /// same-named type the files cannot see.
+    #[test]
+    fn references_for_a_name_shared_across_files_are_exact() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let widget = "package a;\n\npublic class Widget {\n}\n";
+        let mut sources: Vec<(String, String)> = vec![
+            ("a/Widget.java".to_string(), widget.to_string()),
+            (
+                "b/Widget.java".to_string(),
+                "package b;\n\npublic class Widget {\n}\n".to_string(),
+            ),
+        ];
+        for i in 0..6 {
+            sources.push((
+                format!("a/U{i}.java"),
+                format!("package a;\n\npublic class U{i} {{\n    Widget w{i} = null;\n}}\n"),
+            ));
+        }
+        let files: Vec<(&str, &str)> = sources
+            .iter()
+            .map(|(path, text)| (path.as_str(), text.as_str()))
+            .collect();
+        let (root, root_uri) = temp_workspace("shared-name-refs", &files);
+        let engine = scanned_engine(&root_uri);
+
+        let requested_path = "a/U3.java";
+        let requested_text = sources
+            .iter()
+            .find(|(path, _)| path == requested_path)
+            .map(|(_, text)| text.clone())
+            .unwrap();
+        let requested_uri = Url::from_file_path(root.join(requested_path)).unwrap();
+        engine.open(&requested_uri, &requested_text, 1);
+        let cursor = lsp_position(
+            &requested_text,
+            requested_text.find("Widget w3").unwrap() + 1,
+        );
+
+        // The last two path segments, so `a/Widget.java` and `b/Widget.java` stay
+        // distinct while the random temp root falls away.
+        let tail = |uri: &Url| {
+            let mut parts: Vec<&str> = uri.path().rsplit('/').take(2).collect();
+            parts.reverse();
+            parts.join("/")
+        };
+        let mut actual: Vec<(String, u32, u32)> = engine
+            .references(&requested_uri, cursor, true)
+            .iter()
+            .map(|location| {
+                (
+                    tail(&location.uri),
+                    location.range.start.line,
+                    location.range.start.character,
+                )
+            })
+            .collect();
+        actual.sort();
+
+        let at = |name: &str, source: &str, byte: usize| {
+            let position = lsp_position(source, byte);
+            (name.to_string(), position.line, position.character)
+        };
+        let mut expected = vec![at(
+            "a/Widget.java",
+            widget,
+            widget.find("class Widget").unwrap() + "class ".len(),
+        )];
+        for i in 0..6 {
+            let source =
+                format!("package a;\n\npublic class U{i} {{\n    Widget w{i} = null;\n}}\n");
+            expected.push(at(
+                &format!("a/U{i}.java"),
+                &source,
+                source.find(&format!("Widget w{i}")).unwrap(),
+            ));
+        }
+        expected.sort();
+
+        assert_eq!(actual, expected);
+        assert!(
+            !actual.iter().any(|(name, _, _)| name == "b/Widget.java"),
+            "an unseen same-named type must not contribute: {actual:?}"
+        );
+    }
+
+    #[test]
+    fn signature_help_lists_constructor_overloads_for_new() {
+        let text = "\
+class Point {
+    Point(int x) {}
+    Point(int x, int y) {}
+}
+class Use {
+    void m() {
+        Point p = new Point(1, 2);
+    }
+}
+";
+        let engine = engine_with(text);
+        let help = engine
+            .signature_help(&uri(), after(text, "new Point("))
+            .expect("signature help");
+        let labels: Vec<&str> = help
+            .signatures
+            .iter()
+            .map(|signature| signature.label.as_str())
+            .collect();
+        assert_eq!(labels, ["Point(int x)", "Point(int x, int y)"]);
+        assert_eq!(help.signatures[0].active_parameter, Some(0));
+    }
+
+    #[test]
+    fn signature_help_answers_an_implicit_no_arg_constructor() {
+        let text =
+            "class Plain {}\nclass Use {\n    void m() {\n        Plain p = new Plain();\n    }\n}\n";
+        let engine = engine_with(text);
+        let help = engine
+            .signature_help(&uri(), after(text, "new Plain("))
+            .expect("signature help");
+        assert_eq!(help.signatures.len(), 1);
+        assert_eq!(help.signatures[0].label, "Plain()");
+    }
+
+    #[test]
+    fn definition_on_new_lands_on_the_matching_constructor() {
+        let text = "\
+class Point {
+    Point(int x) {}
+    Point(String s) {}
+}
+class Use {
+    void m() {
+        Point p = new Point(1);
+        Point q = new Point(\"a\");
+    }
+}
+";
+        let engine = engine_with(text);
+        let at =
+            |needle: &str| lsp_position(text, text.find(needle).expect("needle") + "new Poi".len());
+        // The argument types pick the overload, so the two calls land on
+        // different declaration lines.
+        let int_ctor = engine
+            .definition(&uri(), at("new Point(1)"))
+            .expect("int constructor");
+        assert_eq!(int_ctor.range.start.line, 1);
+        let string_ctor = engine
+            .definition(&uri(), at("new Point(\"a\")"))
+            .expect("String constructor");
+        assert_eq!(string_ctor.range.start.line, 2);
+    }
+
+    #[test]
+    fn references_from_a_constructor_declaration_find_new_sites() {
+        let text = "\
+class Point {
+    Point(int x) {}
+}
+class Use {
+    void m() {
+        Point a = new Point(1);
+        Point b = new Point(2);
+    }
+}
+";
+        let engine = engine_with(text);
+        let cursor = lsp_position(text, text.find("Point(int x)").unwrap() + 2);
+        let references = engine.references(&uri(), cursor, false);
+        assert_eq!(references.len(), 2, "{references:?}");
+
+        let with_declaration = engine.references(&uri(), cursor, true);
+        assert_eq!(with_declaration.len(), 3, "{with_declaration:?}");
+        // Rename has no constructor declaration of its own to rewrite.
+        assert!(engine.rename(&uri(), cursor, "Origin").is_none());
+    }
+
+    #[test]
+    fn constructor_parameter_hints_name_new_arguments() {
+        let text = "\
+class Point {
+    Point(int x, int y) {}
+}
+class Use {
+    void m() {
+        Point p = new Point(1, 2);
+    }
+}
+";
+        let engine = engine_with(text);
+        let labels: Vec<String> = hints_in(&engine, full_range(text))
+            .into_iter()
+            .map(|(_, label)| label)
+            .collect();
+        assert!(labels.contains(&"x:".to_string()), "{labels:?}");
+        assert!(labels.contains(&"y:".to_string()), "{labels:?}");
+    }
+
+    #[test]
+    fn dot_completion_does_not_offer_a_constructor() {
+        let text = "\
+class Point {
+    Point(int x) {}
+    int value() { return 0; }
+}
+class Use {
+    void m() {
+        Point p = new Point(1);
+        p.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("p.\n").expect("cursor") + 2;
+        let response = engine
+            .completions(&uri(), lsp_position(text, offset))
+            .expect("completions");
+        let items = match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        assert!(
+            items.iter().any(|item| item.label.contains("value(")),
+            "{items:?}"
+        );
+        assert!(
+            !items.iter().any(|item| item.label.starts_with("Point")),
+            "a constructor must not be a member: {items:?}"
+        );
+    }
+
+    #[test]
+    fn workspace_symbols_exclude_constructors() {
+        let text = "class Point {\n    Point(int x) {}\n}\n";
+        let engine = engine_with(text);
+        let names: Vec<String> = engine
+            .workspace_symbols("Point")
+            .into_iter()
+            .map(|symbol| symbol.name)
+            .collect();
+        assert_eq!(names, ["Point"], "only the type, never its constructor");
+    }
+
+    #[test]
+    fn definition_of_a_library_constructor_is_none() {
+        let engine = engine_with_types(vec![jdk_entry(
+            "Point",
+            IndexKind::Class,
+            Some("java.lang"),
+        )]);
+        let text = "class Use {\n    void m() {\n        Object p = new Point(1);\n    }\n}\n";
+        engine.open(&uri(), text, 1);
+        let offset = text.find("new Point").unwrap() + "new Poi".len();
+        assert!(engine
+            .definition(&uri(), lsp_position(text, offset))
+            .is_none());
+    }
+
+    const LOMBOK_BEAN: &str = "\
+class Bean {
+    @Getter
+    private int count;
+}
+class Use {
+    void m(Bean b) {
+        int x = b.getCount();
+        int y = b.getCount();
+    }
+}
+";
+
+    #[test]
+    fn dot_completion_offers_lombok_generated_members() {
+        let text = "\
+@Getter
+class Bean {
+    private int count;
+    void use() {
+        Bean b = new Bean();
+        b.
+    }
+}
+";
+        let engine = engine_with(text);
+        let offset = text.find("b.\n").expect("cursor") + 2;
+        let response = engine
+            .completions(&uri(), lsp_position(text, offset))
+            .expect("completions");
+        let items = match response {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        assert!(
+            items.iter().any(|item| item.label.contains("getCount(")),
+            "{items:?}"
+        );
+    }
+
+    #[test]
+    fn a_lombok_accessor_resolves_and_only_a_real_unknown_member_is_reported() {
+        let engine = engine_with_model(source_model(
+            "com.a",
+            "@Getter\nclass Bean {\n    private int count;\n}\n",
+        ));
+        let text = "\
+package com.a;
+
+class Use {
+    void m(Bean b) {
+        int ok = b.getCount();
+        int bad = b.missing();
+    }
+}
+";
+        engine.open(&uri(), text, 1);
+        let diagnostics = diagnostics_of(&engine, &uri());
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].code,
+            Some(NumberOrString::String("unresolved-member".to_string()))
+        );
+    }
+
+    #[test]
+    fn definition_on_a_lombok_accessor_lands_on_the_field() {
+        let engine = engine_with(LOMBOK_BEAN);
+        let offset = LOMBOK_BEAN.find("b.getCount").unwrap() + "b.get".len();
+        let location = engine
+            .definition(&uri(), lsp_position(LOMBOK_BEAN, offset))
+            .expect("definition");
+        // The annotated field `private int count;` is on line 2.
+        assert_eq!(location.range.start.line, 2);
+    }
+
+    #[test]
+    fn references_on_a_lombok_accessor_find_call_sites_and_rename_refuses() {
+        let engine = engine_with(LOMBOK_BEAN);
+        let cursor = lsp_position(
+            LOMBOK_BEAN,
+            LOMBOK_BEAN.find("b.getCount").unwrap() + "b.get".len(),
+        );
+        let references = engine.references(&uri(), cursor, false);
+        assert_eq!(references.len(), 2, "{references:?}");
+        assert!(engine.rename(&uri(), cursor, "getNumberOf").is_none());
+    }
+
+    #[test]
+    fn implementation_lists_every_workspace_subtype_transitively() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let greeter = "package demo;\n\ninterface Greeter {\n    void greet();\n}\n";
+        let (root, root_uri) = temp_workspace(
+            "impl-type",
+            &[
+                ("demo/Greeter.java", greeter),
+                (
+                    "demo/Base.java",
+                    "package demo;\n\nabstract class Base implements Greeter {\n}\n",
+                ),
+                (
+                    "demo/English.java",
+                    "package demo;\n\nclass English extends Base {\n    public void greet() {}\n}\n",
+                ),
+                (
+                    "demo/Friendly.java",
+                    "package demo;\n\ninterface Friendly extends Greeter {\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let uri = Url::from_file_path(root.join("demo/Greeter.java")).unwrap();
+        engine.open(&uri, greeter, 1);
+        let cursor = lsp_position(
+            greeter,
+            greeter.find("interface Greeter").unwrap() + "interface ".len(),
+        );
+
+        let locations = engine.implementation(&uri, cursor);
+        let mut names: Vec<&str> = locations
+            .iter()
+            .map(|location| location.uri.path().rsplit('/').next().unwrap())
+            .collect();
+        names.sort();
+        // The abstract intermediate, the concrete subclass, and the
+        // sub-interface are all implementations; the contract itself is not.
+        assert_eq!(names, ["Base.java", "English.java", "Friendly.java"]);
+    }
+
+    #[test]
+    fn implementation_narrows_a_member_contract_to_the_selected_overload() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let greeter = "package demo;\n\ninterface Greeter2 {\n    void greet(String who);\n    void greet(int times);\n}\n";
+        let (root, root_uri) = temp_workspace(
+            "impl-member",
+            &[
+                ("demo/Greeter2.java", greeter),
+                (
+                    "demo/A.java",
+                    "package demo;\n\nclass A implements Greeter2 {\n    public void greet(String who) {}\n    public void greet(int times) {}\n}\n",
+                ),
+                (
+                    "demo/B.java",
+                    "package demo;\n\nclass B implements Greeter2 {\n    public void greet(int times) {}\n}\n",
+                ),
+                // Inherits `greet` from A without declaring it: not an override.
+                ("demo/C.java", "package demo;\n\nclass C extends A {\n}\n"),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let uri = Url::from_file_path(root.join("demo/Greeter2.java")).unwrap();
+        engine.open(&uri, greeter, 1);
+        let cursor = lsp_position(greeter, greeter.find("greet(String").unwrap());
+
+        let locations = engine.implementation(&uri, cursor);
+        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert!(locations[0].uri.path().ends_with("A.java"));
+    }
+
+    #[test]
+    fn implementation_matches_a_single_overload_by_name_alone() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let one = "package demo;\n\ninterface One {\n    void ping();\n}\n";
+        let (root, root_uri) = temp_workspace(
+            "impl-name-only",
+            &[
+                ("demo/One.java", one),
+                (
+                    "demo/Impl.java",
+                    "package demo;\n\nclass Impl implements One {\n    public void ping() {}\n}\n",
+                ),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let uri = Url::from_file_path(root.join("demo/One.java")).unwrap();
+        engine.open(&uri, one, 1);
+        let cursor = lsp_position(one, one.find("void ping").unwrap() + "void ".len());
+
+        let locations = engine.implementation(&uri, cursor);
+        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert!(locations[0].uri.path().ends_with("Impl.java"));
+    }
+
+    #[test]
+    fn implementation_answers_from_a_library_contract() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let task =
+            "package demo;\n\nclass Task implements Runnable {\n    public void run() {}\n}\n";
+        let caller = "package demo;\n\nclass Caller {\n    void m(Runnable r) {\n        r.run();\n    }\n}\n";
+        let (root, root_uri) = temp_workspace(
+            "impl-library",
+            &[("demo/Task.java", task), ("demo/Caller.java", caller)],
+        );
+        let engine = scanned_engine(&root_uri);
+        // A JDK interface the workspace does not declare: it lives only in the
+        // non-source base, as an indexed `java.lang` type would.
+        engine.index.set_types(std::sync::Arc::new(source_model(
+            "java.lang",
+            "public interface Runnable {\n    void run();\n}\n",
+        )));
+
+        let task_uri = Url::from_file_path(root.join("demo/Task.java")).unwrap();
+        engine.open(&task_uri, task, 1);
+        let type_cursor = lsp_position(
+            task,
+            task.find("implements Runnable").unwrap() + "implements ".len(),
+        );
+        let locations = engine.implementation(&task_uri, type_cursor);
+        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert!(locations[0].uri.path().ends_with("Task.java"));
+
+        let caller_uri = Url::from_file_path(root.join("demo/Caller.java")).unwrap();
+        engine.open(&caller_uri, caller, 1);
+        let member_cursor = lsp_position(caller, caller.find("r.run").unwrap() + "r.".len());
+        let locations = engine.implementation(&caller_uri, member_cursor);
+        assert_eq!(locations.len(), 1, "{locations:?}");
+        assert!(locations[0].uri.path().ends_with("Task.java"));
+    }
+
+    #[test]
+    fn implementation_refuses_cursors_that_name_no_contract() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let solo = "package demo;\n\nclass Solo {\n    int count;\n    Solo() {}\n}\n";
+        let (root, root_uri) = temp_workspace("impl-none", &[("demo/Solo.java", solo)]);
+        let engine = scanned_engine(&root_uri);
+        let uri = Url::from_file_path(root.join("demo/Solo.java")).unwrap();
+        engine.open(&uri, solo, 1);
+
+        // A field and a constructor name no contract.
+        let field = lsp_position(solo, solo.find("count").unwrap());
+        assert!(engine.implementation(&uri, field).is_empty());
+        let constructor = lsp_position(solo, solo.find("Solo()").unwrap());
+        assert!(engine.implementation(&uri, constructor).is_empty());
+        // A type with no workspace implementations.
+        let ty = lsp_position(solo, solo.find("class Solo").unwrap() + "class ".len());
+        assert!(engine.implementation(&uri, ty).is_empty());
+    }
+
+    /// Every feature that reads the layered type model gives the same answer
+    /// through the cached, name-indexed view as through the merged model: a name
+    /// shared by two packages resolves per the import, never across packages.
+    #[test]
+    fn shared_name_across_packages_keeps_each_features_answer() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let a_widget = "package a;\n\npublic class Widget {\n    public int size() { return 0; }\n    public int size(int extra) { return extra; }\n    public void run() {}\n}\n";
+        let b_widget =
+            "package b;\n\npublic class Widget {\n    public String label() { return null; }\n}\n";
+        let use_text = "package a;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n        w.run();\n        w.size();\n        w.size(1);\n    }\n}\n";
+        let other = "package c;\n\nimport a.Widget;\n\npublic class Other {\n    void n() {\n        Widget w = null;\n        w.size();\n    }\n}\n";
+        let (root, root_uri) = temp_workspace(
+            "shared-name-features",
+            &[
+                ("a/Widget.java", a_widget),
+                ("b/Widget.java", b_widget),
+                ("a/Use.java", use_text),
+                ("c/Other.java", other),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
+        engine.open(&use_uri, use_text, 1);
+
+        // Diagnostics: the file is consistent.
+        assert!(diagnostics_of(&engine, &use_uri).is_empty());
+
+        // Hover on the receiver's member resolves to `a.Widget`, not `b.Widget`.
+        let hover = engine
+            .hover(
+                &use_uri,
+                lsp_position(use_text, use_text.find("w.run();").unwrap() + 2),
+            )
+            .expect("hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected markup");
+        };
+        assert!(markup.value.contains("run"), "{}", markup.value);
+        assert!(!markup.value.contains("label"), "{}", markup.value);
+
+        // Member completion offers `a.Widget`'s members only.
+        let after_dot = use_text.find("w.run();").unwrap() + "w.".len();
+        let Some(CompletionResponse::Array(items)) =
+            engine.completions(&use_uri, lsp_position(use_text, after_dot))
+        else {
+            panic!("expected member items");
+        };
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.starts_with("void run")),
+            "{labels:?}"
+        );
+        assert!(
+            labels.iter().any(|l| l.starts_with("int size")),
+            "{labels:?}"
+        );
+        assert!(!labels.iter().any(|l| l.contains("label")), "{labels:?}");
+
+        // Signature help lists the receiver's overloads.
+        let call = use_text.find("w.size(1)").unwrap() + "w.size(".len();
+        let help = engine
+            .signature_help(&use_uri, lsp_position(use_text, call))
+            .expect("signature help");
+        assert!(
+            help.signatures.iter().any(|s| s.label.contains("size")),
+            "{:?}",
+            help.signatures
+        );
+
+        // Inlay hints restate the declared local's type from the same model.
+        let hints: Vec<(Position, String)> = engine
+            .inlay_hints(&use_uri, full_range(use_text))
+            .into_iter()
+            .map(|hint| (hint.position, hint_label(&hint).to_string()))
+            .collect();
+        assert!(
+            hints.contains(&(after(use_text, "Widget w"), ": Widget".to_string())),
+            "{hints:?}"
+        );
+
+        // References stay within the package that can see `a.Widget`.
+        let cursor = lsp_position(use_text, use_text.find("Widget w").unwrap() + 1);
+        let uris = file_uris(&engine.references(&use_uri, cursor, true));
+        assert!(
+            uris.iter().any(|p| p.ends_with("a/Widget.java")),
+            "{uris:?}"
+        );
+        assert!(uris.iter().any(|p| p.ends_with("a/Use.java")), "{uris:?}");
+        assert!(uris.iter().any(|p| p.ends_with("c/Other.java")), "{uris:?}");
+        assert!(
+            !uris.iter().any(|p| p.ends_with("b/Widget.java")),
+            "same-named type in another package must not be touched: {uris:?}"
+        );
+    }
+
+    /// A contract's implementation search finds same-named implementers in
+    /// different packages, all through the name-indexed view.
+    #[test]
+    fn shared_name_implementers_across_packages_are_both_found() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let shape = "package demo;\n\npublic interface Shape {\n    void draw();\n}\n";
+        let impl_a = "package a;\n\nimport demo.Shape;\n\npublic class Impl implements Shape {\n    public void draw() {}\n}\n";
+        let impl_b = "package b;\n\nimport demo.Shape;\n\npublic class Impl implements Shape {\n    public void draw() {}\n}\n";
+        let (root, root_uri) = temp_workspace(
+            "shared-name-impl",
+            &[
+                ("demo/Shape.java", shape),
+                ("a/Impl.java", impl_a),
+                ("b/Impl.java", impl_b),
+            ],
+        );
+        let engine = scanned_engine(&root_uri);
+        let shape_uri = Url::from_file_path(root.join("demo/Shape.java")).unwrap();
+        engine.open(&shape_uri, shape, 1);
+
+        let cursor = lsp_position(
+            shape,
+            shape.find("interface Shape").unwrap() + "interface ".len(),
+        );
+        let uris = file_uris(&engine.implementation(&shape_uri, cursor));
+        assert!(uris.iter().any(|p| p.ends_with("a/Impl.java")), "{uris:?}");
+        assert!(uris.iter().any(|p| p.ends_with("b/Impl.java")), "{uris:?}");
+    }
+
+    /// An open buffer's edited model replaces its warm-up source for every
+    /// feature: the new member is offered and the removed one is gone.
+    #[test]
+    fn open_buffer_overrides_the_warmup_model_for_every_feature() {
+        let _env = crate::jdk::env_lock();
+        std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+        let widget_disk = "package a;\n\npublic class Widget {\n    public void run() {}\n}\n";
+        let use_disk = "package b;\n\nimport a.Widget;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n        w.run();\n    }\n}\n";
+        let widget_edited = "package a;\n\npublic class Widget {\n    public void extra() {}\n}\n";
+        let use_edited = "package b;\n\nimport a.Widget;\n\npublic class Use {\n    void m() {\n        Widget w = null;\n        var copy = w;\n        w.extra();\n    }\n}\n";
+        let (root, root_uri) = temp_workspace(
+            "open-override",
+            &[("a/Widget.java", widget_disk), ("b/Use.java", use_disk)],
+        );
+        let engine = scanned_engine(&root_uri);
+        let widget_uri = Url::from_file_path(root.join("a/Widget.java")).unwrap();
+        let use_uri = Url::from_file_path(root.join("b/Use.java")).unwrap();
+        engine.open(&widget_uri, widget_edited, 2);
+        engine.open(&use_uri, use_edited, 2);
+
+        // Diagnostics reflect the edited model: `extra` resolves, `run` is gone.
+        assert!(diagnostics_of(&engine, &use_uri).is_empty());
+
+        // Member completion offers the edited member and not the removed one.
+        let after_dot = use_edited.find("w.extra();").unwrap() + "w.".len();
+        let Some(CompletionResponse::Array(items)) =
+            engine.completions(&use_uri, lsp_position(use_edited, after_dot))
+        else {
+            panic!("expected member items");
+        };
+        let labels: Vec<&str> = items.iter().map(|item| item.label.as_str()).collect();
+        assert!(
+            labels.iter().any(|l| l.starts_with("void extra")),
+            "{labels:?}"
+        );
+        assert!(
+            !labels.iter().any(|l| l.starts_with("void run")),
+            "{labels:?}"
+        );
+
+        // Hover resolves through the edited model too.
+        let hover = engine
+            .hover(
+                &use_uri,
+                lsp_position(use_edited, use_edited.find("w.extra();").unwrap() + 2),
+            )
+            .expect("hover");
+        let HoverContents::Markup(markup) = hover.contents else {
+            panic!("expected markup");
+        };
+        assert!(markup.value.contains("extra"), "{}", markup.value);
+
+        // Inlay hints read the edited model for an inferred `var`.
+        let hints: Vec<(Position, String)> = engine
+            .inlay_hints(&use_uri, full_range(use_edited))
+            .into_iter()
+            .map(|hint| (hint.position, hint_label(&hint).to_string()))
+            .collect();
+        assert!(
+            hints.contains(&(after(use_edited, "var copy"), ": Widget".to_string())),
+            "{hints:?}"
+        );
     }
 }

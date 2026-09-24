@@ -9,6 +9,7 @@
 
 use std::io::Read;
 use std::path::Path;
+use std::sync::Arc;
 
 use tower_lsp::lsp_types::{Position, Range, Url};
 
@@ -25,6 +26,8 @@ pub struct ClassInfo {
     pub fields: Vec<String>,
     /// Declared members, public and non-synthetic, with descriptor types.
     pub members: Vec<Member>,
+    /// Public constructors (`<init>`), named after the enclosing type.
+    pub constructors: Vec<Member>,
     /// The superclass and interfaces, as dotted references. The implicit
     /// `java.lang.Object` is not recorded (see the request's Decisions).
     pub supertypes: Vec<Ty>,
@@ -35,7 +38,7 @@ pub struct ClassInfo {
 /// supertypes) — one pass over the archive, so no caller parses it twice.
 pub fn jar_outputs(path: &Path) -> Option<(Vec<SymbolEntry>, Vec<TypeInfo>)> {
     let data = std::fs::read(path).ok()?;
-    let jar_url = Url::from_file_path(path).ok()?;
+    let jar_url = Arc::new(Url::from_file_path(path).ok()?);
     let entries = read_zip_entries(&data)?;
     let mut out = Vec::new();
     let mut types = Vec::new();
@@ -81,6 +84,7 @@ pub fn class_type_info(info: &ClassInfo) -> Option<TypeInfo> {
             info_type.fields.push(member.clone());
         }
     }
+    info_type.constructors = info.constructors.clone();
     Some(info_type)
 }
 
@@ -94,13 +98,13 @@ pub fn entries_from_jar(path: &Path) -> Option<Vec<SymbolEntry>> {
 /// zero because jar locations are not openable, and these entries are flagged
 /// as dependencies so navigation filters them out. The package comes from the
 /// internal name so completions can import the type.
-pub fn class_entries(jar_url: &Url, info: &ClassInfo) -> Vec<SymbolEntry> {
+pub fn class_entries(jar_url: &Arc<Url>, info: &ClassInfo) -> Vec<SymbolEntry> {
     let zero = Range::new(Position::new(0, 0), Position::new(0, 0));
     let simple = info.internal_name.rsplit('/').next().unwrap_or("");
-    let package = info
+    let package: Option<Arc<str>> = info
         .internal_name
         .rsplit_once('/')
-        .map(|(directory, _)| directory.replace('/', "."));
+        .map(|(directory, _)| Arc::from(directory.replace('/', ".")));
     let mut container: Vec<String> = simple
         .split('$')
         .filter(|segment| !segment.is_empty())
@@ -111,49 +115,52 @@ pub fn class_entries(jar_url: &Url, info: &ClassInfo) -> Vec<SymbolEntry> {
         return Vec::new();
     }
 
+    // A member's container is its type's chain plus the type's own name. One
+    // `Arc` is built and shared by every member, rather than cloning the vector
+    // and allocating a fresh `Arc` per member — a jar's members are millions.
+    let member_container: Arc<[String]> = {
+        let mut c = container.clone();
+        c.push(name.clone());
+        Arc::from(c)
+    };
     let mut out = vec![SymbolEntry {
-        uri: jar_url.clone(),
+        uri: Arc::clone(jar_url),
         name: name.clone(),
         kind: info.kind,
         package: package.clone(),
-        container: container.clone(),
+        container: Arc::from(container),
         full_range: zero,
         selection_range: zero,
         dependency: true,
         library_source: false,
+        synthetic: false,
     }];
     for method in &info.methods {
         out.push(SymbolEntry {
-            uri: jar_url.clone(),
+            uri: Arc::clone(jar_url),
             name: method.clone(),
             kind: IndexKind::Method,
             package: package.clone(),
-            container: {
-                let mut c = container.clone();
-                c.push(name.clone());
-                c
-            },
+            container: Arc::clone(&member_container),
             full_range: zero,
             selection_range: zero,
             dependency: true,
             library_source: false,
+            synthetic: false,
         });
     }
     for field in &info.fields {
         out.push(SymbolEntry {
-            uri: jar_url.clone(),
+            uri: Arc::clone(jar_url),
             name: field.clone(),
             kind: IndexKind::Field,
             package: package.clone(),
-            container: {
-                let mut c = container.clone();
-                c.push(name.clone());
-                c
-            },
+            container: Arc::clone(&member_container),
             full_range: zero,
             selection_range: zero,
             dependency: true,
             library_source: false,
+            synthetic: false,
         });
     }
     out
@@ -264,6 +271,23 @@ pub fn parse_class(data: &[u8]) -> Result<ClassInfo, String> {
         let count = reader.u2()?;
         read_members(&mut reader, count, &utf8_at, IndexKind::Method)?
     };
+    // `<init>` is a constructor, not a method: it is modelled separately and
+    // renamed to the enclosing type's simple name, which is what `new T(...)`
+    // targets. `<clinit>`, private, and synthetic members were already dropped.
+    let simple_name = internal_name
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .rsplit('$')
+        .next()
+        .unwrap_or("")
+        .to_string();
+    let (mut constructors, method_members): (Vec<Member>, Vec<Member>) = method_members
+        .into_iter()
+        .partition(|member| member.name == "<init>");
+    for ctor in &mut constructors {
+        ctor.name = simple_name.clone();
+    }
     let attributes = reader.u2()?;
     for _ in 0..attributes {
         reader.u2()?;
@@ -292,6 +316,7 @@ pub fn parse_class(data: &[u8]) -> Result<ClassInfo, String> {
         methods,
         fields,
         members,
+        constructors,
         supertypes,
     })
 }
@@ -325,9 +350,15 @@ fn read_members<'a>(
         let Some(name) = utf8_at(name_index) else {
             continue;
         };
-        // <init>/<clinit> are not source-visible names; `$` marks synthetic
-        // members like `this$0` and accessors.
-        if name.starts_with('<') || name.contains('$') {
+        // `$` marks synthetic members like `this$0` and accessors; a field is
+        // never named `<...>`. In the method table `<init>` survives as a
+        // constructor (parsed separately by `parse_class`) while `<clinit>` does
+        // not name a source-visible member.
+        let skip = match kind {
+            IndexKind::Method => name == "<clinit>",
+            _ => name.starts_with('<'),
+        };
+        if skip || name.contains('$') {
             continue;
         }
         if member_flags & 0x0002 != 0 {
@@ -687,6 +718,32 @@ mod tests {
     }
 
     #[test]
+    fn constructors_become_type_info() {
+        let bytes = class_bytes_typed(
+            "demo/Point",
+            Some("java/lang/Object"),
+            &[],
+            &[],
+            &[("<init>", "(I)V")],
+        );
+        let info = parse_class(&bytes).unwrap();
+        assert!(info.methods.is_empty());
+        assert_eq!(info.constructors.len(), 1);
+        assert_eq!(info.constructors[0].name, "Point");
+        assert_eq!(info.constructors[0].params.len(), 1);
+        assert_eq!(
+            info.constructors[0].params[0].ty,
+            Ty::Prim(crate::types::Prim::Int)
+        );
+
+        // The constructor reaches the declared type, kept out of `methods`.
+        let type_info = class_type_info(&info).unwrap();
+        assert_eq!(type_info.constructors.len(), 1);
+        assert_eq!(type_info.constructors[0].name, "Point");
+        assert!(type_info.methods.is_empty());
+    }
+
+    #[test]
     fn object_is_not_recorded_as_a_supertype() {
         let info = parse_class(&class_bytes_typed(
             "demo/Foo",
@@ -899,17 +956,21 @@ mod tests {
     }
 
     #[test]
-    fn skips_constructors_synthetic_and_private_members() {
+    fn models_constructors_and_skips_synthetic_and_private_members() {
         let bytes = class_bytes(
             "demo/Foo",
             0x0021,
             Some("java/lang/Object"),
-            &["<init>", "!this$0", "size", "!secret"],
-            &["<clinit>", "!access$100", "getSize"],
+            &["!this$0", "size", "!secret"],
+            &["<init>", "<clinit>", "!access$100", "getSize"],
         );
         let info = parse_class(&bytes).unwrap();
         assert_eq!(info.fields, vec!["size"]);
         assert_eq!(info.methods, vec!["getSize"]);
+        // `<init>` is modelled as a constructor named after the type; the
+        // synthetic initializer and private members are still skipped.
+        assert_eq!(info.constructors.len(), 1);
+        assert_eq!(info.constructors[0].name, "Foo");
     }
 
     #[test]
@@ -946,7 +1007,7 @@ mod tests {
             .expect("class entry");
         assert_eq!(lib.kind, IndexKind::Class);
         assert!(lib.dependency);
-        assert_eq!(lib.uri, jar_url);
+        assert_eq!(*lib.uri, jar_url);
         assert!(lib.container.is_empty());
         assert_eq!(lib.package.as_deref(), Some("com.example.lib"));
 
@@ -955,7 +1016,7 @@ mod tests {
             .find(|entry| entry.name == "getName")
             .expect("method entry");
         assert_eq!(get_name.kind, IndexKind::Method);
-        assert_eq!(get_name.container, vec!["Lib".to_string()]);
+        assert_eq!(get_name.container.to_vec(), vec!["Lib".to_string()]);
         assert_eq!(get_name.package.as_deref(), Some("com.example.lib"));
 
         let name = entries
@@ -1000,7 +1061,7 @@ mod tests {
             .unwrap();
         assert!(outer_entry.container.is_empty());
         let inner_entry = entries.iter().find(|entry| entry.name == "Inner").unwrap();
-        assert_eq!(inner_entry.container, vec!["Outer".to_string()]);
+        assert_eq!(inner_entry.container.to_vec(), vec!["Outer".to_string()]);
         // Anonymous classes ($1) are not indexable names.
         assert!(!entries.iter().any(|entry| entry.name == "1"));
 

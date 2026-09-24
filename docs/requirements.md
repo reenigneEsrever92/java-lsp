@@ -31,7 +31,8 @@ All use cases belong to the Java developer.
 - **UC4 — See diagnostics.** Parse errors and unresolved symbols are reported
   as diagnostics on open and on edit — a type, member, bare identifier, or
   import that does not resolve (including a symbol that exists but is not
-  imported) — each unresolved symbol with a quick fix.
+  imported) — each unresolved symbol with a quick fix. Diagnostics also refresh
+  when another workspace file changes, including a file the editor never opened.
 
 ## Technology choices
 
@@ -46,7 +47,7 @@ All use cases belong to the Java developer.
   with error recovery. Alternative considered: a hand-written parser; deferred
   until the pure-Rust semantic work needs a lossless tree.
 - **In-memory workspace index, with a disk cache for library sources.** The
-  index itself is in memory and holds no storage; dependency *sources* are
+  index itself is in memory and holds no storage; dependency _sources_ are
   fetched from a Maven repository (Maven Central by default) on by default,
   written into the local Maven repository, and extracted under
   `$JAVA_LSP_SOURCES_CACHE` (default `~/.cache/java-lsp/sources`).
@@ -59,19 +60,21 @@ All use cases belong to the Java developer.
 
 ## Requirements
 
-| ID | Requirement | Type | Priority | Traced to |
-|----|-------------|------|----------|-----------|
-| R1 | LSP server over stdio usable from any LSP client | Functional | high | UC1 |
-| R2 | Lifecycle and incremental text sync with versioned documents | Functional | high | UC1 |
-| R3 | Syntax features from tree-sitter: document symbols, folding ranges, semantic tokens, parse-error diagnostics | Functional | high | UC1, UC4 |
-| R4 | Completions without type resolution: keywords, locals in scope, workspace index symbols | Functional | high | UC2 |
-| R5 | Workspace symbol index built without blocking the request path; go-to-definition and workspace symbols backed by it | Functional | high | UC3 |
-| R6 | Project open → responsive: the initial scan never blocks text sync or request handling; individual features may be briefly unavailable while warming up | Non-functional | high | UC1 |
-| R7 | Type-aware semantic engine: a pure-Rust type layer resolving declared types, members, and receivers | Functional | medium | v0.3 |
-| R8 | Gradle project model | Functional | low | deferred |
-| R9 | Inlay hints: variable types (including `var` inference), parameter names, and chained-call return types, computed for the requested range | Functional | medium | UC1, R7 |
-| R10 | Dependency sources fetched and indexed; go-to-definition opens library declarations | Functional | medium | UC3 |
-| R11 | Semantic diagnostics: unresolved types, members, identifiers, and imports reported as errors, each with a code-action quick fix (add import, did-you-mean, or create a class/interface/enum/record, method, field, or local variable with a signature inferred from the usage) | Functional | medium | UC4, R7 |
+| ID  | Requirement                                                                                                                                                                                                                                                                      | Type           | Priority | Traced to     |
+| --- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------- | -------- | ------------- |
+| R1  | LSP server over stdio usable from any LSP client                                                                                                                                                                                                                                 | Functional     | high     | UC1           |
+| R2  | Lifecycle and incremental text sync with versioned documents                                                                                                                                                                                                                     | Functional     | high     | UC1           |
+| R3  | Syntax features from tree-sitter: document symbols, folding ranges, semantic tokens, parse-error diagnostics                                                                                                                                                                     | Functional     | high     | UC1, UC4      |
+| R4  | Completions without type resolution: keywords, locals in scope, workspace index symbols                                                                                                                                                                                          | Functional     | high     | UC2           |
+| R5  | Workspace symbol index built without blocking the request path and kept current from open buffers and a `**/*.java` file watcher; go-to-definition and workspace symbols backed by it                                                                                            | Functional     | high     | UC3           |
+| R6  | Project open → responsive: neither the initial scan nor a diagnostics sweep nor a workspace search blocks the dispatcher, text sync, or another request, and no shared lock is held across analysis or a search; individual features may be briefly unavailable while warming up | Non-functional | high     | UC1           |
+| R7  | Type-aware semantic engine: a pure-Rust type layer resolving declared types, their members (constructors included), and receivers                                                                                                                                                | Functional     | medium   | v0.3          |
+| R8  | Gradle project model                                                                                                                                                                                                                                                             | Functional     | low      | deferred      |
+| R9  | Inlay hints: variable types (including `var` inference), parameter names, and chained-call return types, computed for the requested range                                                                                                                                        | Functional     | medium   | UC1, R7       |
+| R10 | Dependency sources fetched and indexed; go-to-definition opens library declarations                                                                                                                                                                                              | Functional     | medium   | UC3           |
+| R11 | Semantic diagnostics: unresolved types, members, identifiers, and imports reported as errors, each with a code-action quick fix (add import, did-you-mean, or create a class/interface/enum/record, method, field, or local variable with a signature inferred from the usage)   | Functional     | medium   | UC4, R7       |
+| R12 | Lombok annotation support: a source type carrying Lombok annotations exposes the members Lombok would generate (accessors, setters, builders, log fields, constructors), synthesized statically with no annotation processor                                                     | Functional     | medium   | UC2, UC3, UC4 |
+| R13 | Go-to-implementation for a type or member cursor: the workspace types that implement or extend it, and the overriding member declarations                                                                                                                                        | Functional     | medium   | UC3           |
 
 ## Milestones
 
@@ -116,10 +119,11 @@ visible range the client requests (R9; see `type-hints` in the backlog). The
 `var` inference pulled forward for the hints also types `var` locals in the
 scope that hover and completions read, from every supported initializer shape —
 a conditional, array creation, `instanceof`, a `switch` expression, an
-enhanced-for iterable, or a try-with-resources initializer — and an incomplete
-`receiver.` at the end of a line keeps its receiver, so completing it offers
-the same members as when the expression continues on the same line
-(`dot-completion-and-var-inference`). Type arguments are inferred and
+enhanced-for iterable, or a try-with-resources initializer — and a member access
+keeps its receiver whether or not the name is already typed: a plain name, a
+dotted nested type (`Outer.Inner.`), or a package qualifier (`java.util.`) all
+offer the same members as when the expression completes on one line
+(`dotted-receiver-completion`, extending `dot-completion-and-var-inference`). Type arguments are inferred and
 substituted for calls — a method's own type parameters from its arguments and
 the receiver's from its own arguments — so `List.of(5)` renders `List<Integer>`
 and `list.get(0)` its element type
@@ -136,6 +140,16 @@ unreachable repository degrades to the class-file behavior (R10; see
 `maven-source-indexing` in the backlog). `references` and `rename` stay
 workspace-only — the cache is never searched or edited.
 
+**v0.7 — Lombok support**: a source type carrying Lombok annotations is no
+longer a member-less type. Getters, setters, `withX`, `@Builder`'s nested
+builder, log fields, and the constructor annotations are synthesized statically
+into the declared-type model and the index — no annotation processor, no JVM —
+so `.`-completion, hover, signature help, inlay hints, and the unresolved-member
+diagnostic see them, and `definition`/`references` reach the field a generated
+member derives from (R12; see `lombok-support` in the backlog). Detection is
+syntactic (by annotation name), `lombok.config` is ignored, and `rename`
+refuses a generated member.
+
 **Deferred**: Gradle project model support (what remains of R8) stays listed
 here so a later change request can pick it up.
 
@@ -145,4 +159,18 @@ identifiers, and imports are reported as `ERROR` diagnostics — each with a qui
 fix (add the missing import, change to a near member, or create a class/interface/
 method stub) served through a new `codeActionProvider` — gated on a clean parse
 and an indexed `java.lang`, and switchable off with `JAVA_LSP_SEMANTIC_DIAGNOSTICS`
-(R11; see `unresolved-symbol-diagnostics` in the backlog).
+(R11; see `unresolved-symbol-diagnostics` in the backlog). They stay current:
+a `.java` file created or changed outside the editor is picked up by a
+`**/*.java` watcher, the declared-type model layers every open buffer over the
+warm-up base, and every open document's diagnostics are recomputed — so a
+referring file's squiggles clear without an edit of its own
+(`external-change-detection`).
+
+**v0.8 — implementation navigation**: go-to-implementation joins the navigation
+features. `textDocument/implementation` on a type lists the workspace types
+whose supertype closure reaches it — sub-interfaces and abstract intermediates
+included — and on a member lists the workspace subtypes that override it,
+matched by name and parameter types. The contract may be a library or JDK type
+(a cursor on `Runnable` lists its workspace implementors), since every result is
+a workspace declaration, and dependency or JDK declarations are never returned
+(R13; see `go-to-implementation` in the backlog).

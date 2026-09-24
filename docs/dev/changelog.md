@@ -10,7 +10,289 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-10-01
+
+- **Go-to-declaration** — `initialize` now advertises `declarationProvider` and
+  `textDocument/declaration` is answered by the go-to-definition resolution
+  (Java has no declaration/definition split), so the editor's "Go to
+  Declaration" command no longer does nothing. Verified by the harness
+  capability and definition tests.
+
+- **Diagnostics sweeps read the index in one batch** — `src/diagnostics.rs` reads
+  the index through a per-sweep `SweepIndex`: `type_layers`/`type_model`/`ready`
+  once per sweep, and every name and wildcard package the open documents' passes
+  look up prefetched via the new `IndexQueryNames`/`IndexHasPackages` requests
+  (logged as `count=N`) into a cache, with a single cached `IndexQueryName` as
+  the fallback; `import_edit` takes `&dyn NameLookup`. See
+  [Batch and cache the diagnostics pass's index queries](backlog/diagnostics-batched-index-queries.md).
+
+- **Jar and JDK members share one container `Arc` per type** — `src/classfile.rs`
+  `class_entries` built `Arc::from(member_container.clone())` for every member,
+  re-allocating the container vector and `Arc` per member; the jar and JDK paths
+  both route through it, so over ~6M members this was a large, repeated
+  allocation. One `Arc<[String]>` is now built per type and shared. See
+  [Shrink the indexed entry and type model](backlog/index-entry-size.md).
+- **Library sources no longer index their import declarations** — `index.rs`
+  gains `drop_import_entries`, called by the dependency-source (`sources.rs`) and
+  JDK (`jdk.rs`) passes, so the two library passes store no `Import` entries. No
+  feature reads them (`definition` filters them out, `completion_kind`/
+  `symbol_kind` answer `None`, `ambiguous_names` skips them, and `references`
+  parses workspace files) — they were ~2.9M of ~0.39 GB over the real corpus.
+  Workspace files keep their imports. See
+  [Stop storing import declarations for library sources](backlog/index-drop-import-entries.md).
+- **End-to-end feature test over the `example/` workspace** — `tests/example_features.rs`
+  drives the real binary over stdio and asserts `definition`, `documentSymbol`,
+  `hover`, `.`-completion, `references`, and `workspace/symbol` against the
+  two-module example (~1 s, no JDK, offline). See
+  [Shrink the indexed entry and type model](backlog/index-entry-size.md).
+- **The warm-up logs what the index holds** — `index.rs` logs an
+  `index composition:` line (entries by kind, names, files, approximate bytes;
+  base layers/types/members; source models) at `Ready` and after the downloads
+  stage, so its size can be targeted rather than guessed. See
+  [Log what the index holds, so its size can be targeted](backlog/index-composition-log.md).
+- **The class-file base cache is one file per archive, read on demand** —
+  `base_cache::ArchiveStore` replaces the whole-kind `jars.json`/`jdk.json` (the
+  jars file had reached 3.7 GB and was loaded and re-written whole each run) with
+  one guarded file per archive, read only when that archive is needed and written
+  only when it is reparsed; the legacy file is dropped on first use. See
+  [Cache each archive's parse in its own file, read on demand](backlog/base-cache-per-archive.md).
+- **The hub debug log no longer floods with per-item lines** — `src/bus.rs` logs
+  the high-cardinality per-item notifications (`SourceFile`, `BaseArtifact`,
+  `Progress`, …) at `trace` and the rest at `debug`, and the extraction progress
+  is emitted ~5 % of the way instead of per archive. See
+  [Keep the hub debug log readable and emit progress in steps](backlog/bus-log-bulk-at-trace.md).
+- **Dependency sources already extracted are not rewritten** — `src/sources.rs`'s
+  `index_one` now creates each package directory once per artifact and writes a
+  `.java` only when it is missing or the wrong length, so a warm cache does no
+  write work (measured: the `write` phase 14294 ms → 42 ms; ~15 % wall clock, as
+  the writes overlapped with the parse). See
+  [Do not rewrite dependency sources already extracted to the cache](backlog/dependency-source-skip-rewrite.md).
+- **The dependency-source pass logs per-phase timings** — `src/sources.rs` logs
+  the fetch (`dependency source fetch: N of M archives available in Xms`) and the
+  per-phase extract totals (`read/inflate/write/parse/entries/types`), every 200
+  archives and at the end, so the bottleneck is measured on the real corpus.
+  Measured over 40 real jars: parse 32 %, cache write 23 %, types 18 %, entries
+  17 %, inflate 5 %, read 5 %. See
+  [Log per-phase timings for the dependency-source pass](backlog/sources-phase-timing.md).
+
+## 2026-09-30
+
+- **Indexing is no longer quadratic in file size** — byte offsets now convert to
+  LSP positions through a per-file `LineIndex` (`analysis.rs`) built once and
+  binary-searched, instead of `lsp_position` rescanning the text per position.
+  The dependency-source pass on a 30-jar sample fell from 373.6 s to 18.7 s. See
+  [Make byte-offset to LSP position conversion linear, not quadratic, per file](backlog/line-index-quadratic.md).
+- **Dependency sources are extracted and parsed across worker threads** —
+  `sources.rs::index_extracted` fans the artifacts across `available_parallelism`
+  workers (one parser each), the calling thread emitting. See
+  [Extract and parse dependency sources across worker threads](backlog/dependency-source-parallel.md).
+- **Dependency-source extraction reports per-archive progress** — `src/sources.rs`'s
+  `index_extracted` emits a `Progress` update per archive,
+  `Parsed x/N dependency source archives (F source files)`, so the extraction
+  phase is legible instead of looking stuck between `Parsing N …` and
+  `Indexed M …`. See
+  [Report progress while dependency source archives are extracted and indexed](backlog/sources-extract-progress.md)
+  and its [follow-up](backlog/sources-extract-progress-followup.md).
+- **Dependency sources are one base artifact per jar** — `src/sources.rs`'s
+  `index_extracted` now publishes a single `BaseArtifact` for a whole sources jar
+  (keyed by the sources-jar URI) instead of one per extracted `.java` file, so the
+  bus, the hub log, and the index base no longer grow per file. See
+  [Publish each dependency's sources as one base artifact, not one per file](backlog/source-artifact-granularity.md).
+- **The hub no longer logs a reply for an unanswered request** — the reply line in
+  `src/bus.rs` is emitted only for a real reply (`deliver.is_some()`), not for a
+  dropped request, and `docs/architecture.md`'s index bullet now describes the
+  request/reply round-trip accurately. See
+  [Stop the hub logging a reply for an unanswered request](backlog/message-hub-log-sender-followups.md).
+- **The hub log names the sender and times replies** — each `debug` line from
+  the hub (`src/bus.rs`) is prefixed `sender=<label>` (the core, the dispatcher,
+  the six drivers, the diagnostics, and the quick fixes each name themselves),
+  and a request's reply is routed back through the hub and logged as
+  `sender=<owner> reply to=<requester> … elapsed=<ms>`. See
+  [Identify the sender, replies, and reply latency in the hub log](backlog/message-hub-log-sender.md).
+- **The hub logs every bus message** — `src/bus.rs` logs each notification and
+  request passing through the hub at `debug` (`RUST_LOG=java_lsp::bus=debug`),
+  with a concise description (identifiers and counts, never a payload). See
+  [One engine bus with broadcast notifications and hub-routed request/response](backlog/unified-bus.md).
+
+## 2026-09-29
+
+- **One engine bus** — every module (the drivers, the index, the diagnostics, the
+  quick fixes, and the core) now speaks a single bus (`src/bus.rs`): notifications
+  are broadcast to every module, and a request is routed by the hub thread to the
+  module that owns it. The per-module `IndexHandle`, `DiagnosticsHandle`,
+  `QuickFixHandle`, and the filesystem driver are gone. See
+  [One engine bus with broadcast notifications and hub-routed request/response](backlog/unified-bus.md).
+- **A quick-fix subsystem, a queryable diagnostics cache, and a prefix-ordered
+  index** — `src/quickfix.rs` now generates the create/import/rename fixes from
+  its own parse, querying the symbol index and a new diagnostics cache
+  (`DiagnosticsHandle::diagnostics`); the index's `by_name` is a `BTreeMap`, so
+  `query_prefix` (completions, `workspace/symbol`) is a range scan. See
+  [A quick-fix subsystem, a queryable diagnostics cache, and a prefix-ordered index](backlog/quickfix-subsystem.md).
+- **The diagnostics engine is its own subsystem** — `src/diagnostics.rs` owns a
+  parser and the open buffers' text, computes the syntax and unresolved-symbol
+  pass itself, and reports it to the hub; the engine's `DiagnosticsPublisher` is
+  gone, and the declared-type overlay moved into the index subsystem. See
+  [Make the index and the diagnostics engine their own subsystems](backlog/diagnostics-index-subsystems.md).
+- **Cache the class-file base across warm-ups** — the dependency-jar and JDK
+  class-file parses are now cached under the sources cache dir (`base/jars.json`,
+  `base/jdk.json`), keyed by a schema version and each archive's path, size, and
+  mtime, so a restart re-parses only what changed; a missing, corrupt, or
+  version-mismatched cache falls back to a full parse. See
+  [Cache the class-file base across warm-ups](backlog/warmup-throughput.md).
+- **The index is its own subsystem** — `src/index.rs` now owns the
+  `WorkspaceIndex` on a dedicated thread behind a message-based `IndexHandle`;
+  the analysis core and the engine hub reach it only through messages, and the
+  hub no longer mutates the index itself. See
+  [Make the index and the diagnostics engine their own subsystems](backlog/diagnostics-index-subsystems.md).
+- **Size the runtime's thread stacks** — `src/main.rs` now builds the tokio
+  runtime with `thread_stack_size(256 MiB)`, applied to both worker and
+  blocking-pool threads, so a deeply recursive analysis pass on a large workspace
+  no longer overflows the default 2 MiB stack and aborts the server. See
+  [Deep analysis recursion overflows the engine runtime's default thread stack on large workspaces](backlog/runtime-stack-overflow.md).
+
+## 2026-09-28
+
+- **Complete member access through dotted receivers** — a member access after `.`
+  now recovers the receiver at the dot before the typed prefix, so `.`-completion
+  works for a partially typed name (`SumType.T…`, `new SumType.T…`), for a dotted
+  nested-type receiver (`Greeter.Inner.`, `Greeter.Inner.CONST`), and for a package
+  qualifier (`java.util.Li` → `List`); `all_types` also keys a type by its name so
+  no same-kind sibling is dropped, and `src/messages.rs` compiles again. See
+  [Member completion after a dot is empty for dotted nested-type receivers and partial type names](backlog/dotted-receiver-completion.md).
+
+- **Route every subsystem through one engine-owned message bus** — all messages
+  now live in `src/messages.rs`, the `Reporter` indirection is gone, and every
+  subsystem (filesystem, project walk, dependency resolution, source scan, jar and
+  JDK indexing, source download) is a driver spawned at start that speaks only
+  `DriverMessage`; the engine hub applies the index-affecting ones and is the sole
+  emitter of the warm-up's client events, so discovery is message-based and
+  nothing else mutates the index or talks to the editor. See
+  [Make every subsystem a message-driven driver on one engine-owned bus](backlog/driver-message-bus.md).
+
+- **Model a source enum's members** — an enum's constants and the fields,
+  methods, and constructors in its `;`-introduced declaration section are now
+  indexed (kind `EnumConstant`) and modelled, so `DataType.` offers its
+  constants as `enumMember`, `DataType.TYPE_1` no longer reports "cannot
+  resolve", and definition/references/rename target a constant. See
+  [Source enum members (constants and declared members) are not modelled](backlog/enum-constants.md).
+
+- **Resolve dotted nested-type references** — `Outer.Inner` is resolved
+  nested-first (the prefix as a type, then its nested type) instead of being read
+  as package `Outer` plus `Inner`, and `.`-completion on a type receiver lists
+  its nested types, so `new Greeter.Inner()` type-resolves and `i.` completes
+  its members. See
+  [Dotted nested-type references are misread as package-qualified names](backlog/nested-type-references.md).
+
+- **Make indexing an incremental, message-based pipeline** — indexing is now a
+  driver that spawns independent producers (project discovery, the workspace
+  source scan, the dependency jars, the JDK, and the dependency-source
+  downloader) which emit `IndexMessage`s to one indexing task; the declared-type
+  base grows append-only per artifact (the downloader's whole-model clone is
+  gone), the downloader runs concurrently with the source scan, and the warm-up's
+  progress, notices, and log lines all flow through that boundary. See
+  [Make indexing an incremental, message-based pipeline of producer modules](backlog/incremental-indexing-pipeline.md).
+
+- **Index the JDK from jmods** — a jmod is a ZIP prefixed by a 4-byte `JM`
+  magic whose central-directory offsets are relative to the byte after it; the
+  reader treated them as absolute, so every jmod yielded zero entries and the
+  standard library was never indexed (`jdk_classes=0` on all JDK 9+ installs) —
+  no `java.*`/`javax.*` types or members completed, hovered, or navigated.
+  `jdk::class_archive_entries` now strips the prefix (Temurin 21.0.8 indexes
+  73310 entries), and the jmod test fixture carries the magic. See
+  [Index the JDK from jmods so standard-library members complete](backlog/jdk-jmod-indexing.md).
+
+- **Publish the type base before the source scan** — `scan_workspace_core` now
+  indexes dependency jars and the JDK (and publishes the base type model) before
+  the workspace source scan, so library types resolve while a large tree is
+  still being indexed (previously the base was published only at the end, so
+  `StringUtils.`/`Math.` completed nothing for the whole scan). Semantic
+  diagnostics stay gated on `ready`, so a not-yet-scanned workspace type is
+  never flagged unresolved. Interim step toward
+  [Make indexing an incremental, message-based pipeline of producer modules](backlog/incremental-indexing-pipeline.md).
+
+- **Responsive request path on large workspaces** — diagnostics now run on a
+  coalescing publisher task instead of inline on the engine dispatcher, the
+  document store is snapshotted so no handler holds its lock across a semantic
+  pass, a references/rename search parses with a private parser from a pool
+  instead of holding the shared parse mutex, and the declared-type base is read
+  through a cached, name-indexed layer view rather than rebuilt per request.
+  Verified by `cargo test --all-targets` (255 lib, 28 harness, and 1 stdio test
+  passing; the only failures are 4 `sources` lib tests and 1 harness test that
+  need a loopback socket this sandbox forbids). On `java-lsp-bench --files 10000
+--methods-per-class 10 --open-docs 20 --edits 10 --references` (20 open
+  documents, JDK indexed): edit → publish 12.4 ms, edit → hover 4.3 ms, edit →
+  definition 4.3 ms, and `references` on a member every file uses 3.2 s for
+  10001 locations (bounded and off the typing path). See
+  [Keep the request path responsive while diagnostics and references run on a large workspace](backlog/warmup-request-responsiveness.md).
+
+## 2026-09-25
+
+- **Lower memory and per-request cost on large projects** — the declared-type
+  layer is now read through a lazy `ModelLayers` view that borrows the per-file
+  `Arc<TypeModel>`s instead of deep-copying the whole workspace union on every
+  request (and once per candidate file in references/rename, now built once per
+  search), and index entries are allocated once and shared between the name and
+  file maps, with a file's URI, package, and container chain shared across its
+  entries. On the 500-file fixture (`java-lsp-bench --files 500
+--methods-per-class 10`) peak RSS fell from 51504 KiB to 43648 KiB and
+  post-warm-up hover RTT from 0.730 ms to 0.163 ms; the bench now reports memory
+  on macOS via `getrusage` `ru_maxrss`. Verified by `cargo test --all-targets`
+  (278 tests). See
+  [Cut per-request type-model churn and index duplication on large projects](backlog/large-project-memory.md).
+
+- **Go-to-implementation** — `textDocument/implementation` now answers a cursor
+  on a type with the workspace types whose supertype closure reaches it
+  (sub-interfaces and abstract intermediates included) and a cursor on a member
+  with the workspace subtypes that override it, matched by name and parameter
+  types; a library/JDK type may be the contract, while only workspace
+  declarations are returned. Verified by `cargo test --all-targets` (274 tests).
+  See
+  [Go to implementation for types and members](backlog/go-to-implementation.md).
+
+- **Lombok annotation support** — a source type carrying Lombok annotations now
+  exposes the members Lombok would generate, synthesized statically (no
+  annotation processor, no `lombok.config`): `@Getter`/`@Setter`/`@With`,
+  `@Data`/`@Value`, `@Accessors` (fluent/chain), `@Builder` (a nested
+  `TBuilder` with `builder()`/`toBuilder()`), the log-field family, and the
+  constructor annotations. Generated members reach `.`-completion, hover,
+  signature help, inlay hints, and stop the unresolved-member diagnostic from
+  crying wolf; they are indexed as `synthetic` entries anchored at the field
+  they derive from, so `definition` and `references` reach it while
+  `workspace/symbol`, ordinary completion, and `rename` leave them alone.
+  Verified by `cargo test --all-targets` (267 tests). See
+  [Lombok annotation support](backlog/lombok-support.md).
+
+- **Constructor modelling and `new T(...)` resolution** — the declared-type layer
+  now carries a type's constructors, kept out of `.`-completion and
+  `workspace/symbol`: `collect_members` reads `constructor_declaration`s, a
+  record's canonical constructor and a class's implicit no-arg one are
+  synthesized from the source, and a public `<init>` becomes a constructor for a
+  jar/JDK type while `<clinit>`, private, and synthetic members stay skipped. A
+  `new T(...)` now answers signature help with the created type's constructor
+  overloads, and resolves go-to-definition (falling back to the type for an
+  implicit or library constructor), find-references, and parameter-name inlay
+  hints, its overload chosen by the call's argument types, then arity, then name.
+  Verified by `cargo test --all-targets` (253 tests). See
+  [Model constructors so new T(...) resolves](backlog/constructors.md).
+
 ## 2026-09-24
+
+- **Forget a deleted source file in the type model** — `WorkspaceIndex` now
+  splits the declared-type model into a non-source base (dependency jars and the
+  JDK) plus one model per workspace source file keyed by URI, so deleting a file
+  drops its types along with its index entries and no model-based feature
+  (member completion, hover, signature help, inlay hints) resolves it any more.
+  Verified by `cargo test --all-targets` (239 tests). See
+  [Forget a deleted source file in the type model](backlog/deleted-file-stays-in-type-model.md).
+
+- **External file changes and a fresh analysis model** — the shell registers a
+  `workspace/didChangeWatchedFiles` watcher for `**/*.java` (when the client
+  supports dynamic registration), re-indexes a created/changed file and drops a
+  deleted one, layers every open buffer's declared types over the warm-up model,
+  and republishes diagnostics for every open document after an open, change,
+  close, or watched event. Verified by `cargo test --all-targets` (236 tests).
+  See
+  [External file change detection and a fresh analysis model](backlog/external-change-detection.md).
 
 - **Create-symbol quick fixes** — unresolved symbols now offer full create
   actions: class / interface / enum / record (a scaffolded file), and a method,
@@ -61,9 +343,9 @@ named change.
 
 - **Warm-up and source-fetch progress** — the server now reports the background
   warm-up to the client: one work-done progress item (`window/workDoneProgress/
-  create` + `$/progress`) titled `java-lsp` whose message names each phase with
+create` + `$/progress`) titled `java-lsp` whose message names each phase with
   counts (`Indexed N source files`, `Indexed N dependency jars`, `Indexed N JDK
-  classes`, `Fetching N dependency sources` with a rising percentage), plus a
+classes`, `Fetching N dependency sources` with a rising percentage), plus a
   single `window/showMessage` notice when `JAVA_LSP_OFFLINE` disables source
   fetching on a workspace that has dependencies. Gated on the client's
   `window.workDoneProgress` capability; emitted through a new `Reporter` and the
@@ -120,7 +402,7 @@ named change.
 
 - **Type-aware review follow-ups** — fixes the defects found reviewing the
   type-aware work. References and rename now identify a member's declaring type
-  by simple name *and* package, so renaming `a.Widget.run` no longer touches
+  by simple name _and_ package, so renaming `a.Widget.run` no longer touches
   `b.Widget.run`; they report a declaration only when `include_declaration`
   asks, target nothing on a non-terminal import segment, count a
   fully-qualified use as visibility, and refuse (rather than drop a reference)

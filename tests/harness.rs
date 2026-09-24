@@ -133,6 +133,8 @@ async fn initialize_advertises_incremental_sync_and_language_capabilities() {
     );
     assert_eq!(capabilities["hoverProvider"], true);
     assert_eq!(capabilities["definitionProvider"], true);
+    assert_eq!(capabilities["declarationProvider"], true);
+    assert_eq!(capabilities["implementationProvider"], true);
     assert!(capabilities["completionProvider"]["triggerCharacters"]
         .as_array()
         .unwrap()
@@ -158,6 +160,104 @@ async fn initialize_advertises_incremental_sync_and_language_capabilities() {
             .len()
             >= 10
     );
+}
+
+#[tokio::test]
+async fn implementation_returns_the_workspace_subtypes() {
+    let _env = JdkEnv::none();
+    let root = std::env::temp_dir().join(format!(
+        "java-lsp-harness-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(root.join("demo")).unwrap();
+    let greeter = "package demo;\n\npublic interface Greeter {\n    void greet();\n}\n";
+    let english = "package demo;\n\npublic class English implements Greeter {\n    public void greet() {}\n}\n";
+    let greeter_path = root.join("demo/Greeter.java");
+    let english_path = root.join("demo/English.java");
+    std::fs::write(&greeter_path, greeter).unwrap();
+    std::fs::write(&english_path, english).unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    // Diagnostics publications go through a capacity-1 channel; drain it so
+    // handlers never block on an unread client socket.
+    tokio::spawn(async move {
+        use futures::StreamExt;
+        while socket.next().await.is_some() {}
+    });
+    let root_uri = Url::from_file_path(&root).unwrap();
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({ "capabilities": {}, "rootUri": root_uri.as_str() }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    let greeter_uri = Url::from_file_path(&greeter_path).unwrap();
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": greeter_uri.as_str(),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": greeter,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |entries, ready| {
+        ready
+            && entries
+                .iter()
+                .any(|e| e.name == "Greeter" && e.kind == IndexKind::Interface)
+            && entries
+                .iter()
+                .any(|e| e.name == "English" && e.kind == IndexKind::Class)
+    })
+    .await;
+
+    let (line, character) = position_in(greeter, "interface Greeter");
+    let implementation = respond(
+        &mut service,
+        Request::build("textDocument/implementation")
+            .id(Id::Number(2))
+            .params(json!({
+                "textDocument": { "uri": greeter_uri.as_str() },
+                "position": {
+                    "line": line,
+                    "character": character + "interface ".len() as u32,
+                },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("implementation must respond");
+
+    // `public class English` in English.java: line 2, characters 13..20.
+    let expected = json!([{
+        "uri": Url::from_file_path(&english_path).unwrap().as_str(),
+        "range": {
+            "start": { "line": 2, "character": 13 },
+            "end": { "line": 2, "character": 20 },
+        },
+    }]);
+    assert_eq!(implementation, expected, "{implementation}");
 }
 
 #[tokio::test]
@@ -371,6 +471,24 @@ async fn next_diagnostics_for(socket: &mut tower_lsp::ClientSocket, uri: &str) -
     panic!("no publishDiagnostics notification arrived for {uri}");
 }
 
+/// Reads server-to-client messages until a request with `method` arrives and
+/// returns its params.
+async fn next_request_with_method(socket: &mut tower_lsp::ClientSocket, method: &str) -> Value {
+    use futures::StreamExt;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no {method} request arrived"
+        );
+        let next = tokio::time::timeout(std::time::Duration::from_millis(500), socket.next()).await;
+        let Ok(Some(request)) = next else { continue };
+        if request.method() == method {
+            return request.params().cloned().unwrap_or(Value::Null);
+        }
+    }
+}
+
 #[tokio::test]
 async fn workspace_index_scans_in_background_and_updates_incrementally() {
     // Serializes env-var mutation across scan-driven tests.
@@ -462,7 +580,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
     let entries = engine.indexed_symbols().await;
     assert!(entries.iter().any(|e| e.name == "getName"
         && e.kind == IndexKind::Method
-        && e.container == vec!["Greet".to_string()]));
+        && e.container.to_vec() == vec!["Greet".to_string()]));
     assert!(entries
         .iter()
         .any(|e| e.name == "name" && e.kind == IndexKind::Field));
@@ -1372,6 +1490,200 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
 
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&jdk);
+}
+
+#[tokio::test]
+async fn watched_file_changes_refresh_a_referring_document() {
+    // A fake JDK providing java.lang.Object and java.lang.String, so the
+    // semantic-diagnostics gate holds.
+    let jdk = temp_dir("watch-jdk");
+    std::fs::create_dir_all(jdk.join("jmods")).unwrap();
+    let _env = JdkEnv::set(&jdk.display().to_string());
+    let object_class = test_class_bytes("java/lang/Object", 0x0021, None, &[], &[]);
+    let string_class = test_class_bytes(
+        "java/lang/String",
+        0x0021,
+        Some("java/lang/Object"),
+        &[],
+        &[],
+    );
+    std::fs::write(
+        jdk.join("jmods").join("java.base.jmod"),
+        test_stored_zip(&[
+            ("classes/java/lang/Object.class", &object_class),
+            ("classes/java/lang/String.class", &string_class),
+        ]),
+    )
+    .unwrap();
+
+    // A workspace whose Main.java uses a class that does not exist yet.
+    let root = temp_dir("watch-workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    let main_uri = Url::from_file_path(root.join("Main.java")).unwrap();
+    let main_text = "package demo;\n\nclass Main {\n    XY field;\n}\n";
+    std::fs::write(root.join("Main.java"), main_text).unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({
+                "capabilities": {
+                    "workspace": {
+                        "didChangeWatchedFiles": { "dynamicRegistration": true }
+                    }
+                },
+                "rootUri": Url::from_file_path(&root).unwrap().as_str(),
+            }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    // The server asks the client to watch `**/*.java` (D1).
+    let registration = next_request_with_method(&mut socket, "client/registerCapability").await;
+    let watched = registration["registrations"]
+        .as_array()
+        .expect("registrations")
+        .iter()
+        .find(|registration| registration["method"] == "workspace/didChangeWatchedFiles")
+        .expect("a watched-file registration");
+    assert_eq!(
+        watched["registerOptions"]["watchers"][0]["globPattern"],
+        "**/*.java"
+    );
+
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |_, ready| ready).await;
+
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": main_uri.as_str(),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": main_text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+    let diagnostics = next_diagnostics_for(&mut socket, main_uri.as_str()).await;
+    assert!(
+        diagnostics.as_array().unwrap().iter().any(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("XY"))
+        }),
+        "XY should be unresolved before the file exists: {diagnostics}"
+    );
+
+    // The file is created on disk and reported through the watcher; it is never
+    // opened in the editor.
+    std::fs::write(
+        root.join("XY.java"),
+        "package demo;\n\npublic class XY {\n}\n",
+    )
+    .unwrap();
+    let xy_uri = Url::from_file_path(root.join("XY.java")).unwrap();
+    respond(
+        &mut service,
+        Request::build("workspace/didChangeWatchedFiles")
+            .params(json!({ "changes": [{ "uri": xy_uri.as_str(), "type": 1 }] }))
+            .finish(),
+    )
+    .await;
+
+    // `Main.java` was never edited, yet its diagnostic clears (D3).
+    let diagnostics = next_diagnostics_for(&mut socket, main_uri.as_str()).await;
+    assert!(
+        diagnostics.as_array().unwrap().is_empty(),
+        "the referring document must refresh: {diagnostics}"
+    );
+
+    // Deleting it again must bring the diagnostic back — a delete is a change
+    // the referring document must see, without being edited either.
+    std::fs::remove_file(root.join("XY.java")).unwrap();
+    respond(
+        &mut service,
+        Request::build("workspace/didChangeWatchedFiles")
+            .params(json!({ "changes": [{ "uri": xy_uri.as_str(), "type": 3 }] }))
+            .finish(),
+    )
+    .await;
+    let diagnostics = next_diagnostics_for(&mut socket, main_uri.as_str()).await;
+    assert!(
+        diagnostics.as_array().unwrap().iter().any(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("XY"))
+        }),
+        "the referring document must flag the deleted type: {diagnostics}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&jdk);
+}
+
+#[tokio::test]
+async fn watched_files_are_not_registered_without_the_client_capability() {
+    use futures::StreamExt;
+    let _env = java_lsp::jdk::env_lock();
+    std::env::set_var("JAVA_LSP_JDK", "/definitely/not/a/jdk");
+    let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
+
+    let root = temp_dir("no-watcher");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Greet.java"),
+        "package demo;\n\npublic class Greet {\n}\n",
+    )
+    .unwrap();
+
+    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    // No `workspace.didChangeWatchedFiles`: the watcher must be skipped (D6).
+    respond(
+        &mut service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({
+                "capabilities": {},
+                "rootUri": Url::from_file_path(&root).unwrap().as_str(),
+            }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        &mut service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+
+    // Wait for the warm-up, then drain for a bounded window: no registration.
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |_, ready| ready).await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    while std::time::Instant::now() < deadline {
+        let next = tokio::time::timeout(std::time::Duration::from_millis(100), socket.next()).await;
+        if let Ok(Some(request)) = next {
+            assert_ne!(
+                request.method(),
+                "client/registerCapability",
+                "no watcher registration without the capability: {request:?}"
+            );
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 #[tokio::test]
@@ -2504,6 +2816,21 @@ class Hello {
     .expect("definition must respond");
     assert_eq!(definition, greet_location, "{definition}");
 
+    // Go to declaration lands on the same place as go to definition.
+    let declaration = respond(
+        &mut service,
+        Request::build("textDocument/declaration")
+            .id(Id::Number(5))
+            .params(json!({
+                "textDocument": { "uri": HELLO_URI },
+                "position": { "line": line, "character": character },
+            }))
+            .finish(),
+    )
+    .await
+    .expect("declaration must respond");
+    assert_eq!(declaration, greet_location, "{declaration}");
+
     // An import target resolves through the dotted path's last segment.
     let (line, character) = position_in(usage, "demo.Greet;");
     let definition = respond(
@@ -2782,6 +3109,243 @@ async fn progress_is_not_sent_without_the_client_capability() {
             );
         }
     }
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Writes a fake JDK whose `jmods` provide `java.lang.Object` and
+/// `java.lang.String`, so the semantic-diagnostics gate (`Object` and `String`
+/// in the base model) holds and a sweep does real work.
+fn write_fake_jdk(jdk: &std::path::Path) {
+    std::fs::create_dir_all(jdk.join("jmods")).unwrap();
+    let object = test_class_bytes("java/lang/Object", 0x0021, None, &[], &[]);
+    let string = test_class_bytes(
+        "java/lang/String",
+        0x0021,
+        Some("java/lang/Object"),
+        &[],
+        &[],
+    );
+    std::fs::write(jdk.join("jmods").join("java.base.jmod"), {
+        // A real jmod is a ZIP prefixed by the 4-byte `JM` magic.
+        let mut jmod = b"JM\x01\x00".to_vec();
+        jmod.extend_from_slice(&test_stored_zip(&[
+            ("classes/java/lang/Object.class", &object),
+            ("classes/java/lang/String.class", &string),
+        ]));
+        jmod
+    })
+    .unwrap();
+}
+
+/// Runs the handshake with `root` as the workspace root, so the background scan
+/// starts on `initialized`.
+async fn initialize_workspace(
+    service: &mut LspService<JavaLanguageServer>,
+    root: &std::path::Path,
+) {
+    respond(
+        service,
+        Request::build("initialize")
+            .id(Id::Number(1))
+            .params(json!({
+                "capabilities": {},
+                "rootUri": Url::from_file_path(root).unwrap().as_str(),
+            }))
+            .finish(),
+    )
+    .await
+    .expect("initialize must respond");
+    respond(
+        service,
+        Request::build("initialized").params(json!({})).finish(),
+    )
+    .await;
+}
+
+/// With many open documents, an edit republishes diagnostics for all of them;
+/// a query issued right after must still be answered within a bounded time
+/// rather than queued behind the whole diagnostics sweep (Defects 1 and 2).
+#[tokio::test]
+async fn many_open_documents_keep_queries_answered_during_a_sweep() {
+    let jdk = temp_dir("resp-jdk");
+    write_fake_jdk(&jdk);
+    let _env = JdkEnv::set(&jdk.display().to_string());
+
+    let root = temp_dir("resp-workspace");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(
+        root.join("Common.java"),
+        "package demo;\n\npublic class Common {\n}\n",
+    )
+    .unwrap();
+
+    let mut service = service();
+    initialize_workspace(&mut service, &root).await;
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |_, ready| ready).await;
+
+    // Many documents, each with a resolvable field and an unresolved one, so a
+    // sweep does real semantic work for every open buffer.
+    let text = "package demo;\n\nclass Doc {\n    Common common;\n    Missing missing;\n}\n";
+    let mut uris = Vec::new();
+    for i in 0..20 {
+        let uri = Url::from_file_path(root.join(format!("Doc{i}.java"))).unwrap();
+        respond(
+            &mut service,
+            Request::build("textDocument/didOpen")
+                .params(json!({
+                    "textDocument": {
+                        "uri": uri.as_str(),
+                        "languageId": "java",
+                        "version": 1,
+                        "text": text,
+                    }
+                }))
+                .finish(),
+        )
+        .await;
+        uris.push(uri);
+    }
+
+    // The edit republishes diagnostics for every open document (Defect 1 ran
+    // that sweep inline before the fix). A query sent immediately after must be
+    // answered promptly, not blocked for the length of the sweep.
+    respond(
+        &mut service,
+        Request::build("textDocument/didChange")
+            .params(json!({
+                "textDocument": { "uri": uris[0].as_str(), "version": 2 },
+                "contentChanges": [{ "text": text }],
+            }))
+            .finish(),
+    )
+    .await;
+
+    let hover = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        respond(
+            &mut service,
+            Request::build("textDocument/hover")
+                .id(Id::Number(100))
+                .params(json!({
+                    "textDocument": { "uri": uris[0].as_str() },
+                    "position": { "line": 3, "character": 5 },
+                }))
+                .finish(),
+        ),
+    )
+    .await
+    .expect("hover must not be blocked by a diagnostics sweep");
+    assert!(hover.is_some(), "the field's type hover must resolve");
+
+    let definition = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        respond(
+            &mut service,
+            Request::build("textDocument/definition")
+                .id(Id::Number(101))
+                .params(json!({
+                    "textDocument": { "uri": uris[0].as_str() },
+                    "position": { "line": 3, "character": 5 },
+                }))
+                .finish(),
+        ),
+    )
+    .await
+    .expect("definition must not be blocked by a diagnostics sweep");
+    assert!(
+        definition.is_some(),
+        "the field's type definition must resolve"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_dir_all(&jdk);
+}
+
+/// A references search over a large workspace must complete within a bounded
+/// time and return the exact set of files that reference the target (Defect 3
+/// removed the whole-search lock hold, and Defect 4 removed the O(N)-per-lookup
+/// cost; this pins that the answers are unchanged).
+#[tokio::test]
+async fn references_across_a_large_workspace_are_bounded_and_complete() {
+    let _env = JdkEnv::none();
+
+    let root = temp_dir("refs-workspace");
+    std::fs::create_dir_all(root.join("demo")).unwrap();
+    std::fs::write(
+        root.join("demo").join("Common.java"),
+        "package demo;\n\npublic class Common {\n}\n",
+    )
+    .unwrap();
+    for i in 0..40 {
+        std::fs::write(
+            root.join("demo").join(format!("User{i}.java")),
+            format!("package demo;\n\nclass User{i} {{\n    Common common;\n}}\n"),
+        )
+        .unwrap();
+    }
+
+    let mut service = service();
+    initialize_workspace(&mut service, &root).await;
+    let engine = service.inner().engine();
+    wait_for_index(&engine, |_, ready| ready).await;
+
+    let user_path = root.join("demo").join("User0.java");
+    let user_uri = Url::from_file_path(&user_path).unwrap();
+    let user_text = std::fs::read_to_string(&user_path).unwrap();
+    respond(
+        &mut service,
+        Request::build("textDocument/didOpen")
+            .params(json!({
+                "textDocument": {
+                    "uri": user_uri.as_str(),
+                    "languageId": "java",
+                    "version": 1,
+                    "text": user_text,
+                }
+            }))
+            .finish(),
+    )
+    .await;
+
+    // Cursor on `Common` in `Common common;` (line 3, character 5).
+    let references = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        respond(
+            &mut service,
+            Request::build("textDocument/references")
+                .id(Id::Number(2))
+                .params(json!({
+                    "textDocument": { "uri": user_uri.as_str() },
+                    "position": { "line": 3, "character": 5 },
+                    "context": { "includeDeclaration": true },
+                }))
+                .finish(),
+        ),
+    )
+    .await
+    .expect("references must complete within the watchdog")
+    .expect("references must return a result");
+
+    let locations = references.as_array().expect("references is an array");
+    let files: std::collections::HashSet<&str> = locations
+        .iter()
+        .filter_map(|location| location["uri"].as_str())
+        .collect();
+    assert!(
+        files.len() >= 40,
+        "references must span the workspace, got {} files: {files:?}",
+        files.len()
+    );
+    assert!(
+        files.iter().any(|uri| uri.ends_with("Common.java")),
+        "the declaration file must be included: {files:?}"
+    );
+    assert!(
+        files.iter().all(|uri| uri.contains("/demo/")),
+        "no references from unrelated packages: {files:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
