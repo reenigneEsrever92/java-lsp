@@ -1509,6 +1509,26 @@ async fn watched_file_changes_refresh_a_referring_document() {
         "the referring document must refresh: {diagnostics}"
     );
 
+    // Deleting it again must bring the diagnostic back — a delete is a change
+    // the referring document must see, without being edited either.
+    std::fs::remove_file(root.join("XY.java")).unwrap();
+    respond(
+        &mut service,
+        Request::build("workspace/didChangeWatchedFiles")
+            .params(json!({ "changes": [{ "uri": xy_uri.as_str(), "type": 3 }] }))
+            .finish(),
+    )
+    .await;
+    let diagnostics = next_diagnostics_for(&mut socket, main_uri.as_str()).await;
+    assert!(
+        diagnostics.as_array().unwrap().iter().any(|diagnostic| {
+            diagnostic["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("XY"))
+        }),
+        "the referring document must flag the deleted type: {diagnostics}"
+    );
+
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_dir_all(&jdk);
 }

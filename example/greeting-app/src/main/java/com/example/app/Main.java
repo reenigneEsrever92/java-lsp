@@ -15,8 +15,6 @@ public class Main {
         Gson gson = new Gson();
         var data = new Data(5);
 
-        var xyz = new XYZ();
-
         data.shout();
         data.test(5);
         data.test(5.0f);

@@ -279,7 +279,13 @@ impl LanguageServer for JavaLanguageServer {
         tracing::info!("java-lsp initialized");
         // One dynamic registration, when the client supports it: without a
         // watcher the server never learns about files the editor did not open.
-        if self.watched_files.load(Ordering::Relaxed) {
+        let watched = self.watched_files.load(Ordering::Relaxed);
+        tracing::debug!(
+            watched_files = watched,
+            "client capability: workspace.didChangeWatchedFiles.dynamicRegistration"
+        );
+        if watched {
+            tracing::debug!("registering workspace/didChangeWatchedFiles for **/*.java");
             self.register_watcher();
         }
         // The background workspace scan starts once the handshake completes;
