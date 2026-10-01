@@ -1,15 +1,15 @@
-//! The engine's message vocabulary: every message in or out, in one place.
+//! The engine's message vocabulary: every message on the bus, in one place.
 //!
-//! The shell talks to the engine with [`Command`] and hears back through
-//! [`EngineEvent`]. Every subsystem — the filesystem, the project walker, the
-//! dependency resolver, the source scanner, the jar/JDK indexers, the source
-//! downloader — is a driver that speaks only [`DriverMessage`], which the engine
-//! applies to the index, relays to every driver, and turns into editor
-//! reporting. No subsystem emits an [`EngineEvent`] itself.
+//! Every component — the LSP shell, the analysis core, the index, the
+//! diagnostics and quick-fix modules, and the drivers (project walker,
+//! dependency resolver, source scanner, jar/JDK indexers, source downloader) —
+//! speaks only [`DriverMessage`] notifications, which the hub broadcasts, and
+//! [`Request`]s, which the hub routes to the one module that answers them. The
+//! shell is a module like any other: it consumes the editor-facing notifications
+//! (diagnostics, progress, notices) and renders them to the client.
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
 
 use tokio::sync::mpsc as tokio_mpsc;
@@ -25,127 +25,12 @@ use crate::project::ProjectModel;
 use crate::resolve::Artifact;
 use crate::types::{ModelLayers, SourceLayerIndex, TypeModel};
 
-type Reply<T> = oneshot::Sender<T>;
-
-/// Commands the shell sends to the engine. Queries carry a `oneshot` reply.
-pub enum Command {
-    /// The workspace root is known; the filesystem driver is told about it.
-    SetWorkspaceRoot(Url),
-    /// Records whether the client supports the `CreateFile` resource operation.
-    SetClientCapabilities {
-        resource_operations: bool,
-    },
-    Open {
-        uri: Url,
-        text: String,
-        version: i32,
-    },
-    Change {
-        uri: Url,
-        text: String,
-        version: i32,
-    },
-    Close(Url),
-    /// Watched filesystem events (created/changed/deleted `.java` files) the
-    /// editor reported but never opened.
-    WatchedFiles {
-        changes: Vec<(Url, WatchedChange)>,
-    },
-    Hover {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<Hover>>,
-    },
-    Definition {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<Location>>,
-    },
-    Implementation {
-        uri: Url,
-        position: Position,
-        reply: Reply<Vec<Location>>,
-    },
-    Completions {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<CompletionResponse>>,
-    },
-    DocumentSymbols {
-        uri: Url,
-        reply: Reply<Option<Vec<DocumentSymbol>>>,
-    },
-    FoldingRanges {
-        uri: Url,
-        reply: Reply<Option<Vec<FoldingRange>>>,
-    },
-    SemanticTokens {
-        uri: Url,
-        reply: Reply<Option<SemanticTokens>>,
-    },
-    InlayHints {
-        uri: Url,
-        range: Range,
-        reply: Reply<Vec<InlayHint>>,
-    },
-    SignatureHelp {
-        uri: Url,
-        position: Position,
-        reply: Reply<Option<SignatureHelp>>,
-    },
-    References {
-        uri: Url,
-        position: Position,
-        include_declaration: bool,
-        reply: Reply<Vec<Location>>,
-    },
-    Rename {
-        uri: Url,
-        position: Position,
-        new_name: String,
-        reply: Reply<Option<WorkspaceEdit>>,
-    },
-    WorkspaceSymbols {
-        query: String,
-        reply: Reply<Vec<SymbolInformation>>,
-    },
-    CodeActions {
-        uri: Url,
-        diagnostics: Vec<Diagnostic>,
-        reply: Reply<Vec<CodeAction>>,
-    },
-    /// A flat snapshot of the index; a verification hook for tests.
-    IndexedSymbols {
-        reply: Reply<Vec<SymbolEntry>>,
-    },
-    /// True once the initial scan finished; a verification hook for tests.
-    IndexReady {
-        reply: Reply<bool>,
-    },
-}
-
 /// How a watched file changed, as reported through `workspace/didChangeWatchedFiles`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WatchedChange {
     Created,
     Changed,
     Deleted,
-}
-
-/// Events the engine pushes to the shell.
-#[derive(Debug)]
-pub enum EngineEvent {
-    /// Diagnostics for `uri`, replacing whatever was published for it before.
-    /// A `None` version clears them (the document closed).
-    Diagnostics {
-        uri: Url,
-        version: Option<i32>,
-        diagnostics: Vec<Diagnostic>,
-    },
-    /// Progress for the single background job (warm-up and source fetch).
-    Progress(ProgressUpdate),
-    /// A discrete, notable message for the user.
-    Message { level: MessageLevel, text: String },
 }
 
 /// One step of the background job's progress. The shell owns the progress token
@@ -189,12 +74,12 @@ pub enum Stage {
     Downloads,
 }
 
-/// A message a driver sends to the engine, which the engine applies, relays to
-/// every driver, and translates to editor reporting. Large payloads are shared
-/// behind an `Arc`, so relaying to every driver is a pointer copy.
+/// A notification on the bus, broadcast by the hub to every module and driver;
+/// each consumes the ones it cares about. Large payloads are shared behind an
+/// `Arc`, so broadcasting is a pointer copy.
 #[derive(Clone)]
 pub enum DriverMessage {
-    // -- filesystem driver --
+    // -- the shell (editor input) --
     /// The workspace root (or a later folder) is known.
     FolderAdded {
         uri: Url,
@@ -246,7 +131,8 @@ pub enum DriverMessage {
     Ready,
     // -- diagnostics subsystem --
     /// Diagnostics for one open document, computed by the diagnostics subsystem
-    /// and translated by the hub into an editor event.
+    /// and published by the shell. A `None` version clears them (the document
+    /// closed).
     Diagnostics {
         uri: Url,
         version: Option<i32>,
@@ -272,6 +158,9 @@ pub enum DriverMessage {
     ClientCapabilities {
         resource_operations: bool,
     },
+    /// The analysis core applied a document or file event (and sent its index
+    /// updates before this), so a diagnostics sweep now sees the new state.
+    AnalysisUpdated,
     // -- index mutations from the core (open buffers) --
     /// The core's symbol entries for one file (an open buffer, a watched
     /// re-read, or a close re-read).
@@ -302,8 +191,11 @@ pub enum DriverMessage {
     BaseTypes {
         model: Arc<TypeModel>,
     },
-    // -- reporting --
+    // -- reporting (progress and notices are rendered by the shell; logs and
+    // the summary by the hub) --
+    /// Progress for the single background job (warm-up and source fetch).
     Progress(ProgressUpdate),
+    /// A discrete, notable message for the user.
     Notice {
         level: MessageLevel,
         text: String,
@@ -391,6 +283,90 @@ pub enum Request {
         diagnostics: Vec<Diagnostic>,
         reply: ReplyHandle<Vec<CodeAction>>,
     },
+    // -- analysis core --
+    Analysis(AnalysisRequest),
+}
+
+/// A query the analysis module answers from the core: one per editor feature.
+pub enum AnalysisRequest {
+    Hover {
+        uri: Url,
+        position: Position,
+        reply: ReplyHandle<Option<Hover>>,
+    },
+    Definition {
+        uri: Url,
+        position: Position,
+        reply: ReplyHandle<Option<Location>>,
+    },
+    Implementation {
+        uri: Url,
+        position: Position,
+        reply: ReplyHandle<Vec<Location>>,
+    },
+    Completions {
+        uri: Url,
+        position: Position,
+        reply: ReplyHandle<Option<CompletionResponse>>,
+    },
+    DocumentSymbols {
+        uri: Url,
+        reply: ReplyHandle<Option<Vec<DocumentSymbol>>>,
+    },
+    FoldingRanges {
+        uri: Url,
+        reply: ReplyHandle<Option<Vec<FoldingRange>>>,
+    },
+    SemanticTokens {
+        uri: Url,
+        reply: ReplyHandle<Option<SemanticTokens>>,
+    },
+    InlayHints {
+        uri: Url,
+        range: Range,
+        reply: ReplyHandle<Vec<InlayHint>>,
+    },
+    SignatureHelp {
+        uri: Url,
+        position: Position,
+        reply: ReplyHandle<Option<SignatureHelp>>,
+    },
+    References {
+        uri: Url,
+        position: Position,
+        include_declaration: bool,
+        reply: ReplyHandle<Vec<Location>>,
+    },
+    Rename {
+        uri: Url,
+        position: Position,
+        new_name: String,
+        reply: ReplyHandle<Option<WorkspaceEdit>>,
+    },
+    WorkspaceSymbols {
+        query: String,
+        reply: ReplyHandle<Vec<SymbolInformation>>,
+    },
+}
+
+impl AnalysisRequest {
+    /// The request's correlation id, from its reply handle.
+    pub(crate) fn id(&self) -> u64 {
+        match self {
+            Self::Hover { reply, .. } => reply.id(),
+            Self::Definition { reply, .. } => reply.id(),
+            Self::Implementation { reply, .. } => reply.id(),
+            Self::Completions { reply, .. } => reply.id(),
+            Self::DocumentSymbols { reply, .. } => reply.id(),
+            Self::FoldingRanges { reply, .. } => reply.id(),
+            Self::SemanticTokens { reply, .. } => reply.id(),
+            Self::InlayHints { reply, .. } => reply.id(),
+            Self::SignatureHelp { reply, .. } => reply.id(),
+            Self::References { reply, .. } => reply.id(),
+            Self::Rename { reply, .. } => reply.id(),
+            Self::WorkspaceSymbols { reply, .. } => reply.id(),
+        }
+    }
 }
 
 /// A message on the engine bus: a notification every module may consume, or a
@@ -426,30 +402,46 @@ pub enum Inbound {
         id: u64,
         deliver: Option<Box<dyn FnOnce() + Send>>,
     },
+    /// `sender` registers `sink` for every notification and, with `serves`, as
+    /// the owner of that module's requests.
+    Subscribe {
+        sender: String,
+        sink: tokio_mpsc::UnboundedSender<Bus>,
+        serves: Option<crate::bus::Module>,
+    },
 }
 
 /// A request's reply handle. The owner answers with [`ReplyHandle::send`], which
 /// posts the value back through the hub (so the hub sees and times the reply)
 /// rather than straight to the caller. Dropping it unanswered tells the hub to
 /// forget the request.
+///
+/// The requester holds the other end of the handle's oneshot channel (a
+/// [`crate::bus::Reply`]), which it awaits or, from synchronous module code,
+/// receives blocking.
 pub struct ReplyHandle<R> {
     inbound: tokio_mpsc::UnboundedSender<Inbound>,
     id: u64,
-    tx: Option<std_mpsc::Sender<R>>,
+    tx: Option<oneshot::Sender<R>>,
 }
 
 impl<R> ReplyHandle<R> {
-    /// Builds the handle for a request; the bus allocates the id.
+    /// Builds the handle for request `id`; `tx` reaches the waiting caller.
     pub(crate) fn new(
         inbound: tokio_mpsc::UnboundedSender<Inbound>,
         id: u64,
-        tx: std_mpsc::Sender<R>,
+        tx: oneshot::Sender<R>,
     ) -> Self {
         Self {
             inbound,
             id,
             tx: Some(tx),
         }
+    }
+
+    /// The request's correlation id.
+    pub(crate) fn id(&self) -> u64 {
+        self.id
     }
 }
 
@@ -480,33 +472,12 @@ impl<R> Drop for ReplyHandle<R> {
     }
 }
 
-/// Turns a message's reporting into an editor event or a `tracing` line. The
-/// engine is the only component that talks to the editor.
-pub fn translate(
-    message: &DriverMessage,
-    events: &tokio::sync::mpsc::UnboundedSender<EngineEvent>,
-) {
+/// Renders a notification's log reporting — a driver's [`DriverMessage::Log`]
+/// line or the warm-up [`DriverMessage::Summary`] — as a `tracing` line. The hub
+/// calls this for every notification; the editor-facing reporting (diagnostics,
+/// progress, notices) is the shell's to render.
+pub fn log_reporting(message: &DriverMessage) {
     match message {
-        DriverMessage::Diagnostics {
-            uri,
-            version,
-            diagnostics,
-        } => {
-            let _ = events.send(EngineEvent::Diagnostics {
-                uri: uri.clone(),
-                version: *version,
-                diagnostics: diagnostics.clone(),
-            });
-        }
-        DriverMessage::Progress(update) => {
-            let _ = events.send(EngineEvent::Progress(update.clone()));
-        }
-        DriverMessage::Notice { level, text } => {
-            let _ = events.send(EngineEvent::Message {
-                level: *level,
-                text: text.clone(),
-            });
-        }
         DriverMessage::Log { level, message } => match level {
             LogLevel::Info => tracing::info!("{message}"),
             LogLevel::Debug => tracing::debug!("{message}"),

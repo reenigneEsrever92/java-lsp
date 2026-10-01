@@ -854,16 +854,17 @@ mod tests {
         );
         assert!(
             bus.all_symbols()
+                .await
                 .iter()
                 .all(|entry| *entry.uri != class_uri),
             "the class-file entries should be dropped"
         );
-        let entries = bus.query_name("Thing");
+        let entries = bus.query_name("Thing").await;
         assert_eq!(entries.len(), 1);
         assert!(entries[0].dependency && entries[0].library_source);
         assert_eq!(entries[0].uri.to_file_path().unwrap(), extracted);
         // The cache is never a references or rename candidate.
-        assert!(bus.source_files().is_empty());
+        assert!(bus.source_files().await.is_empty());
     }
 
     #[tokio::test]
@@ -972,7 +973,7 @@ mod tests {
             "expected a per-archive progress update"
         );
         // Both files' entries are in that single layer.
-        assert_eq!(bus.query_name("Thing").len(), 1);
-        assert_eq!(bus.query_name("Other").len(), 1);
+        assert_eq!(bus.query_name("Thing").blocking_recv().len(), 1);
+        assert_eq!(bus.query_name("Other").blocking_recv().len(), 1);
     }
 }

@@ -67,3 +67,6 @@ Change requests live here as `<slug>.md`. Each request has a `kind`
 | [index-composition-log](index-composition-log.md)                         | improvement | low      | done        |
 | [index-drop-import-entries](index-drop-import-entries.md)                 | improvement | low      | done        |
 | [diagnostics-batched-index-queries](diagnostics-batched-index-queries.md) | improvement | medium   | done        |
+| [server-as-bus-client](server-as-bus-client.md)                           | refactor    | medium   | done        |
+| [bus-reply-receiver](bus-reply-receiver.md)                               | refactor    | low      | done        |
+| [bus-subscriptions](bus-subscriptions.md)                                 | refactor    | medium   | done        |

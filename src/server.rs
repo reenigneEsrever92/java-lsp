@@ -1,10 +1,14 @@
-//! The LSP shell: editor-facing handlers that delegate all analysis to the
-//! engine over its command/event boundary ([`crate::engine`]).
+//! The LSP shell: editor-facing handlers. The shell is just another client on
+//! the engine bus ([`crate::bus`]): it notifies the editor's input, requests the
+//! editor's queries, and renders the editor-facing notifications (diagnostics,
+//! progress, notices) it receives on its own subscription. It is built by
+//! [`crate::engine::start`], with every other participant.
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 
-use tokio::sync::{mpsc, RwLock};
+use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::request::{
     GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
@@ -31,9 +35,9 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{Client, LanguageServer};
 
+use crate::bus::BusClient;
 use crate::document::DocumentStore;
-use crate::engine::{self, EngineHandle};
-use crate::messages::{EngineEvent, MessageLevel, ProgressUpdate, WatchedChange};
+use crate::messages::{Bus, DriverMessage, MessageLevel, ProgressUpdate, WatchedChange};
 
 /// The single background job's progress token.
 const PROGRESS_TOKEN: &str = "java-lsp/warm-up";
@@ -94,7 +98,8 @@ async fn send_progress(client: &Client, token: NumberOrString, update: ProgressU
 
 pub struct JavaLanguageServer {
     documents: Arc<RwLock<DocumentStore>>,
-    engine: EngineHandle,
+    /// The shell's client on the engine bus (logged as `server`).
+    bus: BusClient,
     /// The client, so `initialized` can register the watched-file capability.
     client: Client,
     workspace_root: Mutex<Option<Url>>,
@@ -113,20 +118,28 @@ impl std::fmt::Debug for JavaLanguageServer {
 }
 
 impl JavaLanguageServer {
-    pub fn new(client: Client) -> Self {
-        // The engine pushes events; this task turns each into a client
-        // notification. Unbounded, so a slow client can never stall the engine.
+    /// Builds the shell on `bus`, the client [`engine::start`] gives it.
+    ///
+    /// [`engine::start`]: crate::engine::start
+    pub fn new(client: Client, bus: BusClient) -> Self {
+        // The shell is a participant on the bus like any other: it subscribes
+        // for every notification, and this task renders the editor-facing ones
+        // as client notifications. Unbounded, so a slow client can never stall
+        // the bus.
         let progress = Arc::new(AtomicBool::new(false));
-        let (events, mut incoming_events) = mpsc::unbounded_channel();
+        let mut incoming = bus.subscribe();
         let publishing = client.clone();
         let supported = progress.clone();
         tokio::spawn(async move {
             // One background job at a time, so one progress token.
             let token = NumberOrString::String(PROGRESS_TOKEN.to_string());
             let mut created = false;
-            while let Some(event) = incoming_events.recv().await {
-                match event {
-                    EngineEvent::Diagnostics {
+            while let Some(message) = incoming.recv().await {
+                let Bus::Notify(message) = message else {
+                    continue;
+                };
+                match message {
+                    DriverMessage::Diagnostics {
                         uri,
                         version,
                         diagnostics,
@@ -135,7 +148,7 @@ impl JavaLanguageServer {
                             .publish_diagnostics(uri, diagnostics, version)
                             .await
                     }
-                    EngineEvent::Progress(update) => {
+                    DriverMessage::Progress(update) => {
                         if !supported.load(Ordering::Relaxed) {
                             continue;
                         }
@@ -145,19 +158,20 @@ impl JavaLanguageServer {
                         }
                         send_progress(&publishing, token.clone(), update).await;
                     }
-                    EngineEvent::Message { level, text } => {
+                    DriverMessage::Notice { level, text } => {
                         let kind = match level {
                             MessageLevel::Info => MessageType::INFO,
                             MessageLevel::Warning => MessageType::WARNING,
                         };
                         publishing.show_message(kind, text).await;
                     }
+                    _ => {}
                 }
             }
         });
         Self {
             documents: Arc::new(RwLock::new(DocumentStore::default())),
-            engine: engine::spawn(events),
+            bus,
             client,
             workspace_root: Mutex::new(None),
             progress,
@@ -170,9 +184,9 @@ impl JavaLanguageServer {
         Arc::clone(&self.documents)
     }
 
-    /// A handle to the engine task, shared with tests.
-    pub fn engine(&self) -> EngineHandle {
-        self.engine.clone()
+    /// The shell's bus client, shared with tests.
+    pub fn bus(&self) -> BusClient {
+        self.bus.clone()
     }
 
     /// Registers `workspace/didChangeWatchedFiles` for `**/*.java` (D1).
@@ -217,9 +231,9 @@ impl LanguageServer for JavaLanguageServer {
             .and_then(|workspace| workspace.workspace_edit.as_ref())
             .and_then(|edit| edit.resource_operations.as_ref())
             .is_some_and(|operations| operations.contains(&ResourceOperationKind::Create));
-        self.engine
-            .set_resource_operations(resource_operations)
-            .await;
+        self.bus.notify(DriverMessage::ClientCapabilities {
+            resource_operations,
+        });
         // The watched-file fix is only registered with a client that supports
         // dynamic registration (D6); without it the rest of the fix stands.
         let watched_files = workspace
@@ -309,27 +323,25 @@ impl LanguageServer for JavaLanguageServer {
             .ok()
             .and_then(|slot| slot.clone());
         if let Some(root) = root {
-            self.engine.set_workspace_root(root).await;
+            self.bus.notify(DriverMessage::FolderAdded { uri: root });
         }
     }
 
     async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
         tracing::debug!(changes = params.changes.len(), "didChangeWatchedFiles");
-        let changes = params
-            .changes
-            .into_iter()
-            .map(|event| {
-                let change = if event.typ == FileChangeType::CREATED {
-                    WatchedChange::Created
-                } else if event.typ == FileChangeType::DELETED {
-                    WatchedChange::Deleted
-                } else {
-                    WatchedChange::Changed
-                };
-                (event.uri, change)
-            })
-            .collect();
-        self.engine.watched_files(changes).await;
+        for event in params.changes {
+            let change = if event.typ == FileChangeType::CREATED {
+                WatchedChange::Created
+            } else if event.typ == FileChangeType::DELETED {
+                WatchedChange::Deleted
+            } else {
+                WatchedChange::Changed
+            };
+            self.bus.notify(DriverMessage::FileEvent {
+                uri: event.uri,
+                change,
+            });
+        }
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -340,8 +352,8 @@ impl LanguageServer for JavaLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let actions = self
-            .engine
-            .code_actions(uri, params.context.diagnostics)
+            .bus
+            .code_actions(&uri, params.context.diagnostics)
             .await;
         if actions.is_empty() {
             return Ok(None);
@@ -363,8 +375,12 @@ impl LanguageServer for JavaLanguageServer {
             let mut docs = self.documents.write().await;
             docs.open(uri.clone(), version, &text);
         }
-        // Diagnostics follow as an engine event; the shell need not ask.
-        self.engine.open(uri, text, version).await;
+        // Diagnostics follow as a bus notification; the shell need not ask.
+        self.bus.notify(DriverMessage::DocumentOpened {
+            uri,
+            text: Arc::new(text),
+            version,
+        });
     }
 
     async fn did_change(&self, params: DidChangeTextDocumentParams) {
@@ -381,7 +397,11 @@ impl LanguageServer for JavaLanguageServer {
                 .map(|doc| String::from_utf8_lossy(&doc.bytes).into_owned())
         };
         let Some(text) = text else { return };
-        self.engine.change(uri, text, version).await;
+        self.bus.notify(DriverMessage::DocumentChanged {
+            uri,
+            text: Arc::new(text),
+            version,
+        });
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
@@ -391,14 +411,14 @@ impl LanguageServer for JavaLanguageServer {
             let mut docs = self.documents.write().await;
             docs.close(&uri);
         }
-        // Closing clears the published diagnostics through the engine event.
-        self.engine.close(uri).await;
+        // The diagnostics module clears the closed document's diagnostics.
+        self.bus.notify(DriverMessage::DocumentClosed { uri });
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        Ok(self.engine.hover(uri, position).await)
+        Ok(self.bus.hover(uri, position).await)
     }
 
     async fn goto_definition(
@@ -408,7 +428,7 @@ impl LanguageServer for JavaLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .engine
+            .bus
             .definition(uri, position)
             .await
             .map(GotoDefinitionResponse::Scalar))
@@ -424,7 +444,7 @@ impl LanguageServer for JavaLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .engine
+            .bus
             .definition(uri, position)
             .await
             .map(GotoDeclarationResponse::Scalar))
@@ -436,7 +456,7 @@ impl LanguageServer for JavaLanguageServer {
     ) -> Result<Option<GotoImplementationResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let locations = self.engine.implementation(uri, position).await;
+        let locations = self.bus.implementation(uri, position).await;
         // An empty result is a refusal as much as a "none found": report null
         // rather than claiming the contract has no implementations.
         if locations.is_empty() {
@@ -449,7 +469,7 @@ impl LanguageServer for JavaLanguageServer {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        Ok(self.engine.completions(uri, position).await)
+        Ok(self.bus.completions(uri, position).await)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -457,7 +477,7 @@ impl LanguageServer for JavaLanguageServer {
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
         let references = self
-            .engine
+            .bus
             .references(uri, position, include_declaration)
             .await;
         // An empty result is a refusal as much as a "none found": report null
@@ -472,7 +492,7 @@ impl LanguageServer for JavaLanguageServer {
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        Ok(self.engine.rename(uri, position, params.new_name).await)
+        Ok(self.bus.rename(uri, position, params.new_name).await)
     }
 
     async fn document_symbol(
@@ -481,7 +501,7 @@ impl LanguageServer for JavaLanguageServer {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
         Ok(self
-            .engine
+            .bus
             .document_symbols(uri)
             .await
             .map(DocumentSymbolResponse::Nested))
@@ -491,12 +511,12 @@ impl LanguageServer for JavaLanguageServer {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
-        Ok(Some(self.engine.workspace_symbols(params.query).await))
+        Ok(Some(self.bus.workspace_symbols(params.query).await))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri;
-        Ok(self.engine.folding_ranges(uri).await)
+        Ok(self.bus.folding_ranges(uri).await)
     }
 
     async fn semantic_tokens_full(
@@ -505,7 +525,7 @@ impl LanguageServer for JavaLanguageServer {
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
         Ok(self
-            .engine
+            .bus
             .semantic_tokens(uri)
             .await
             .map(SemanticTokensResult::Tokens))
@@ -514,12 +534,12 @@ impl LanguageServer for JavaLanguageServer {
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let range = params.range;
-        Ok(Some(self.engine.inlay_hints(uri, range).await))
+        Ok(Some(self.bus.inlay_hints(uri, range).await))
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        Ok(self.engine.signature_help(uri, position).await)
+        Ok(self.bus.signature_help(uri, position).await)
     }
 }

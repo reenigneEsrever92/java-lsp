@@ -1,6 +1,6 @@
 //! Drives the server over JSON-RPC with `LspService` — no editor, no stdio.
 
-use java_lsp::engine::EngineHandle;
+use java_lsp::bus::BusClient;
 use java_lsp::index::IndexKind;
 use java_lsp::server::JavaLanguageServer;
 use serde_json::{json, Value};
@@ -35,7 +35,7 @@ public class Sample {
 const COMPLETION_POSITION: (u32, u32) = (5, 17);
 
 fn service() -> LspService<JavaLanguageServer> {
-    let (service, _socket) = LspService::new(JavaLanguageServer::new);
+    let (service, _socket) = LspService::new(java_lsp::engine::start);
     service
 }
 
@@ -181,7 +181,7 @@ async fn implementation_returns_the_workspace_subtypes() {
     std::fs::write(&greeter_path, greeter).unwrap();
     std::fs::write(&english_path, english).unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     // Diagnostics publications go through a capacity-1 channel; drain it so
     // handlers never block on an unread client socket.
     tokio::spawn(async move {
@@ -220,7 +220,7 @@ async fn implementation_returns_the_workspace_subtypes() {
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -408,7 +408,7 @@ async fn syntax_features_answer_for_an_opened_document() {
 
 #[tokio::test]
 async fn published_diagnostics_reflect_parse_errors_and_clear_when_fixed() {
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     initialize(&mut service).await;
 
     respond(
@@ -518,7 +518,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
     )
     .unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     // Diagnostics publications go through a capacity-1 channel; drain it so
     // handlers never block on an unread client socket.
     tokio::spawn(async move {
@@ -569,7 +569,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
     assert_eq!(symbols[0]["name"], "Sample");
 
     // The scan finishes and indexes the fixture's declarations.
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -577,7 +577,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
                 .any(|e| e.name == "Greet" && e.kind == IndexKind::Class)
     })
     .await;
-    let entries = engine.indexed_symbols().await;
+    let entries = engine.all_symbols().await;
     assert!(entries.iter().any(|e| e.name == "getName"
         && e.kind == IndexKind::Method
         && e.container.to_vec() == vec!["Greet".to_string()]));
@@ -608,7 +608,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
             .any(|e| e.name == "Renamed" && e.kind == IndexKind::Class)
     })
     .await;
-    let entries = engine.indexed_symbols().await;
+    let entries = engine.all_symbols().await;
     assert!(!entries.iter().any(|e| e.name == "Sample"), "{entries:?}");
 
     // Closing a file outside the workspace root drops its entries.
@@ -760,7 +760,7 @@ package com.example;\n\npublic class App {\n    private Lib lib;\n\n    public S
     )
     .unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     tokio::spawn(async move {
         use futures::StreamExt;
         while socket.next().await.is_some() {}
@@ -781,7 +781,7 @@ package com.example;\n\npublic class App {\n    private Lib lib;\n\n    public S
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries.iter().any(|e| e.name == "App" && e.kind == IndexKind::Class)
@@ -1070,7 +1070,7 @@ async fn library_sources_are_fetched_and_definition_reaches_them() {
     let server = SourceServer::start(routes);
     let _central = EnvVar::set("JAVA_LSP_MAVEN_CENTRAL_URL", server.base_url());
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     tokio::spawn(async move {
         use futures::StreamExt;
         while socket.next().await.is_some() {}
@@ -1091,7 +1091,7 @@ async fn library_sources_are_fetched_and_definition_reaches_them() {
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, _| {
         entries.iter().any(|e| e.name == "Lib" && e.library_source)
     })
@@ -1198,7 +1198,7 @@ class Main {\n    List names;\n    String greeting;\n}\n",
     )
     .unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     tokio::spawn(async move {
         use futures::StreamExt;
         while socket.next().await.is_some() {}
@@ -1218,7 +1218,7 @@ class Main {\n    List names;\n    String greeting;\n}\n",
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -1365,7 +1365,7 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
     let main_text = "class Main {\n    Widget field;\n    Missing other;\n}\n";
     std::fs::write(root.join("Main.java"), main_text).unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     respond(
         &mut service,
         Request::build("initialize")
@@ -1386,7 +1386,7 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -1523,7 +1523,7 @@ async fn watched_file_changes_refresh_a_referring_document() {
     let main_text = "package demo;\n\nclass Main {\n    XY field;\n}\n";
     std::fs::write(root.join("Main.java"), main_text).unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     respond(
         &mut service,
         Request::build("initialize")
@@ -1559,7 +1559,7 @@ async fn watched_file_changes_refresh_a_referring_document() {
         "**/*.java"
     );
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |_, ready| ready).await;
 
     respond(
@@ -1648,7 +1648,7 @@ async fn watched_files_are_not_registered_without_the_client_capability() {
     )
     .unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     // No `workspace.didChangeWatchedFiles`: the watcher must be skipped (D6).
     respond(
         &mut service,
@@ -1669,7 +1669,7 @@ async fn watched_files_are_not_registered_without_the_client_capability() {
     .await;
 
     // Wait for the warm-up, then drain for a bounded window: no registration.
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |_, ready| ready).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
@@ -1715,7 +1715,7 @@ async fn inlay_hints_resolve_an_imported_name_shared_across_packages() {
     let bare =
         "package demo;\n\nclass Bare {\n    void m() {\n        var x = List.of(3);\n    }\n}\n";
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     tokio::spawn(async move {
         use futures::StreamExt;
         while socket.next().await.is_some() {}
@@ -1734,7 +1734,7 @@ async fn inlay_hints_resolve_an_imported_name_shared_across_packages() {
         Request::build("initialized").params(json!({})).finish(),
     )
     .await;
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready && entries.iter().any(|e| e.name == "of")
     })
@@ -1816,7 +1816,7 @@ async fn inlay_hints_resolve_a_jdk_static_factory() {
     let text = "package demo;\n\nimport java.util.List;\n\nclass Main {\n    void m() {\n        var list = List.of(5);\n    }\n}\n";
     std::fs::write(root.join("Main.java"), text).unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     tokio::spawn(async move {
         use futures::StreamExt;
         while socket.next().await.is_some() {}
@@ -1835,7 +1835,7 @@ async fn inlay_hints_resolve_a_jdk_static_factory() {
         Request::build("initialized").params(json!({})).finish(),
     )
     .await;
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -2054,13 +2054,13 @@ fn test_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 async fn wait_for_index(
-    engine: &EngineHandle,
+    engine: &BusClient,
     mut pred: impl FnMut(&[java_lsp::index::SymbolEntry], bool) -> bool,
 ) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
-        let entries = engine.indexed_symbols().await;
-        let ready = engine.index_ready().await;
+        let entries = engine.all_symbols().await;
+        let ready = engine.ready().await;
         if pred(&entries, ready) {
             return;
         }
@@ -2172,7 +2172,7 @@ async fn hover_and_member_completion_use_the_receiver_type() {
     )
     .unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     tokio::spawn(async move {
         use futures::StreamExt;
         while socket.next().await.is_some() {}
@@ -2212,7 +2212,7 @@ async fn hover_and_member_completion_use_the_receiver_type() {
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready && entries.iter().any(|entry| entry.name == "getSize")
     })
@@ -2282,7 +2282,7 @@ async fn references_and_rename_span_the_workspace() {
     .unwrap();
     let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     tokio::spawn(async move {
         use futures::StreamExt;
         while socket.next().await.is_some() {}
@@ -2320,7 +2320,7 @@ async fn references_and_rename_span_the_workspace() {
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready && entries.iter().any(|entry| entry.name == "Widget")
     })
@@ -2404,7 +2404,7 @@ async fn completion_offers_keywords_locals_and_workspace_symbols() {
     )
     .unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     // Diagnostics publications go through a capacity-1 channel; drain it so
     // handlers never block on an unread client socket.
     tokio::spawn(async move {
@@ -2443,7 +2443,7 @@ async fn completion_offers_keywords_locals_and_workspace_symbols() {
     .await;
 
     // Wait for the fixture's declarations before expecting a workspace hit.
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -2734,7 +2734,7 @@ async fn definition_resolves_usages_imports_and_reports_ambiguity() {
     )
     .unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     // Diagnostics publications go through a capacity-1 channel; drain it so
     // handlers never block on an unread client socket.
     tokio::spawn(async move {
@@ -2781,7 +2781,7 @@ class Hello {
     .await;
 
     // The scanned fixture files provide the navigation targets.
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -2883,7 +2883,7 @@ async fn workspace_symbol_finds_scanned_files_without_opening_them() {
     let greet_path = root.join("Greet.java");
     std::fs::write(&greet_path, GREET_FIXTURE).unwrap();
 
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     // Diagnostics publications go through a capacity-1 channel; drain it so
     // handlers never block on an unread client socket.
     tokio::spawn(async move {
@@ -2906,7 +2906,7 @@ async fn workspace_symbol_finds_scanned_files_without_opening_them() {
     )
     .await;
 
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -2999,7 +2999,7 @@ async fn warmup_progress_is_reported_when_the_client_supports_it() {
     let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
 
     let root = progress_fixture("progress");
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     let root_uri = Url::from_file_path(&root).unwrap();
     respond(
         &mut service,
@@ -3073,7 +3073,7 @@ async fn progress_is_not_sent_without_the_client_capability() {
     let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
 
     let root = progress_fixture("no-progress");
-    let (mut service, mut socket) = LspService::new(JavaLanguageServer::new);
+    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
     let root_uri = Url::from_file_path(&root).unwrap();
     // No `window.workDoneProgress`: progress must be suppressed entirely.
     respond(
@@ -3092,7 +3092,7 @@ async fn progress_is_not_sent_without_the_client_capability() {
     .await;
 
     // Wait for the warm-up to actually finish, so the check is not vacuous.
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |_, ready| ready).await;
 
     // Then drain for a bounded window: nothing progress-like may appear.
@@ -3182,7 +3182,7 @@ async fn many_open_documents_keep_queries_answered_during_a_sweep() {
 
     let mut service = service();
     initialize_workspace(&mut service, &root).await;
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |_, ready| ready).await;
 
     // Many documents, each with a resolvable field and an unresolved one, so a
@@ -3288,7 +3288,7 @@ async fn references_across_a_large_workspace_are_bounded_and_complete() {
 
     let mut service = service();
     initialize_workspace(&mut service, &root).await;
-    let engine = service.inner().engine();
+    let engine = service.inner().bus();
     wait_for_index(&engine, |_, ready| ready).await;
 
     let user_path = root.join("demo").join("User0.java");

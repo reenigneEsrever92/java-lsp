@@ -25,7 +25,7 @@ public class Main {
         var inner = new Greeter.Inner();
         inner.getVal();
 
-        var sumType = new SumType.Type1();
+        var sumType = new SumType.Type2("test");
 
         if (sumType instanceof Type1(var val)) {
             System.out.println("Some val" + val);

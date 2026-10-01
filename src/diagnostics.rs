@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::thread;
 
 use serde_json::json;
-use tokio::sync::mpsc as tokio_mpsc;
 use tower_lsp::lsp_types::{Diagnostic, DiagnosticSeverity, NumberOrString, Url};
 use tree_sitter::{Node, Parser, Tree};
 
@@ -146,7 +145,8 @@ impl<'a> SweepIndex<'a> {
         // as unresolved.
         let workspace = index
             .type_model()
-            .filter(|_| index.ready())
+            .blocking_recv()
+            .filter(|_| index.ready().blocking_recv())
             .filter(|workspace| workspace.contains("Object") && workspace.contains("String"));
         Self {
             index,
@@ -182,7 +182,7 @@ impl<'a> SweepIndex<'a> {
                 .collect()
         };
         if !names.is_empty() {
-            let mut found = self.index.query_names(names.clone());
+            let mut found = self.index.query_names(names.clone()).blocking_recv();
             let mut cache = self.names.borrow_mut();
             for name in names {
                 let entries = found.remove(&name).unwrap_or_default();
@@ -197,7 +197,7 @@ impl<'a> SweepIndex<'a> {
                 .collect()
         };
         if !packages.is_empty() {
-            let known = self.index.has_packages(packages.clone());
+            let known = self.index.has_packages(packages.clone()).blocking_recv();
             let mut cache = self.packages.borrow_mut();
             for package in packages {
                 let exists = known.contains(&package);
@@ -210,7 +210,7 @@ impl<'a> SweepIndex<'a> {
         if let Some(entries) = self.names.borrow().get(name) {
             return entries.clone();
         }
-        let entries = self.index.query_name(name);
+        let entries = self.index.query_name(name).blocking_recv();
         self.names
             .borrow_mut()
             .insert(name.to_string(), entries.clone());
@@ -221,7 +221,7 @@ impl<'a> SweepIndex<'a> {
         if let Some(exists) = self.packages.borrow().get(package) {
             return *exists;
         }
-        let exists = self.index.has_package(package);
+        let exists = self.index.has_package(package).blocking_recv();
         self.packages
             .borrow_mut()
             .insert(package.to_string(), exists);
@@ -977,7 +977,13 @@ fn collect_errors(node: &Node, text: &str, out: &mut Vec<Diagnostic>) {
 /// buffers' text, consumes the document notifications the hub broadcasts, and
 /// answers the diagnostics requests. It reads the index through its bus client
 /// and reports each pass through the hub.
-pub fn spawn_module(mut rx: tokio_mpsc::UnboundedReceiver<Bus>, client: IndexHandle) {
+///
+/// A document notification only records (or drops) the text; the sweep runs on
+/// [`DriverMessage::AnalysisUpdated`], which the analysis module sends after it
+/// has applied the same event and sent the index its updates — so the sweep
+/// reads an index that already holds the edit.
+pub fn spawn_module(client: IndexHandle) {
+    let mut rx = client.serve(crate::bus::Module::Diagnostics);
     thread::Builder::new()
         .name("java-lsp-diagnostics".to_string())
         .spawn(move || {
@@ -995,7 +1001,7 @@ pub fn spawn_module(mut rx: tokio_mpsc::UnboundedReceiver<Bus>, client: IndexHan
                         module.document(uri, text, version);
                     }
                     Bus::Notify(DriverMessage::DocumentClosed { uri }) => module.closed(&uri),
-                    Bus::Notify(DriverMessage::FileEvent { .. }) => module.sweep(),
+                    Bus::Notify(DriverMessage::AnalysisUpdated) => module.sweep(),
                     Bus::Request(Request::DiagnosticsForDocument { uri, reply }) => {
                         reply.send(module.diagnostics(&uri));
                     }
@@ -1025,17 +1031,22 @@ struct DiagnosticsModule {
 }
 
 impl DiagnosticsModule {
-    /// Records a document's current text and sweeps.
+    /// Records a document's current text; the sweep follows the analysis
+    /// module's `AnalysisUpdated`.
     fn document(&mut self, uri: Url, text: Arc<String>, version: i32) {
         self.docs.insert(uri, (version, text));
-        self.sweep();
     }
 
-    /// Drops a closed document and republishes the rest.
+    /// Drops a closed document and clears its published diagnostics; the
+    /// republish of the rest follows the analysis module's `AnalysisUpdated`.
     fn closed(&mut self, uri: &Url) {
         self.docs.remove(uri);
         self.results.remove(uri);
-        self.sweep();
+        self.client.notify(DriverMessage::Diagnostics {
+            uri: uri.clone(),
+            version: None,
+            diagnostics: Vec::new(),
+        });
     }
 
     /// The cached pass for `uri`, for the quick-fix subsystem.
@@ -1054,7 +1065,7 @@ impl DiagnosticsModule {
         if self.docs.is_empty() {
             return;
         }
-        let overlay = self.client.type_layers();
+        let overlay = self.client.type_layers().blocking_recv();
         let mut parsed: Vec<(Url, i32, Arc<String>, Tree)> = Vec::new();
         for (uri, (version, text)) in &self.docs {
             if let Some(tree) = self.parser.parse(text.as_bytes(), None) {

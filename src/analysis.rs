@@ -4,9 +4,9 @@
 //! warmed by a background scan and answering go-to-definition and
 //! workspace-symbol queries.
 //!
-//! A concrete, synchronous, `Send + Sync` type: the shell reaches it through
-//! [`crate::engine`], which owns it and exchanges commands and events with the
-//! LSP layer.
+//! A concrete, synchronous, `Send + Sync` type: the analysis module
+//! ([`spawn_module`]) owns it on the engine bus, applying the editor's document
+//! notifications and answering the shell's query requests.
 //!
 //! Trees are rebuilt from the full document text on every `open`/`change`.
 //! The engine never reparses other documents, so an edit reparses exactly one
@@ -29,7 +29,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::diagnostics::semantic_diagnostics_enabled;
 use crate::index::{extract_entries, java_parser, IndexHandle, IndexKind, NameLookup, SymbolEntry};
-use crate::messages::{EngineEvent, WatchedChange};
+use crate::messages::{AnalysisRequest, Bus, DriverMessage, Request, WatchedChange};
 use crate::types::{
     self, Member, ModelLayers, SourceLayerIndex, Ty, TypeInfo, TypeLookup, TypeModel, TypeQuery,
 };
@@ -96,9 +96,6 @@ pub struct TreeSitterEngine {
     /// Whether the client advertised `workspace.workspaceEdit.resourceOperations`
     /// with `CreateFile`, so the create-type quick fix can be offered.
     resource_operations: AtomicBool,
-    /// The shell's event channel, installed by the shell; the warm-up's indexing
-    /// task emits client events through it. `None` until the shell installs one.
-    events: Mutex<Option<tokio::sync::mpsc::UnboundedSender<EngineEvent>>>,
     /// A test-only hook fired by [`Self::diagnostics`] after the document
     /// snapshot is taken and the store lock released, so a test can prove the
     /// lock is not held across the semantic pass.
@@ -122,7 +119,6 @@ impl TreeSitterEngine {
             workspace_root: Mutex::new(None),
             semantic_diagnostics: AtomicBool::new(semantic_diagnostics_enabled()),
             resource_operations: AtomicBool::new(false),
-            events: Mutex::new(None),
             #[cfg(test)]
             analyze_hook: Mutex::new(None),
         }
@@ -138,14 +134,6 @@ impl TreeSitterEngine {
     /// default (used by tests).
     pub fn set_semantic_diagnostics(&self, enabled: bool) {
         self.semantic_diagnostics.store(enabled, Ordering::Relaxed);
-    }
-
-    /// Installs the shell's event channel, which the warm-up's indexing task
-    /// emits progress, notices, and diagnostics through.
-    pub fn set_events(&self, events: tokio::sync::mpsc::UnboundedSender<EngineEvent>) {
-        if let Ok(mut slot) = self.events.lock() {
-            *slot = Some(events);
-        }
     }
 
     /// Snapshots an open document: clones the `Arc` under a short lock and drops
@@ -254,7 +242,7 @@ impl TreeSitterEngine {
     /// Whether `path` lies in a workspace source root (or, before the scan has
     /// set a project model, in the workspace root).
     fn is_workspace_source(&self, path: &std::path::Path) -> bool {
-        let roots = self.index.source_roots();
+        let roots = self.index.source_roots().blocking_recv();
         if roots.is_empty() {
             self.workspace_root
                 .lock()
@@ -288,7 +276,7 @@ impl TreeSitterEngine {
     /// a map removal) and read through a view (a per-request merge would copy the
     /// whole workspace).
     fn type_layers(&self) -> ModelLayers {
-        self.index.type_layers()
+        self.index.type_layers().blocking_recv()
     }
 
     /// Completion items for a member access after `.`: the receiver's inferred
@@ -305,7 +293,7 @@ impl TreeSitterEngine {
             return Vec::new();
         };
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -430,7 +418,7 @@ impl TreeSitterEngine {
         let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
         let node = cursor_node(tree, node, text, offset);
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -592,6 +580,7 @@ impl TreeSitterEngine {
         let mut entries: Vec<Arc<SymbolEntry>> = self
             .index
             .query_name(name)
+            .blocking_recv()
             .into_iter()
             .filter(|entry| !entry.dependency && is_type_kind(entry.kind))
             .collect();
@@ -708,7 +697,7 @@ impl TreeSitterEngine {
     ) -> Option<Target> {
         let text = &document.text;
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -824,7 +813,7 @@ impl TreeSitterEngine {
         let mut parser = self.take_search_parser();
         let mut complete = true;
 
-        let mut candidates = self.index.source_files();
+        let mut candidates = self.index.source_files().blocking_recv();
         if !candidates.iter().any(|uri| uri == requested) {
             candidates.push(requested.clone());
         }
@@ -833,7 +822,7 @@ impl TreeSitterEngine {
         // per candidate file: a view over the per-file layers, so a receiver in
         // any file still resolves the type its member belongs to.
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1110,7 +1099,7 @@ impl TreeSitterEngine {
             .descendant_for_byte_range(offset, offset)?;
         let node = cursor_node(&document.tree, node, text, offset);
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1156,6 +1145,7 @@ impl TreeSitterEngine {
                 let candidates: Vec<Arc<SymbolEntry>> = self
                     .index
                     .query_name(simple)
+                    .blocking_recv()
                     .into_iter()
                     .filter(|entry| !entry.dependency || entry.library_source)
                     .filter(|entry| {
@@ -1185,6 +1175,7 @@ impl TreeSitterEngine {
         let candidates: Vec<Arc<SymbolEntry>> = self
             .index
             .query_name(word)
+            .blocking_recv()
             .into_iter()
             .filter(|entry| !entry.dependency || entry.library_source)
             .filter(|entry| entry.kind != IndexKind::Import)
@@ -1225,7 +1216,7 @@ impl TreeSitterEngine {
             return None;
         }
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1246,6 +1237,7 @@ impl TreeSitterEngine {
         let candidates: Vec<Arc<SymbolEntry>> = self
             .index
             .query_name(name)
+            .blocking_recv()
             .into_iter()
             .filter(|entry| !entry.dependency || entry.library_source)
             .filter(|entry| entry.kind == IndexKind::Method)
@@ -1282,7 +1274,7 @@ impl TreeSitterEngine {
     ) -> Option<Location> {
         let text = &document.text;
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1301,6 +1293,7 @@ impl TreeSitterEngine {
         let candidates: Vec<Arc<SymbolEntry>> = self
             .index
             .query_name(&owner.name)
+            .blocking_recv()
             .into_iter()
             .filter(|entry| !entry.dependency || entry.library_source)
             .filter(|entry| entry.kind == IndexKind::Method)
@@ -1350,7 +1343,7 @@ impl TreeSitterEngine {
             return Vec::new();
         };
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1434,7 +1427,7 @@ impl TreeSitterEngine {
         let node = tree.root_node().descendant_for_byte_range(offset, offset)?;
         let node = cursor_node(tree, node, text, offset);
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1573,6 +1566,7 @@ impl TreeSitterEngine {
     pub fn workspace_symbols(&self, query: &str) -> Vec<SymbolInformation> {
         self.index
             .query_prefix(query)
+            .blocking_recv()
             .into_iter()
             .filter(|entry| !entry.dependency)
             .filter(|entry| !is_constructor_entry(entry))
@@ -1671,12 +1665,12 @@ impl TreeSitterEngine {
         // each labeled with its owner — so the user can tell them apart.
         let (file_package, package_line) = file_header(&document.tree.root_node(), &document.text);
         let imports = collect_imports(&document.tree.root_node(), &document.text);
-        let entries = self.index.query_prefix(prefix);
+        let entries = self.index.query_prefix(prefix).blocking_recv();
         let ambiguous = ambiguous_names(&entries);
         // A type model layered with every open buffer, so a method's overloads
         // reflect unsaved edits — including edits to other files.
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1837,7 +1831,7 @@ impl TreeSitterEngine {
             return Vec::new();
         }
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1870,7 +1864,7 @@ impl TreeSitterEngine {
         let offset = byte_offset(text, position);
 
         let overlay = self.type_layers();
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, &overlay);
@@ -1965,11 +1959,11 @@ impl TreeSitterEngine {
     }
 
     pub fn index_ready(&self) -> bool {
-        self.index.ready()
+        self.index.ready().blocking_recv()
     }
 
     pub fn indexed_symbols(&self) -> Vec<crate::index::SymbolEntry> {
-        self.index.all_symbols()
+        self.index.all_symbols().blocking_recv()
     }
 }
 
@@ -2090,6 +2084,7 @@ fn workspace_type_entry(
 ) -> Option<Arc<SymbolEntry>> {
     let candidates: Vec<Arc<SymbolEntry>> = index
         .query_name(name)
+        .blocking_recv()
         .into_iter()
         .filter(|entry| !entry.dependency && is_type_kind(entry.kind))
         .filter(|entry| entry.package.as_deref() == package)
@@ -2099,9 +2094,13 @@ fn workspace_type_entry(
 
 /// True when a workspace source declares a type with this name in `package`.
 fn declared_in_workspace(name: &str, package: Option<&str>, index: &IndexHandle) -> bool {
-    index.query_name(name).into_iter().any(|entry| {
-        !entry.dependency && is_type_kind(entry.kind) && entry.package.as_deref() == package
-    })
+    index
+        .query_name(name)
+        .blocking_recv()
+        .into_iter()
+        .any(|entry| {
+            !entry.dependency && is_type_kind(entry.kind) && entry.package.as_deref() == package
+        })
 }
 
 /// The package a simple type name resolves in: an exact single-type import
@@ -2156,6 +2155,7 @@ fn member_declarations(
 ) -> Vec<Arc<SymbolEntry>> {
     index
         .query_name(name)
+        .blocking_recv()
         .into_iter()
         .filter(|entry| !entry.dependency && kinds.contains(&entry.kind))
         .filter(|entry| entry.container.last().map(String::as_str) == Some(owner))
@@ -4488,6 +4488,130 @@ fn offer(
     });
 }
 
+// -- the analysis module ---------------------------------------------------
+
+/// Starts the analysis module: a thread that owns the core and the open
+/// documents' trees. It applies the editor's notifications inline, in arrival
+/// order, so an edit always lands before the query the client sends at the new
+/// cursor; after each document or file event it notifies
+/// [`DriverMessage::AnalysisUpdated`], so the diagnostics sweep follows the
+/// index updates the core just sent. Each [`AnalysisRequest`] runs on the
+/// runtime's blocking pool, so a slow query never delays a later edit.
+pub fn spawn_module(client: crate::bus::BusClient, runtime: tokio::runtime::Handle) {
+    let mut rx = client.serve(crate::bus::Module::Analysis);
+    let engine = Arc::new(TreeSitterEngine::with_index(client.clone()));
+    std::thread::Builder::new()
+        .name("java-lsp-analysis".to_string())
+        // The open-document parse/extract recurses deeply; give this thread the
+        // same stack the runtime's threads get.
+        .stack_size(crate::RUNTIME_STACK_SIZE)
+        .spawn(move || {
+            while let Some(message) = rx.blocking_recv() {
+                match message {
+                    Bus::Notify(message) => {
+                        if apply_notification(&engine, message) {
+                            client.notify(DriverMessage::AnalysisUpdated);
+                        }
+                    }
+                    Bus::Request(Request::Analysis(request)) => {
+                        let engine = Arc::clone(&engine);
+                        runtime.spawn_blocking(move || answer(&engine, request));
+                    }
+                    Bus::Request(_) => {}
+                }
+            }
+        })
+        .expect("spawn the analysis module thread");
+}
+
+/// Applies one notification to the core; true when it changed a document or
+/// file the diagnostics can see.
+fn apply_notification(engine: &TreeSitterEngine, message: DriverMessage) -> bool {
+    match message {
+        DriverMessage::FolderAdded { uri } => {
+            engine.set_workspace_root(&uri);
+            false
+        }
+        DriverMessage::ClientCapabilities {
+            resource_operations,
+        } => {
+            engine.set_resource_operations(resource_operations);
+            false
+        }
+        DriverMessage::DocumentOpened { uri, text, version } => {
+            engine.open(&uri, &text, version);
+            true
+        }
+        DriverMessage::DocumentChanged { uri, text, version } => {
+            engine.change(&uri, &text, version);
+            true
+        }
+        DriverMessage::DocumentClosed { uri } => {
+            engine.close(&uri);
+            true
+        }
+        DriverMessage::FileEvent { uri, change } => {
+            engine.watched_files(&[(uri, change)]);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Answers one query from the core.
+fn answer(engine: &TreeSitterEngine, request: AnalysisRequest) {
+    match request {
+        AnalysisRequest::Hover {
+            uri,
+            position,
+            reply,
+        } => reply.send(engine.hover(&uri, position)),
+        AnalysisRequest::Definition {
+            uri,
+            position,
+            reply,
+        } => reply.send(engine.definition(&uri, position)),
+        AnalysisRequest::Implementation {
+            uri,
+            position,
+            reply,
+        } => reply.send(engine.implementation(&uri, position)),
+        AnalysisRequest::Completions {
+            uri,
+            position,
+            reply,
+        } => reply.send(engine.completions(&uri, position)),
+        AnalysisRequest::DocumentSymbols { uri, reply } => {
+            reply.send(engine.document_symbols(&uri))
+        }
+        AnalysisRequest::FoldingRanges { uri, reply } => reply.send(engine.folding_ranges(&uri)),
+        AnalysisRequest::SemanticTokens { uri, reply } => reply.send(engine.semantic_tokens(&uri)),
+        AnalysisRequest::InlayHints { uri, range, reply } => {
+            reply.send(engine.inlay_hints(&uri, range))
+        }
+        AnalysisRequest::SignatureHelp {
+            uri,
+            position,
+            reply,
+        } => reply.send(engine.signature_help(&uri, position)),
+        AnalysisRequest::References {
+            uri,
+            position,
+            include_declaration,
+            reply,
+        } => reply.send(engine.references(&uri, position, include_declaration)),
+        AnalysisRequest::Rename {
+            uri,
+            position,
+            new_name,
+            reply,
+        } => reply.send(engine.rename(&uri, position, &new_name)),
+        AnalysisRequest::WorkspaceSymbols { query, reply } => {
+            reply.send(engine.workspace_symbols(&query))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6726,14 +6850,14 @@ class Sample {
         let use_uri = Url::from_file_path(root.join("a/Use.java")).unwrap();
         let use_text = std::fs::read_to_string(root.join("a/Use.java")).unwrap();
         engine.open(&use_uri, &use_text, 1);
-        assert!(engine.index.query_name("Widget").is_empty());
+        assert!(engine.index.query_name("Widget").blocking_recv().is_empty());
 
         // A file created on disk, never opened, becomes visible.
         let widget_path = root.join("a").join("Widget.java");
         std::fs::write(&widget_path, "package a;\n\npublic class Widget {\n}\n").unwrap();
         let widget_uri = Url::from_file_path(&widget_path).unwrap();
         assert!(engine.watched_files(&[(widget_uri.clone(), WatchedChange::Created)]));
-        let entries = engine.index.query_name("Widget");
+        let entries = engine.index.query_name("Widget").blocking_recv();
         assert_eq!(entries.len(), 1, "{entries:?}");
         assert_eq!(*entries[0].uri, widget_uri);
 
@@ -6747,13 +6871,14 @@ class Sample {
         assert!(engine
             .index
             .query_name("run")
+            .blocking_recv()
             .iter()
             .any(|entry| *entry.uri == widget_uri));
 
         // Deleting it drops its entries.
         std::fs::remove_file(&widget_path).unwrap();
         assert!(engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]));
-        assert!(engine.index.query_name("Widget").is_empty());
+        assert!(engine.index.query_name("Widget").blocking_recv().is_empty());
     }
 
     #[test]
@@ -6783,9 +6908,14 @@ class Sample {
         assert!(engine
             .index
             .query_name("unsaved")
+            .blocking_recv()
             .iter()
             .any(|entry| *entry.uri == widget_uri));
-        assert!(engine.index.query_name("fromDisk").is_empty());
+        assert!(engine
+            .index
+            .query_name("fromDisk")
+            .blocking_recv()
+            .is_empty());
     }
 
     #[test]
@@ -6826,7 +6956,7 @@ class Sample {
         std::fs::remove_file(root.join("a/Widget.java")).unwrap();
         engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]);
 
-        assert!(engine.index.query_name("Widget").is_empty());
+        assert!(engine.index.query_name("Widget").blocking_recv().is_empty());
         let after = labels(&engine);
         assert!(
             !after.contains(&"run".to_string()),
@@ -6919,7 +7049,7 @@ class Sample {
 
         std::fs::remove_file(&widget_path).unwrap();
         assert!(engine.watched_files(&[(widget_uri, WatchedChange::Deleted)]));
-        assert!(engine.index.query_name("Widget").is_empty());
+        assert!(engine.index.query_name("Widget").blocking_recv().is_empty());
         let after = labels(&engine);
         assert!(
             !after.contains(&"run".to_string()),

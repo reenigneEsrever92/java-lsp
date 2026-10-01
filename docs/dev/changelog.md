@@ -12,6 +12,36 @@ named change.
 
 ## 2026-10-01
 
+- **Every participant subscribes through its BusClient** — the hub starts
+  empty (`bus::spawn_hub`) and learns its participants at runtime:
+  `BusClient::subscribe()` for every notification, `serve(Module)` to also own
+  a module's requests. Modules and drivers take only their client; the drivers
+  now receive `Bus` like the modules. `engine::start` is the one setup path,
+  building the hub and every participant, the server included. A second owner
+  is logged and ignored, and dropped receivers are pruned. `spawn_router`,
+  `bus::channel` and the hand-wired channels are gone. Verified by 299 library
+  tests, 29 harness tests, and the stdio smoke test. See
+  [Every participant subscribes to the bus through its BusClient](backlog/bus-subscriptions.md).
+
+- **Bus requests return an awaitable reply** — every `BusClient` request now
+  returns a `Reply<R>` (a thin wrapper over a tokio oneshot receiver): the shell
+  and tokio tests `.await` it, the synchronous analysis, diagnostics and
+  quick-fix code calls `blocking_recv()`. The closure-built requests, the boxed
+  reply deliverer, the `std`-channel blocking path and the `_async` method twins
+  are gone. Verified by 297 library tests, 29 harness tests, and the stdio smoke
+  test. See [Bus requests return an awaitable reply receiver](backlog/bus-reply-receiver.md).
+
+- **The LSP shell is just another bus client** — `JavaLanguageServer` holds a
+  `BusClient`: it notifies `DocumentOpened/Changed/Closed`, `FolderAdded`,
+  `FileEvent`, and `ClientCapabilities`, awaits `Request::Analysis(…)` queries
+  answered by the new analysis module (`analysis::spawn_module`), and renders
+  `Diagnostics`/`Progress`/`Notice` from its own bus channel; `Command`,
+  `EngineHandle`, `EngineEvent`, the dispatcher, and `messages::translate` are
+  gone, the diagnostics sweep runs on the new `AnalysisUpdated`, and the close
+  clear comes from the diagnostics module. Verified by 297 library tests, 29
+  harness tests, and the stdio smoke test. See
+  [Make the LSP shell just another bus client](backlog/server-as-bus-client.md).
+
 - **Go-to-declaration** — `initialize` now advertises `declarationProvider` and
   `textDocument/declaration` is answered by the go-to-definition resolution
   (Java has no declaration/definition split), so the editor's "Go to

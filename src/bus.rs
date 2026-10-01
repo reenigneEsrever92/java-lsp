@@ -1,12 +1,17 @@
 //! The engine bus: one mechanism every module uses.
 //!
 //! Modules never call each other directly and never share state. Each module
-//! owns its own state and holds a [`BusClient`]; it sends **notifications**
-//! (which the hub broadcasts to every module — each consumes the ones it cares
-//! about) and **requests** (which the hub routes to the one module that answers
-//! them, the reply riding the same bus). The hub itself is a thread, so a module
-//! may block on a request from any thread — including a runtime worker — without
-//! deadlocking.
+//! owns its own state and holds a [`BusClient`], which is all it needs: it
+//! registers with the hub through it ([`BusClient::subscribe`], or
+//! [`BusClient::serve`] to also own a module's requests), sends
+//! **notifications** (which the hub broadcasts to every subscriber — each
+//! consumes the ones it cares about) and **requests** (which the hub routes to
+//! the one module that serves them, the reply riding the same bus). Every request returns a [`Reply`]: a
+//! thin wrapper over a tokio oneshot receiver. Code on the runtime (the shell,
+//! the drivers) awaits it; synchronous module code — the analysis core, the
+//! diagnostics and quick-fix modules, which run on their own threads or the
+//! blocking pool — calls [`Reply::blocking_recv`]. The hub is a thread, so a
+//! blocked module never stalls it.
 //!
 //! `BusClient` mirrors the query surface its callers need, so a module that used
 //! to hold a neighbour's handle now holds a client instead.
@@ -23,27 +28,35 @@
 //! never by their key lists.
 
 use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc as std_mpsc;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::thread;
 use std::time::Instant;
 
 use tokio::sync::mpsc as tokio_mpsc;
-use tower_lsp::lsp_types::{CodeAction, Diagnostic, Url};
+use tokio::sync::oneshot;
+use tower_lsp::lsp_types::{
+    CodeAction, CompletionResponse, Diagnostic, DocumentSymbol, FoldingRange, Hover, InlayHint,
+    Location, Position, Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
+    WorkspaceEdit,
+};
 
 use crate::index::SymbolEntry;
-use crate::messages::{self, Bus, DriverMessage, EngineEvent, Inbound, ReplyHandle, Request};
+use crate::messages::{self, AnalysisRequest, Bus, DriverMessage, Inbound, ReplyHandle, Request};
 use crate::project::ProjectModel;
 use crate::types::{ModelLayers, SourceLayerIndex, TypeModel};
 
 /// Which module owns a request.
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Module {
     Index,
     Diagnostics,
     QuickFix,
+    Analysis,
 }
 
 /// A cheap, cloneable client for talking on the bus. Everything — the core, the
@@ -77,92 +90,141 @@ impl BusClient {
         });
     }
 
-    /// Sends a request to the hub, which routes it to the owning module, and
-    /// waits for the reply. Degrades to the type's default if the bus is gone.
-    fn request<R, F>(&self, build: F) -> R
-    where
-        R: Default + Send + 'static,
-        F: FnOnce(ReplyHandle<R>) -> Request,
-    {
-        let (tx, rx) = std_mpsc::channel();
+    /// Registers with the hub for every notification. Call it before starting
+    /// the thread or task that drains the receiver: the subscription rides the
+    /// hub's FIFO inbound channel, so it is in place before any message sent
+    /// afterwards. Dropping the receiver unsubscribes.
+    pub fn subscribe(&self) -> tokio_mpsc::UnboundedReceiver<Bus> {
+        self.register(None)
+    }
+
+    /// [`Self::subscribe`], and also makes this receiver the owner of
+    /// `module`'s requests. A module already served keeps its first owner (the
+    /// hub logs an error); dropping the receiver releases the ownership.
+    pub fn serve(&self, module: Module) -> tokio_mpsc::UnboundedReceiver<Bus> {
+        self.register(Some(module))
+    }
+
+    fn register(&self, serves: Option<Module>) -> tokio_mpsc::UnboundedReceiver<Bus> {
+        let (sink, rx) = tokio_mpsc::unbounded_channel();
+        let _ = self.inbound.send(Inbound::Subscribe {
+            sender: self.sender.clone(),
+            sink,
+            serves,
+        });
+        rx
+    }
+
+    /// A fresh request id with its reply pair: the handle travels in the request,
+    /// the [`Reply`] stays with the caller.
+    fn reply<R>(&self) -> (ReplyHandle<R>, Reply<R>) {
         let id = NEXT_REQUEST_ID.fetch_add(1, Ordering::Relaxed);
-        let reply = ReplyHandle::new(self.inbound.clone(), id, tx);
-        if self
-            .inbound
-            .send(Inbound::Request {
-                sender: self.sender.clone(),
-                id,
-                request: build(reply),
-            })
-            .is_err()
-        {
-            return R::default();
-        }
-        rx.recv().unwrap_or_default()
+        let (tx, rx) = oneshot::channel();
+        (ReplyHandle::new(self.inbound.clone(), id, tx), Reply(rx))
+    }
+
+    /// Posts request `id` to the hub, which routes it to the owning module. If
+    /// the bus is gone the request (and its handle) is dropped, so the caller's
+    /// [`Reply`] resolves to the default.
+    fn post(&self, id: u64, request: Request) {
+        let _ = self.inbound.send(Inbound::Request {
+            sender: self.sender.clone(),
+            id,
+            request,
+        });
     }
 
     // -- index subsystem ---------------------------------------------------
 
-    pub fn query_name(&self, name: &str) -> Vec<Arc<SymbolEntry>> {
+    pub fn query_name(&self, name: &str) -> Reply<Vec<Arc<SymbolEntry>>> {
+        let (reply, answer) = self.reply();
         let name = name.to_string();
-        self.request(move |reply| Request::IndexQueryName { name, reply })
+        self.post(reply.id(), Request::IndexQueryName { name, reply });
+        answer
     }
 
     /// Exact-name lookups for many names in one round trip; every requested name
     /// has an entry in the result.
-    pub fn query_names(&self, names: Vec<String>) -> HashMap<String, Vec<Arc<SymbolEntry>>> {
-        self.request(move |reply| Request::IndexQueryNames { names, reply })
+    pub fn query_names(&self, names: Vec<String>) -> Reply<HashMap<String, Vec<Arc<SymbolEntry>>>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexQueryNames { names, reply });
+        answer
     }
 
-    pub fn query_prefix(&self, prefix: &str) -> Vec<Arc<SymbolEntry>> {
+    pub fn query_prefix(&self, prefix: &str) -> Reply<Vec<Arc<SymbolEntry>>> {
+        let (reply, answer) = self.reply();
         let prefix = prefix.to_string();
-        self.request(move |reply| Request::IndexQueryPrefix { prefix, reply })
+        self.post(reply.id(), Request::IndexQueryPrefix { prefix, reply });
+        answer
     }
 
-    pub fn all_symbols(&self) -> Vec<SymbolEntry> {
-        self.request(|reply| Request::IndexAllSymbols { reply })
+    pub fn all_symbols(&self) -> Reply<Vec<SymbolEntry>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexAllSymbols { reply });
+        answer
     }
 
-    pub fn file_count(&self) -> usize {
-        self.request(|reply| Request::IndexFileCount { reply })
+    pub fn file_count(&self) -> Reply<usize> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexFileCount { reply });
+        answer
     }
 
-    pub fn ready(&self) -> bool {
-        self.request(|reply| Request::IndexReady { reply })
+    /// True once the warm-up's core stages finished.
+    pub fn ready(&self) -> Reply<bool> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexReady { reply });
+        answer
     }
 
-    pub fn has_package(&self, package: &str) -> bool {
+    pub fn has_package(&self, package: &str) -> Reply<bool> {
+        let (reply, answer) = self.reply();
         let package = package.to_string();
-        self.request(move |reply| Request::IndexHasPackage { package, reply })
+        self.post(reply.id(), Request::IndexHasPackage { package, reply });
+        answer
     }
 
     /// The packages among `packages` the index knows, in one round trip.
-    pub fn has_packages(&self, packages: Vec<String>) -> HashSet<String> {
-        self.request(move |reply| Request::IndexHasPackages { packages, reply })
+    pub fn has_packages(&self, packages: Vec<String>) -> Reply<HashSet<String>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexHasPackages { packages, reply });
+        answer
     }
 
-    pub fn type_model(&self) -> Option<Arc<SourceLayerIndex>> {
-        self.request(|reply| Request::IndexTypeModel { reply })
+    pub fn type_model(&self) -> Reply<Option<Arc<SourceLayerIndex>>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexTypeModel { reply });
+        answer
     }
 
-    pub fn type_layers(&self) -> ModelLayers {
-        self.request(|reply| Request::IndexTypeLayers { reply })
+    pub fn type_layers(&self) -> Reply<ModelLayers> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexTypeLayers { reply });
+        answer
     }
 
-    pub fn source_files(&self) -> Vec<Url> {
-        self.request(|reply| Request::IndexSourceFiles { reply })
+    pub fn source_files(&self) -> Reply<Vec<Url>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexSourceFiles { reply });
+        answer
     }
 
-    pub fn source_roots(&self) -> Vec<PathBuf> {
-        self.request(|reply| Request::IndexSourceRoots { reply })
+    pub fn source_roots(&self) -> Reply<Vec<PathBuf>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexSourceRoots { reply });
+        answer
     }
 
-    pub fn source_layer_index(&self) -> Arc<SourceLayerIndex> {
-        self.request(|reply| Request::IndexSourceLayerIndex { reply })
+    pub fn source_layer_index(&self) -> Reply<Arc<SourceLayerIndex>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexSourceLayerIndex { reply });
+        answer
     }
 
-    pub fn source_models(&self) -> Vec<(Url, Arc<TypeModel>)> {
-        self.request(|reply| Request::IndexSourceModels { reply })
+    pub fn source_models(&self) -> Reply<Vec<(Url, Arc<TypeModel>)>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::IndexSourceModels { reply });
+        answer
     }
 
     // -- index mutations (notifications) -----------------------------------
@@ -243,39 +305,195 @@ impl BusClient {
     // -- diagnostics subsystem ---------------------------------------------
 
     /// The diagnostics subsystem's cached pass for `uri`.
-    pub fn diagnostics(&self, uri: &Url) -> Option<(i32, Arc<Vec<Diagnostic>>)> {
+    pub fn diagnostics(&self, uri: &Url) -> Reply<Option<(i32, Arc<Vec<Diagnostic>>)>> {
+        let (reply, answer) = self.reply();
         let uri = uri.clone();
-        self.request(move |reply| Request::DiagnosticsForDocument { uri, reply })
+        self.post(reply.id(), Request::DiagnosticsForDocument { uri, reply });
+        answer
     }
 
     // -- quick-fix subsystem -----------------------------------------------
 
     /// The quick fixes for `diagnostics` in `uri`.
-    pub fn code_actions(&self, uri: &Url, diagnostics: Vec<Diagnostic>) -> Vec<CodeAction> {
+    pub fn code_actions(&self, uri: &Url, diagnostics: Vec<Diagnostic>) -> Reply<Vec<CodeAction>> {
+        let (reply, answer) = self.reply();
         let uri = uri.clone();
-        self.request(move |reply| Request::QuickFixForDocument {
+        self.post(
+            reply.id(),
+            Request::QuickFixForDocument {
+                uri,
+                diagnostics,
+                reply,
+            },
+        );
+        answer
+    }
+
+    // -- analysis module ---------------------------------------------------
+
+    pub fn hover(&self, uri: Url, position: Position) -> Reply<Option<Hover>> {
+        let (reply, answer) = self.reply();
+        let request = AnalysisRequest::Hover {
             uri,
-            diagnostics,
+            position,
             reply,
-        })
+        };
+        self.post_analysis(request);
+        answer
+    }
+
+    pub fn definition(&self, uri: Url, position: Position) -> Reply<Option<Location>> {
+        let (reply, answer) = self.reply();
+        let request = AnalysisRequest::Definition {
+            uri,
+            position,
+            reply,
+        };
+        self.post_analysis(request);
+        answer
+    }
+
+    pub fn implementation(&self, uri: Url, position: Position) -> Reply<Vec<Location>> {
+        let (reply, answer) = self.reply();
+        let request = AnalysisRequest::Implementation {
+            uri,
+            position,
+            reply,
+        };
+        self.post_analysis(request);
+        answer
+    }
+
+    pub fn completions(&self, uri: Url, position: Position) -> Reply<Option<CompletionResponse>> {
+        let (reply, answer) = self.reply();
+        let request = AnalysisRequest::Completions {
+            uri,
+            position,
+            reply,
+        };
+        self.post_analysis(request);
+        answer
+    }
+
+    pub fn document_symbols(&self, uri: Url) -> Reply<Option<Vec<DocumentSymbol>>> {
+        let (reply, answer) = self.reply();
+        self.post_analysis(AnalysisRequest::DocumentSymbols { uri, reply });
+        answer
+    }
+
+    pub fn folding_ranges(&self, uri: Url) -> Reply<Option<Vec<FoldingRange>>> {
+        let (reply, answer) = self.reply();
+        self.post_analysis(AnalysisRequest::FoldingRanges { uri, reply });
+        answer
+    }
+
+    pub fn semantic_tokens(&self, uri: Url) -> Reply<Option<SemanticTokens>> {
+        let (reply, answer) = self.reply();
+        self.post_analysis(AnalysisRequest::SemanticTokens { uri, reply });
+        answer
+    }
+
+    pub fn inlay_hints(&self, uri: Url, range: Range) -> Reply<Vec<InlayHint>> {
+        let (reply, answer) = self.reply();
+        self.post_analysis(AnalysisRequest::InlayHints { uri, range, reply });
+        answer
+    }
+
+    pub fn signature_help(&self, uri: Url, position: Position) -> Reply<Option<SignatureHelp>> {
+        let (reply, answer) = self.reply();
+        let request = AnalysisRequest::SignatureHelp {
+            uri,
+            position,
+            reply,
+        };
+        self.post_analysis(request);
+        answer
+    }
+
+    pub fn references(
+        &self,
+        uri: Url,
+        position: Position,
+        include_declaration: bool,
+    ) -> Reply<Vec<Location>> {
+        let (reply, answer) = self.reply();
+        let request = AnalysisRequest::References {
+            uri,
+            position,
+            include_declaration,
+            reply,
+        };
+        self.post_analysis(request);
+        answer
+    }
+
+    pub fn rename(
+        &self,
+        uri: Url,
+        position: Position,
+        new_name: String,
+    ) -> Reply<Option<WorkspaceEdit>> {
+        let (reply, answer) = self.reply();
+        let request = AnalysisRequest::Rename {
+            uri,
+            position,
+            new_name,
+            reply,
+        };
+        self.post_analysis(request);
+        answer
+    }
+
+    pub fn workspace_symbols(&self, query: String) -> Reply<Vec<SymbolInformation>> {
+        let (reply, answer) = self.reply();
+        self.post_analysis(AnalysisRequest::WorkspaceSymbols { query, reply });
+        answer
+    }
+
+    fn post_analysis(&self, request: AnalysisRequest) {
+        self.post(request.id(), Request::Analysis(request));
     }
 }
 
-/// Starts the hub thread. Every module registered in `modules` receives every
-/// notification as a [`Bus`] value; every sink in `notifications` receives the
-/// bare [`DriverMessage`] (the drivers). A request is routed to the module
-/// registered in `owners`. The returned client is how the shell, the core, and
-/// the modules reach the bus.
-pub fn spawn_router(
-    events: tokio_mpsc::UnboundedSender<EngineEvent>,
-    modules: Vec<tokio_mpsc::UnboundedSender<Bus>>,
-    notifications: Vec<tokio_mpsc::UnboundedSender<DriverMessage>>,
-    owners: HashMap<Module, tokio_mpsc::UnboundedSender<Bus>>,
-) -> BusClient {
+/// The pending answer to a bus request: a thin wrapper over the request's tokio
+/// oneshot receiver. Await it on the runtime; synchronous module code (a module
+/// thread, the blocking pool, a sync test) calls [`Reply::blocking_recv`]. If
+/// the owner drops the request unanswered or the bus is gone, it resolves to
+/// `R::default()`.
+#[must_use = "a request's answer arrives only through its Reply"]
+pub struct Reply<R>(oneshot::Receiver<R>);
+
+impl<R: Default> Reply<R> {
+    /// Blocks the current thread for the answer. Panics inside an async
+    /// context: await the reply there instead.
+    pub fn blocking_recv(self) -> R {
+        self.0.blocking_recv().unwrap_or_default()
+    }
+}
+
+impl<R: Default> Future for Reply<R> {
+    type Output = R;
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<R> {
+        Pin::new(&mut self.0)
+            .poll(cx)
+            .map(Result::unwrap_or_default)
+    }
+}
+
+/// Starts the hub thread, with no participants yet: every module, driver, and
+/// the shell registers through its client ([`BusClient::subscribe`],
+/// [`BusClient::serve`]). Every subscriber receives every notification; a
+/// request is routed to the subscriber serving its module. The hub renders the
+/// log reporting (`Log`, `Summary`) itself and nothing else: the editor-facing
+/// notifications are the shell's to render.
+pub fn spawn_hub() -> BusClient {
     let (inbound, mut rx) = tokio_mpsc::unbounded_channel::<Inbound>();
     thread::Builder::new()
         .name("java-lsp-hub".to_string())
         .spawn(move || {
+            let mut subscribers: Vec<tokio_mpsc::UnboundedSender<Bus>> = Vec::new();
+            let mut owners: HashMap<Module, tokio_mpsc::UnboundedSender<Bus>> = HashMap::new();
             // The requests the hub is still waiting on, so each reply can be
             // timed and attributed to the module that owned its request.
             let mut pending: HashMap<u64, Pending> = HashMap::new();
@@ -303,14 +521,9 @@ pub fn spawn_router(
                                 describe_notification(&message)
                             );
                         }
-                        // The hub is the sole translator to the editor.
-                        messages::translate(&message, &events);
-                        for sink in &modules {
-                            let _ = sink.send(Bus::Notify(message.clone()));
-                        }
-                        for sink in &notifications {
-                            let _ = sink.send(message.clone());
-                        }
+                        messages::log_reporting(&message);
+                        // A failed send is a dropped receiver: unsubscribe it.
+                        subscribers.retain(|sink| sink.send(Bus::Notify(message.clone())).is_ok());
                     }
                     Inbound::Request {
                         sender,
@@ -335,8 +548,13 @@ pub fn spawn_router(
                                 started: Instant::now(),
                             },
                         );
-                        if let Some(sink) = owners.get(&owner) {
-                            let _ = sink.send(Bus::Request(request));
+                        // An unowned request, or one whose owner is gone, is
+                        // dropped here: its reply resolves to the default.
+                        let delivered = owners
+                            .get(&owner)
+                            .is_some_and(|sink| sink.send(Bus::Request(request)).is_ok());
+                        if !delivered {
+                            owners.remove(&owner);
                         }
                     }
                     Inbound::Reply { id, deliver } => {
@@ -352,6 +570,36 @@ pub fn spawn_router(
                         if let Some(deliver) = deliver {
                             deliver();
                         }
+                    }
+                    Inbound::Subscribe {
+                        sender,
+                        sink,
+                        serves,
+                    } => {
+                        match serves {
+                            Some(module) => {
+                                tracing::debug!(
+                                    target: "java_lsp::bus",
+                                    "sender={sender} serve {module:?}"
+                                );
+                                let taken = owners
+                                    .get(&module)
+                                    .is_some_and(|owner| !owner.is_closed());
+                                if taken {
+                                    tracing::error!(
+                                        target: "java_lsp::bus",
+                                        "sender={sender} cannot serve {module:?}: it already has an owner; keeping the first"
+                                    );
+                                } else {
+                                    owners.insert(module, sink.clone());
+                                }
+                            }
+                            None => tracing::debug!(
+                                target: "java_lsp::bus",
+                                "sender={sender} subscribe"
+                            ),
+                        }
+                        subscribers.push(sink);
                     }
                 }
             }
@@ -379,20 +627,9 @@ impl BusClient {
 
 /// A standalone bus with only the index module.
 fn standalone_client() -> BusClient {
-    let (events, _events_rx) = tokio_mpsc::unbounded_channel();
-    let (index, index_rx) = channel();
-    crate::index::spawn_index_module(index_rx);
-    let mut owners = HashMap::new();
-    owners.insert(Module::Index, index.clone());
-    spawn_router(events, vec![index], Vec::new(), owners).labeled("core")
-}
-
-/// A bus channel: the sink a module registers with the hub, and its receiver.
-pub fn channel() -> (
-    tokio_mpsc::UnboundedSender<Bus>,
-    tokio_mpsc::UnboundedReceiver<Bus>,
-) {
-    tokio_mpsc::unbounded_channel()
+    let client = spawn_hub();
+    crate::index::spawn_module(&client.labeled("index"));
+    client.labeled("core")
 }
 
 /// A module that owns a request.
@@ -414,6 +651,7 @@ fn owner_of(request: &Request) -> Module {
         | Request::IndexSourceModels { .. } => Module::Index,
         Request::DiagnosticsForDocument { .. } => Module::Diagnostics,
         Request::QuickFixForDocument { .. } => Module::QuickFix,
+        Request::Analysis(_) => Module::Analysis,
     }
 }
 
@@ -431,6 +669,7 @@ fn module_label(module: Module) -> &'static str {
         Module::Index => "index",
         Module::Diagnostics => "diagnostics",
         Module::QuickFix => "quickfix",
+        Module::Analysis => "analysis",
     }
 }
 
@@ -513,6 +752,7 @@ fn describe_notification(message: &DriverMessage) -> String {
             )
         }
         DriverMessage::DocumentClosed { uri } => format!("DocumentClosed {uri}"),
+        DriverMessage::AnalysisUpdated => "AnalysisUpdated".to_string(),
         DriverMessage::ClientCapabilities {
             resource_operations,
         } => format!("ClientCapabilities resource_operations={resource_operations}"),
@@ -571,6 +811,55 @@ fn describe_request(request: &Request) -> String {
             "QuickFixForDocument {uri} diagnostics={}",
             diagnostics.len()
         ),
+        Request::Analysis(request) => describe_analysis(request),
+    }
+}
+
+/// The same, for an analysis query: the feature, the document, and the cursor.
+fn describe_analysis(request: &AnalysisRequest) -> String {
+    let at = |position: &Position| format!("{}:{}", position.line, position.character);
+    match request {
+        AnalysisRequest::Hover { uri, position, .. } => {
+            format!("AnalysisHover {uri} {}", at(position))
+        }
+        AnalysisRequest::Definition { uri, position, .. } => {
+            format!("AnalysisDefinition {uri} {}", at(position))
+        }
+        AnalysisRequest::Implementation { uri, position, .. } => {
+            format!("AnalysisImplementation {uri} {}", at(position))
+        }
+        AnalysisRequest::Completions { uri, position, .. } => {
+            format!("AnalysisCompletions {uri} {}", at(position))
+        }
+        AnalysisRequest::DocumentSymbols { uri, .. } => format!("AnalysisDocumentSymbols {uri}"),
+        AnalysisRequest::FoldingRanges { uri, .. } => format!("AnalysisFoldingRanges {uri}"),
+        AnalysisRequest::SemanticTokens { uri, .. } => format!("AnalysisSemanticTokens {uri}"),
+        AnalysisRequest::InlayHints { uri, range, .. } => format!(
+            "AnalysisInlayHints {uri} {}-{}",
+            at(&range.start),
+            at(&range.end)
+        ),
+        AnalysisRequest::SignatureHelp { uri, position, .. } => {
+            format!("AnalysisSignatureHelp {uri} {}", at(position))
+        }
+        AnalysisRequest::References {
+            uri,
+            position,
+            include_declaration,
+            ..
+        } => format!(
+            "AnalysisReferences {uri} {} include_declaration={include_declaration}",
+            at(position)
+        ),
+        AnalysisRequest::Rename {
+            uri,
+            position,
+            new_name,
+            ..
+        } => format!("AnalysisRename {uri} {} to={new_name}", at(position)),
+        AnalysisRequest::WorkspaceSymbols { query, .. } => {
+            format!("AnalysisWorkspaceSymbols {query}")
+        }
     }
 }
 
@@ -599,6 +888,40 @@ mod tests {
     #[test]
     fn an_unanswered_request_is_not_logged_as_a_reply() {
         assert!(reply_log(&pending_reply(), false).is_none());
+    }
+
+    /// Answers one `IndexFileCount` request arriving on `rx` with `count`.
+    fn answer_file_count(rx: &mut tokio_mpsc::UnboundedReceiver<Bus>, count: usize) {
+        while let Some(message) = rx.blocking_recv() {
+            if let Bus::Request(Request::IndexFileCount { reply }) = message {
+                reply.send(count);
+                return;
+            }
+        }
+        panic!("the subscription closed before the request arrived");
+    }
+
+    #[test]
+    fn a_request_reaches_the_first_module_serving_it() {
+        let client = spawn_hub();
+        let mut first = client.labeled("first").serve(Module::Index);
+        // A second owner is a wiring bug: the hub keeps the first.
+        let _second = client.labeled("second").serve(Module::Index);
+        let reply = client.file_count();
+        answer_file_count(&mut first, 7);
+        assert_eq!(reply.blocking_recv(), 7);
+    }
+
+    #[test]
+    fn a_dropped_owner_resolves_its_requests_to_the_default() {
+        let client = spawn_hub();
+        drop(client.serve(Module::Index));
+        assert_eq!(client.file_count().blocking_recv(), 0);
+        // The module is free again, so a new owner can serve it.
+        let mut owner = client.serve(Module::Index);
+        let reply = client.file_count();
+        answer_file_count(&mut owner, 3);
+        assert_eq!(reply.blocking_recv(), 3);
     }
 
     #[test]

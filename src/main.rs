@@ -1,18 +1,6 @@
-use java_lsp::server::JavaLanguageServer;
+use java_lsp::engine;
+use java_lsp::RUNTIME_STACK_SIZE;
 use tower_lsp::{LspService, Server};
-
-/// Thread stack size for the runtime's worker and blocking-pool threads.
-///
-/// The analysis paths recurse deeply — the warm-up source scan, the open-document
-/// parse/extract (`TreeSitterEngine::store_tree`), and the diagnostics sweep all
-/// walk the AST and the type model recursively — and on a large workspace that
-/// overflows the standard library's default 2 MiB stack, aborting the process
-/// with `has overflowed its stack`. Sizing the runtime explicitly keeps the
-/// server safe by default, without depending on the `RUST_MIN_STACK` environment
-/// variable, which the editor extension does not set. The value matches the size
-/// verified to fix the abort on a large Maven workspace; it can be lowered once
-/// the deepest walk is identified and made iterative.
-const RUNTIME_STACK_SIZE: usize = 256 * 1024 * 1024;
 
 fn main() {
     let subscriber = tracing_subscriber::fmt()
@@ -34,7 +22,7 @@ fn main() {
     runtime.block_on(async {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        let (service, socket) = LspService::build(JavaLanguageServer::new).finish();
+        let (service, socket) = LspService::build(engine::start).finish();
         Server::new(stdin, stdout, socket).serve(service).await;
     });
 }

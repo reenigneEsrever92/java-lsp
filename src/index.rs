@@ -17,8 +17,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
 
-use tokio::sync::mpsc as tokio_mpsc;
-
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::{Range, Url};
 use tree_sitter::{Node, Parser, Tree};
@@ -1157,15 +1155,18 @@ pub(crate) trait NameLookup {
 }
 
 impl NameLookup for IndexHandle {
+    /// Blocks for the bus reply: `NameLookup` serves the synchronous analysis
+    /// code, which runs off the runtime's workers.
     fn query_name(&self, name: &str) -> Vec<Arc<SymbolEntry>> {
-        IndexHandle::query_name(self, name)
+        IndexHandle::query_name(self, name).blocking_recv()
     }
 }
 
 /// Starts the index module: a thread that owns the [`WorkspaceIndex`] and serves
 /// the bus — it applies the notifications that affect the index and answers the
 /// index requests. It exits when the hub drops its sink.
-pub fn spawn_index_module(mut rx: tokio_mpsc::UnboundedReceiver<Bus>) {
+pub fn spawn_module(client: &crate::bus::BusClient) {
+    let mut rx = client.serve(crate::bus::Module::Index);
     thread::Builder::new()
         .name("java-lsp-index".to_string())
         .spawn(move || {
@@ -1702,8 +1703,8 @@ class A {}
         let index = IndexHandle::standalone();
         warm_up_sync(&root_url, &index);
 
-        assert!(index.ready());
-        let symbols = index.all_symbols();
+        assert!(index.ready().blocking_recv());
+        let symbols = index.all_symbols().blocking_recv();
         let classes: Vec<&str> = symbols
             .iter()
             .filter(|entry| entry.kind == IndexKind::Class)
@@ -1712,15 +1713,15 @@ class A {}
         // all_symbols orders by URI: the root's Top.java sorts before
         // nested/Deep.java ('T' < 'n').
         assert_eq!(classes, vec!["Top", "Deep"]);
-        assert!(index.query_name("Skip").is_empty());
+        assert!(index.query_name("Skip").blocking_recv().is_empty());
 
         // The same warm-up builds the declared-type base: it holds no workspace
         // source types — each source file gets its own per-URI model instead.
-        if let Some(base) = index.type_model() {
+        if let Some(base) = index.type_model().blocking_recv() {
             assert!(!crate::types::TypeLookup::contains(base.as_ref(), "Top"));
             assert!(!crate::types::TypeLookup::contains(base.as_ref(), "Deep"));
         }
-        let sources = index.source_models();
+        let sources = index.source_models().blocking_recv();
         let top_uri = Url::from_file_path(root.join("Top.java")).unwrap();
         let deep_uri = Url::from_file_path(root.join("nested").join("Deep.java")).unwrap();
         let by_uri = |uri: &Url| {

@@ -15,8 +15,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::thread;
 
-use tokio::sync::mpsc as tokio_mpsc;
-
 use tower_lsp::lsp_types::{
     CodeAction, CodeActionKind, CreateFile, CreateFileOptions, Diagnostic, DocumentChangeOperation,
     DocumentChanges, OneOf, OptionalVersionedTextDocumentIdentifier, Position, Range, ResourceOp,
@@ -75,7 +73,7 @@ impl QuickFix<'_> {
     /// diagnostic's `data`, so the fix matches what was reported.
     pub fn actions(&self, diagnostics: &[Diagnostic]) -> Vec<CodeAction> {
         // The type model, for inferring created signatures from the usage.
-        let workspace = self.index.type_model();
+        let workspace = self.index.type_model().blocking_recv();
         let empty = SourceLayerIndex::default();
         let base = workspace.as_deref().unwrap_or(&empty);
         let query = TypeQuery::new(base, self.overlay);
@@ -141,6 +139,7 @@ impl QuickFix<'_> {
             let Some(entry) = self
                 .index
                 .query_name(simple)
+                .blocking_recv()
                 .into_iter()
                 .find(|entry| import_target(entry).as_deref() == Some(target))
             else {
@@ -354,6 +353,7 @@ impl QuickFix<'_> {
         let Some(entry) = self
             .index
             .query_name(simple)
+            .blocking_recv()
             .into_iter()
             .find(|entry| !entry.dependency && import_target(entry).as_deref() == Some(owner))
         else {
@@ -423,6 +423,7 @@ impl QuickFix<'_> {
         let base = self
             .index
             .source_roots()
+            .blocking_recv()
             .into_iter()
             .filter(|root| path.starts_with(root))
             .max_by_key(|root| root.components().count())
@@ -671,7 +672,8 @@ fn workspace_edit_changes(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
 /// buffers' text, consumes the document notifications the hub broadcasts, and
 /// answers the quick-fix requests. It reads the symbol index and the diagnostics
 /// cache through its bus client.
-pub fn spawn_module(mut rx: tokio_mpsc::UnboundedReceiver<Bus>, client: crate::bus::BusClient) {
+pub fn spawn_module(client: crate::bus::BusClient) {
+    let mut rx = client.serve(crate::bus::Module::QuickFix);
     thread::Builder::new()
         .name("java-lsp-quickfix".to_string())
         .spawn(move || {
@@ -728,12 +730,13 @@ impl QuickFixModule {
         let diagnostics: Vec<Diagnostic> = if diagnostics.is_empty() {
             self.client
                 .diagnostics(uri)
+                .blocking_recv()
                 .map(|(_, cached)| (*cached).clone())
                 .unwrap_or_default()
         } else {
             diagnostics.to_vec()
         };
-        let overlay = self.client.type_layers();
+        let overlay = self.client.type_layers().blocking_recv();
         QuickFix::new(
             uri,
             &tree,
@@ -749,20 +752,13 @@ impl QuickFixModule {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::sync::mpsc as tokio_mpsc;
 
     #[tokio::test]
     async fn the_module_generates_a_fix_from_the_request_diagnostics() {
-        let (events, _events_rx) = tokio_mpsc::unbounded_channel();
-        let (index_tx, index_rx) = crate::bus::channel();
-        crate::index::spawn_index_module(index_rx);
-        let (quickfix_tx, quickfix_rx) = crate::bus::channel();
-        let mut owners = std::collections::HashMap::new();
-        owners.insert(crate::bus::Module::Index, index_tx.clone());
-        owners.insert(crate::bus::Module::QuickFix, quickfix_tx.clone());
-        let client =
-            crate::bus::spawn_router(events, vec![index_tx, quickfix_tx], Vec::new(), owners);
-        crate::quickfix::spawn_module(quickfix_rx, client.clone());
+        let client = crate::bus::spawn_hub();
+        crate::index::spawn_module(&client.labeled("index"));
+        crate::quickfix::spawn_module(client.labeled("quickfix"));
+        let client = client.labeled("test");
 
         let uri = Url::parse("file:///Main.java").unwrap();
         client.notify(DriverMessage::DocumentOpened {
@@ -788,7 +784,7 @@ mod tests {
             })),
         };
 
-        let actions = client.code_actions(&uri, vec![diagnostic]);
+        let actions = client.code_actions(&uri, vec![diagnostic]).await;
         assert_eq!(actions.len(), 1, "{actions:?}");
         assert!(actions[0].title.contains("value"), "{:?}", actions[0].title);
         assert_eq!(actions[0].kind, Some(CodeActionKind::QUICKFIX));
