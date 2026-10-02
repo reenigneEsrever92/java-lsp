@@ -60,4 +60,4 @@ and filler:
 
     - **Sort and filter by front matter fields** — `/api/dirs` now accepts
       `sort=<field>` and `filter=<field>=<value>`. See
-      [Sort and filter by front matter fields](backlog/sort-filter-frontmatter.md).
+      [Sort and filter by front matter fields](backlog/summary.md#sort-and-filter-by-front-matter-fields).

@@ -6,7 +6,9 @@ change requests; `fawi-plan` adds an implementation plan to a request,
 `fawi-implement` builds it and records the outcome, and `fawi-review` checks
 the result.
 
-- [Backlog](backlog/index.md) — the change requests and their states.
+- [Backlog](backlog/index.md) — the open change requests and their states.
+- [Backlog summary](backlog/summary.md) — condensed records of the finished
+  requests, newest first.
 - [Changelog](changelog.md) — shipped changes, newest first.
 
 A contributing guide is not yet needed for this single-maintainer project.

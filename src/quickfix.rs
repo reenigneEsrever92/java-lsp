@@ -672,7 +672,8 @@ fn workspace_edit_changes(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
 /// buffers' text, consumes the document notifications the hub broadcasts, and
 /// answers the quick-fix requests. It reads the symbol index and the diagnostics
 /// cache through its bus client.
-pub fn spawn_module(client: crate::bus::BusClient) {
+pub fn spawn(bus: &crate::bus::BusClient) {
+    let client = bus.labeled("quickfix");
     let mut rx = client.serve(crate::bus::Module::QuickFix);
     thread::Builder::new()
         .name("java-lsp-quickfix".to_string())
@@ -756,8 +757,8 @@ mod tests {
     #[tokio::test]
     async fn the_module_generates_a_fix_from_the_request_diagnostics() {
         let client = crate::bus::spawn_hub();
-        crate::index::spawn_module(&client.labeled("index"));
-        crate::quickfix::spawn_module(client.labeled("quickfix"));
+        crate::index::spawn(&client);
+        crate::quickfix::spawn(&client);
         let client = client.labeled("test");
 
         let uri = Url::parse("file:///Main.java").unwrap();

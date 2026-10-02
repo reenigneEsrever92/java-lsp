@@ -10,8 +10,10 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
+use crate::bus::BusClient;
 use crate::classfile::{for_each_zip_entry, parse_class};
 use crate::index::SymbolEntry;
+use crate::messages::{DriverMessage, LogLevel, ProgressUpdate, Stage};
 
 /// Locates a usable JDK home: explicit override, `JAVA_HOME`, then the
 /// common installation directories (including SDKMAN). An explicit override
@@ -272,9 +274,155 @@ fn src_zip_entries(src: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types::
     vec![(uri, entries, types)]
 }
 
+// -- the JDK indexer driver -------------------------------------------------
+
+/// Starts the JDK indexer on the bus: it runs once at start, independent of the
+/// workspace, and emits its archives' entries and models, then the `Jdk`
+/// stage-done. It listens to nothing, so it does not subscribe.
+pub fn spawn(bus: &BusClient) {
+    let client = bus.labeled("jdk");
+    tokio::spawn(async move {
+        let _ = tokio::task::spawn_blocking(move || {
+            let count = {
+                let mut sink = |message| {
+                    let _ = client.notify(message);
+                };
+                index_jdk(&mut sink)
+            };
+            let _ = client.notify(DriverMessage::StageDone {
+                stage: Stage::Jdk,
+                count,
+            });
+        })
+        .await;
+    });
+}
+
+/// Indexes the standard library through the same path as dependency jars
+/// (offered in completions, filtered from navigation). A missing JDK is a
+/// no-op. Returns the number of classes indexed.
+///
+/// The whole JDK is served from [`crate::base_cache`] when its home and every
+/// archive's identity are unchanged; a JDK upgrade (any archive changed) or a
+/// missing archive re-parses it in full.
+pub(crate) fn index_jdk(sink: &mut dyn FnMut(DriverMessage)) -> usize {
+    let Some(home) = locate_jdk() else {
+        sink(DriverMessage::Log {
+            level: LogLevel::Info,
+            message: "no usable JDK found; standard library not indexed".to_string(),
+        });
+        return 0;
+    };
+    let store = crate::base_cache::ArchiveStore::new("jdk");
+    let key = jdk_cache_key(&home);
+    let archives = match key
+        .as_ref()
+        .and_then(|key| store.get::<Vec<crate::base_cache::JdkArchive>>(key))
+    {
+        Some(archives) => archives,
+        None => {
+            let archives: Vec<crate::base_cache::JdkArchive> = jdk_entries(&home)
+                .into_iter()
+                .map(|(uri, entries, types)| crate::base_cache::JdkArchive {
+                    uri,
+                    entries,
+                    types,
+                })
+                .collect();
+            if let Some(key) = &key {
+                store.insert(key, &archives);
+            }
+            archives
+        }
+    };
+    let mut jdk_classes = 0usize;
+    for archive in archives {
+        jdk_classes += archive.entries.len();
+        let mut types = crate::types::TypeModel::new();
+        types.extend(archive.types);
+        sink(DriverMessage::BaseArtifact {
+            uri: archive.uri,
+            entries: Arc::new(archive.entries),
+            types: Arc::new(types),
+        });
+    }
+    sink(DriverMessage::Progress(ProgressUpdate::Update {
+        message: format!("Indexed {jdk_classes} JDK classes"),
+        percentage: None,
+    }));
+    jdk_classes
+}
+
+/// The JDK's cache identity: its home plus every archive's identity, so a JDK
+/// upgrade (any archive changed) invalidates the cached parse. `None` when an
+/// archive cannot be identified, which forces a full parse.
+fn jdk_cache_key(home: &Path) -> Option<String> {
+    let archives = jdk_archive_paths(home);
+    if archives.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::with_capacity(archives.len() + 1);
+    parts.push(format!("jdk:{}", home.display()));
+    for archive in &archives {
+        parts.push(crate::base_cache::identity(archive)?);
+    }
+    Some(parts.join("|"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A second warm-up over an unchanged JDK re-parses no class files: the whole
+    /// JDK is served from the base cache. Proven by emptying the cached archives
+    /// under the live key — a cache hit then emits no classes at all.
+    #[test]
+    fn a_second_jdk_warmup_is_served_from_the_cache() {
+        let _env = crate::jdk::env_lock();
+        let Some(home) = locate_jdk() else {
+            return; // no JDK here; nothing to cache
+        };
+        let cache_root = std::env::temp_dir().join(format!(
+            "java-lsp-jdk-cache-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::env::set_var("JAVA_LSP_SOURCES_CACHE", &cache_root);
+
+        // First warm-up: parses the JDK and writes the cache.
+        let mut sink = |_message| {};
+        let classes = index_jdk(&mut sink);
+        if classes == 0 {
+            // No readable standard-library archive here; nothing to prove.
+            std::env::remove_var("JAVA_LSP_SOURCES_CACHE");
+            let _ = std::fs::remove_dir_all(&cache_root);
+            return;
+        }
+
+        // Empty the cached archives under the live key; a hit then emits none,
+        // so a zero-class second run proves the cache was used, not re-parsed.
+        let store = crate::base_cache::ArchiveStore::new("jdk");
+        let key = jdk_cache_key(&home).expect("a JDK key");
+        assert!(
+            store
+                .get::<Vec<crate::base_cache::JdkArchive>>(&key)
+                .is_some(),
+            "the JDK cache should be written"
+        );
+        store.insert(&key, &Vec::<crate::base_cache::JdkArchive>::new());
+
+        let mut second = |_message| {};
+        assert_eq!(
+            index_jdk(&mut second),
+            0,
+            "the second warm-up must be served from the cache"
+        );
+
+        std::env::remove_var("JAVA_LSP_SOURCES_CACHE");
+        let _ = std::fs::remove_dir_all(&cache_root);
+    }
 
     /// Minimal STORED-entry zip writer (std has none); duplicated here —
     /// same pattern as in `classfile` and `harness` tests.

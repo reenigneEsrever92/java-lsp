@@ -982,7 +982,8 @@ fn collect_errors(node: &Node, text: &str, out: &mut Vec<Diagnostic>) {
 /// [`DriverMessage::AnalysisUpdated`], which the analysis module sends after it
 /// has applied the same event and sent the index its updates — so the sweep
 /// reads an index that already holds the edit.
-pub fn spawn_module(client: IndexHandle) {
+pub fn spawn(bus: &crate::bus::BusClient) {
+    let client = bus.labeled("diagnostics");
     let mut rx = client.serve(crate::bus::Module::Diagnostics);
     thread::Builder::new()
         .name("java-lsp-diagnostics".to_string())

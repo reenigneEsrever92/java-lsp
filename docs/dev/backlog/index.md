@@ -1,72 +1,15 @@
 # Backlog
 
-Change requests live here as `<slug>.md`. Each request has a `kind`
+Open change requests live here as `<slug>.md`. Each request has a `kind`
 (`feature`, `bug`, `improvement`, `refactor`) and moves through a single
 `state` field: `proposed` → `planned` → `in-progress` → `done` (with
 `rejected`/`superseded` as exits, set by `fawi-check`).
 
-| Request                                                                   | Kind        | Priority | State       |
-| ------------------------------------------------------------------------- | ----------- | -------- | ----------- |
-| [lsp-shell-skeleton](lsp-shell-skeleton.md)                               | feature     | high     | done        |
-| [syntax-features](syntax-features.md)                                     | feature     | high     | done        |
-| [workspace-symbol-index](workspace-symbol-index.md)                       | feature     | high     | done        |
-| [completions-v1](completions-v1.md)                                       | feature     | high     | done        |
-| [navigation-v1](navigation-v1.md)                                         | feature     | medium   | done        |
-| [perf-benchmarks](perf-benchmarks.md)                                     | feature     | medium   | done        |
-| [type-aware-engine](type-aware-engine.md)                                 | feature     | medium   | done        |
-| [jvm-member-descriptors](jvm-member-descriptors.md)                       | feature     | medium   | done        |
-| [references-and-rename](references-and-rename.md)                         | feature     | medium   | done        |
-| [maven-project-model](maven-project-model.md)                             | feature     | high     | done        |
-| [auto-import-completions](auto-import-completions.md)                     | feature     | high     | done        |
-| [jdk-standard-library](jdk-standard-library.md)                           | feature     | high     | done        |
-| [type-hints](type-hints.md)                                               | feature     | medium   | done        |
-| [import-aware-type-resolution](import-aware-type-resolution.md)           | bug         | high     | done        |
-| [same-name-completions](same-name-completions.md)                         | bug         | high     | done        |
-| [generic-type-argument-inference](generic-type-argument-inference.md)     | feature     | medium   | done        |
-| [type-aware-review-followups](type-aware-review-followups.md)             | bug         | high     | done        |
-| [record-members](record-members.md)                                       | bug         | high     | done        |
-| [dot-completion-and-var-inference](dot-completion-and-var-inference.md)   | bug         | high     | done        |
-| [maven-source-indexing](maven-source-indexing.md)                         | feature     | high     | done        |
-| [message-based-engine](message-based-engine.md)                           | refactor    | high     | done        |
-| [warmup-progress-reporting](warmup-progress-reporting.md)                 | improvement | medium   | done        |
-| [overload-completions](overload-completions.md)                           | feature     | high     | done        |
-| [overload-navigation](overload-navigation.md)                             | feature     | medium   | done        |
-| [float-literals-and-overload-hints](float-literals-and-overload-hints.md) | bug         | high     | done        |
-| [unresolved-symbol-diagnostics](unresolved-symbol-diagnostics.md)         | feature     | high     | done        |
-| [create-stub-quick-fixes](create-stub-quick-fixes.md)                     | feature     | medium   | done        |
-| [external-change-detection](external-change-detection.md)                 | bug         | high     | done        |
-| [deleted-file-stays-in-type-model](deleted-file-stays-in-type-model.md)   | bug         | high     | done        |
-| [constructors](constructors.md)                                           | feature     | high     | done        |
-| [lombok-support](lombok-support.md)                                       | feature     | high     | done        |
-| [go-to-implementation](go-to-implementation.md)                           | feature     | medium   | done        |
-| [large-project-memory](large-project-memory.md)                           | refactor    | high     | done        |
-| [warmup-request-responsiveness](warmup-request-responsiveness.md)         | bug         | high     | done        |
-| [warmup-throughput](warmup-throughput.md)                                 | improvement | high     | done        |
-| [jdk-jmod-indexing](jdk-jmod-indexing.md)                                 | bug         | high     | done        |
-| [incremental-indexing-pipeline](incremental-indexing-pipeline.md)         | refactor    | high     | done        |
-| [enum-constants](enum-constants.md)                                       | bug         | high     | done        |
-| [nested-type-references](nested-type-references.md)                       | bug         | high     | done        |
-| [driver-message-bus](driver-message-bus.md)                               | refactor    | high     | done        |
-| [dotted-receiver-completion](dotted-receiver-completion.md)               | bug         | high     | done        |
-| [runtime-stack-overflow](runtime-stack-overflow.md)                       | bug         | high     | done        |
-| [diagnostics-index-subsystems](diagnostics-index-subsystems.md)           | refactor    | medium   | done        |
-| [quickfix-subsystem](quickfix-subsystem.md)                               | refactor    | medium   | done        |
-| [unified-bus](unified-bus.md)                                             | refactor    | high     | done        |
-| [message-hub-log-sender](message-hub-log-sender.md)                       | improvement | low      | done        |
-| [message-hub-log-sender-followups](message-hub-log-sender-followups.md)   | bug         | low      | done        |
-| [source-artifact-granularity](source-artifact-granularity.md)             | improvement | low      | done        |
-| [sources-extract-progress](sources-extract-progress.md)                   | improvement | low      | done        |
-| [sources-extract-progress-followup](sources-extract-progress-followup.md) | improvement | low      | done        |
-| [line-index-quadratic](line-index-quadratic.md)                           | bug         | high     | done        |
-| [dependency-source-parallel](dependency-source-parallel.md)               | improvement | medium   | done        |
-| [sources-phase-timing](sources-phase-timing.md)                           | improvement | low      | done        |
-| [dependency-source-skip-rewrite](dependency-source-skip-rewrite.md)       | improvement | medium   | done        |
-| [bus-log-bulk-at-trace](bus-log-bulk-at-trace.md)                         | improvement | medium   | done        |
-| [base-cache-per-archive](base-cache-per-archive.md)                       | improvement | high     | done        |
-| [index-entry-size](index-entry-size.md)                                   | refactor    | medium   | in-progress |
-| [index-composition-log](index-composition-log.md)                         | improvement | low      | done        |
-| [index-drop-import-entries](index-drop-import-entries.md)                 | improvement | low      | done        |
-| [diagnostics-batched-index-queries](diagnostics-batched-index-queries.md) | improvement | medium   | done        |
-| [server-as-bus-client](server-as-bus-client.md)                           | refactor    | medium   | done        |
-| [bus-reply-receiver](bus-reply-receiver.md)                               | refactor    | low      | done        |
-| [bus-subscriptions](bus-subscriptions.md)                                 | refactor    | medium   | done        |
+Finished requests leave this folder once they have sat a while: their gist is
+kept in [summary.md](summary.md) and the original is deleted, so the backlog
+holds only open work.
+
+| Request                                                             | Kind     | Priority | State       |
+| ------------------------------------------------------------------- | -------- | -------- | ----------- |
+| [index-entry-size](index-entry-size.md)                             | refactor | medium   | in-progress |
+| [module-owned-bus-subscriptions](module-owned-bus-subscriptions.md) | refactor | medium   | done        |

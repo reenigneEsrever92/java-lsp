@@ -26,26 +26,33 @@ src/
                 a bus client that renders diagnostics, progress, and notices
   document.rs — DocumentStore: URI -> { version, bytes }, incremental text sync
   index.rs    — the index subsystem: WorkspaceIndex (workspace symbol entries
-                and the append-only declared-type base), the producers that warm
-                it (project walk, source scan, jar/JDK index), and IndexHandle,
-                the message-based handle whose thread owns the index
+                and the append-only declared-type base) and IndexHandle, the
+                message-based handle whose thread owns the index
+  scan.rs     — the source-scanner driver: parses the project's `.java` files
+                into the index (the `Sources` stage)
+  jars.rs     — the dependency-jar indexer driver: parses resolved jars into
+                the index (the `Jars` stage)
   base_cache.rs — the cross-run cache of the class-file base (jars, JDK): one
                 guarded file per archive, read on demand
   bus.rs      — the engine bus: BusClient (notify, subscribe/serve, and
                 hub-routed requests answered as an awaitable Reply) and the hub
                 thread that broadcasts notifications, routes requests, and logs
   types.rs    — declared-type model (R7): types, members, hierarchies, binding
-  project.rs  — Maven project model: pom discovery, modules, source roots
+  project.rs  — Maven project model (pom discovery, modules, source roots) and
+                the project driver: walks the model + inventory and coordinates
+                `ready` and the summary
   resolve.rs  — static Maven dependency resolution (effective poms, closure)
+                and the dependency driver
   classfile.rs— minimal jar (ZIP) + class-file reader for dependency indexing
-  jdk.rs      — standard-library indexing: JDK discovery, jmods/src.zip/rt.jar
+  jdk.rs      — standard-library indexing (JDK discovery, jmods/src.zip/rt.jar)
+                and the JDK indexer driver
   sources.rs  — dependency sources: fetches -sources.jar, extracts, and
-                publishes them through the bus
+                publishes them through the bus; the source downloader driver
   messages.rs — the bus vocabulary: the DriverMessage notifications, the
                 Request variants (AnalysisRequest for the editor's queries),
                 and the reply handle
-  engine.rs   — the one setup path (`start`: the hub plus every participant,
-                the shell included) and the drivers
+  engine.rs   — the one setup path (`start`: the hub plus every participant's
+                `spawn`, the shell included)
   diagnostics.rs — the diagnostics subsystem: its own parser and open-document
                 state, computing syntax and unresolved-symbol diagnostics and
                 reporting them to the hub, plus a queryable cache of the latest
@@ -127,11 +134,12 @@ diagnostics cache) through hub-routed requests.
   only place position semantics are handled on the way in.
 - **The shell on the bus** (`server.rs`, `engine.rs`, `analysis.rs`): the shell
   never touches the core directly — it is just another bus client.
-  `engine::start` (the `LspService` constructor) starts the hub and builds every
-  participant: the shell first, then the modules, then the drivers. Each takes
-  only its `BusClient` and registers itself — `subscribe()` for every
-  notification, `serve(Module)` to also own a module's requests — so nothing
-  wires channels by hand. The shell's client logs as `server`. The shell
+  `engine::start` (the `LspService` constructor) starts the hub and calls each
+  participant's `spawn`: the shell first, then the modules, then the drivers.
+  Each `spawn` labels itself, registers — `subscribe()` for every notification,
+  `serve(Module)` to also own a module's requests — and starts its own thread or
+  task, so `engine.rs` is pure wiring (no channel, no label, no receive loop) and
+  the shell's client logs as `server`. The shell
   **notifies** the editor's input — `FolderAdded` (the root, in
   `initialized`), `ClientCapabilities`, `DocumentOpened`/`DocumentChanged`/
   `DocumentClosed`, and `FileEvent` — and **requests** each query as a
@@ -657,13 +665,17 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   `EngineHandle` dispatcher (`server-as-bus-client`).
 - **Every subsystem is a module or driver on one bus** (`messages.rs`,
   `bus.rs`, `engine.rs`) — all messages live in `messages.rs`: the
-  `DriverMessage` notifications and the `Request`s. The drivers are spawned at
-  start, none scheduled by a pre-step, and each reacts to the messages it cares
-  about: the project driver walks for the model and inventory on `FolderAdded`
-  (and coordinates `ready` and the summary); the dependency driver resolves the
-  jars; the source scanner, jar indexer, JDK indexer, and source downloader
-  produce the index data. The hub starts empty: every participant registers
-  through its own client (`subscribe`/`serve`) before its thread or task starts,
+  `DriverMessage` notifications and the `Request`s. Each participant is a module
+  that owns its whole bus life — its label, its subscription, and its own thread
+  or task — so `engine::start` only builds the hub and calls each `spawn`. The
+  warm-up drivers live with the work they drive (`project.rs`, `resolve.rs`,
+  `scan.rs`, `jars.rs`, `jdk.rs`, `sources.rs`), and each reacts to the messages
+  it cares about: the project driver walks for the model and inventory on
+  `FolderAdded` (and coordinates `ready` and the summary); the dependency driver
+  resolves the jars; the source scanner, jar indexer, JDK indexer, and source
+  downloader produce the index data. The hub starts empty: every participant
+  registers through its own client (`subscribe`/`serve`) before its thread or
+  task starts,
   and the registration rides the hub's FIFO inbound channel, so it is in place
   before any later message. A module keeps its first owner (a second `serve` is
   logged as an error), and a dropped receiver is pruned. The hub broadcasts every notification, routes every

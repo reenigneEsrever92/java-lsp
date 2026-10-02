@@ -5,7 +5,7 @@
 //! workspace-symbol queries.
 //!
 //! A concrete, synchronous, `Send + Sync` type: the analysis module
-//! ([`spawn_module`]) owns it on the engine bus, applying the editor's document
+//! ([`spawn`]) owns it on the engine bus, applying the editor's document
 //! notifications and answering the shell's query requests.
 //!
 //! Trees are rebuilt from the full document text on every `open`/`change`.
@@ -4497,7 +4497,8 @@ fn offer(
 /// [`DriverMessage::AnalysisUpdated`], so the diagnostics sweep follows the
 /// index updates the core just sent. Each [`AnalysisRequest`] runs on the
 /// runtime's blocking pool, so a slow query never delays a later edit.
-pub fn spawn_module(client: crate::bus::BusClient, runtime: tokio::runtime::Handle) {
+pub fn spawn(bus: &crate::bus::BusClient, runtime: tokio::runtime::Handle) {
+    let client = bus.labeled("analysis");
     let mut rx = client.serve(crate::bus::Module::Analysis);
     let engine = Arc::new(TreeSitterEngine::with_index(client.clone()));
     std::thread::Builder::new()

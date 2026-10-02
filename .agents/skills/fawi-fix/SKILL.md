@@ -1,15 +1,15 @@
 ---
 name: fawi-fix
-description: Turn a bug report into a backlog item — inspect the codebase, reproduce or isolate the fault, settle open questions with the user, then write a type - ChangeRequest with kind - bug under docs/dev/backlog.
+description: Turn a bug report into a backlog item — inspect the codebase, write a test that reproduces the fault, settle open questions with the user, then write a type - ChangeRequest with kind - bug under docs/dev/backlog.
 ---
 
 # Fixing a bug
 
 A bug is a change request too. Capture the defect as a `type: ChangeRequest`
 with `kind: bug` in the backlog before any code is written. Fixing is an
-interactive conversation: inspect the codebase, reproduce the bug, surface the
-points that need clarification, agree on them with the user, and only then
-write the request.
+Fixing is an interactive conversation: inspect the codebase, write a test
+that reproduces the bug, surface the points that need clarification, agree on
+them with the user, and only then write the request.
 
 ## 1. Understand the bug
 
@@ -20,14 +20,25 @@ and the existing tests. Do not invent files, crates, or commands.
 
 ## 2. Reproduce and isolate
 
-Work out whether the report is really a bug and where it lives:
+Before anything else, try to reproduce the bug with a test. Write a failing
+test in the project's existing test style (same crate, same conventions as the
+current tests) that fails on the buggy behaviour and will pass once the bug
+is fixed. The test doubles as the reproduction script and, later, as the
+regression check for the fix.
 
-- Capture the steps to reproduce, the observed behaviour, and the expected
-  behaviour.
+If it is unclear how to test the bug, or whether an automated test is the
+right tool at all (for example for issues only visible in a UI, in generated
+output, or in external system behaviour), ask the user before guessing.
+
+Then work out whether the report is really a bug and where it lives:
+
+- Capture the steps to reproduce (or the failing test, when one exists), the
+  observed behaviour, and the expected behaviour.
 - Find the likely root cause in the code: name the crate(s), module(s), and
   file(s).
 - Classify it — a regression, an edge case, or a design-level defect — and note
   whether an existing mechanism should have caught it.
+- Note where the reproduction test lives, or why no test was written.
 
 If the report is not actually a bug (it is intended behaviour, a feature request
 in disguise, or a duplicate of an existing request), say so now and stop, or
@@ -41,6 +52,8 @@ written. For each one, state what the code shows, then ask. Typical points:
 
 - scope — what is in and what is deliberately left out;
 - the fix approach — patch the symptom versus address the root cause;
+- the reproduction test — whether the test written in step 2 is the right
+  regression test to keep, and how it should be named or placed;
 - expected-versus-actual behaviour where the report is ambiguous;
 - tradeoffs and defaults (behaviour, naming, performance, dependency choices);
 - acceptance criteria that are ambiguous in the report.
@@ -75,7 +88,8 @@ move it to `rejected` or `superseded`. The `kind` field marks the change type as
 
 - `# Problem` — the bug and its impact, in one or two paragraphs.
 - `# Reproduction` — the steps to reproduce, the observed behaviour, and the
-  expected behaviour.
+  expected behaviour. Reference the reproduction test (its path and name), or
+  state why no test exists.
 - `# Proposal` — the fix in one or two paragraphs.
 - `# Decisions` — the key decisions agreed in step 3, each with its reason.
   There is no separate feasibility section; feasibility findings fold into the

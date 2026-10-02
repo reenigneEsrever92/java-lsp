@@ -481,6 +481,19 @@ impl<R: Default> Future for Reply<R> {
     }
 }
 
+/// The next notification on a subscriber's receiver, or `None` once the bus is
+/// gone. A driver serves no module, so a request on the receiver is skipped.
+pub(crate) async fn next_notification(
+    rx: &mut tokio_mpsc::UnboundedReceiver<Bus>,
+) -> Option<DriverMessage> {
+    loop {
+        match rx.recv().await? {
+            Bus::Notify(message) => return Some(message),
+            Bus::Request(_) => continue,
+        }
+    }
+}
+
 /// Starts the hub thread, with no participants yet: every module, driver, and
 /// the shell registers through its client ([`BusClient::subscribe`],
 /// [`BusClient::serve`]). Every subscriber receives every notification; a
@@ -628,7 +641,7 @@ impl BusClient {
 /// A standalone bus with only the index module.
 fn standalone_client() -> BusClient {
     let client = spawn_hub();
-    crate::index::spawn_module(&client.labeled("index"));
+    crate::index::spawn(&client);
     client.labeled("core")
 }
 

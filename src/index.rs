@@ -2,7 +2,7 @@
 //!
 //! Entries are flat [`SymbolEntry`]s (no trees, no text — memory stays
 //! proportional to workspace size). The initial scan runs off the request
-//! path (the drivers the engine spawns); edits to open documents
+//! path in the warm-up drivers, each its own module; edits to open documents
 //! update only that file's entries. `ready()` gates index-backed features
 //! until warm-up completes — they may be briefly unavailable, never blocking.
 //!
@@ -12,7 +12,6 @@
 
 use std::collections::{BTreeMap, HashMap};
 use std::ops::Bound;
-use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -22,8 +21,7 @@ use tower_lsp::lsp_types::{Range, Url};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::analysis::LineIndex;
-use crate::messages::{Bus, DriverMessage, LogLevel, ProgressUpdate, Request};
-use crate::resolve::{resolve_closure, Artifact, Resolver};
+use crate::messages::{Bus, DriverMessage, Request};
 use crate::types::{ModelLayers, TypeModel};
 
 /// What kind of declaration an indexed entry is.
@@ -877,269 +875,39 @@ fn import_name(node: &Node, text: &str) -> String {
     raw.trim_end_matches(';').trim().to_string()
 }
 
-/// Walks the workspace: discovers the Maven model and collects the `.java` files
-/// under its source roots. The project driver runs this off the request path.
-pub(crate) fn walk_project(root: &Path) -> (crate::project::ProjectModel, Vec<PathBuf>) {
-    let mut resolver = Resolver::new(local_repository());
-    let model = crate::project::discover(root, &mut resolver);
-    let mut files = Vec::new();
-    for source_root in model.source_roots() {
-        collect_java_files(&source_root, &mut files);
-    }
-    files.sort();
-    (model, files)
-}
-
-/// Resolves each module's dependency closure against the local repository,
-/// keeping only coordinates whose jar is on disk, deduplicated. The dependency
-/// driver runs this off the request path.
-pub(crate) fn resolve_artifacts(model: &crate::project::ProjectModel) -> Vec<Artifact> {
-    let mut resolver = Resolver::new(local_repository());
-    let mut artifacts: Vec<Artifact> = Vec::new();
-    let mut seen: std::collections::HashSet<Artifact> = Default::default();
-    for module in &model.modules {
-        let Some(effective) = &module.effective else {
-            continue;
-        };
-        for (group, artifact_id, version) in resolve_closure(effective, &mut resolver) {
-            // Resolution is pom-level; a jar present in the local repository is
-            // indexed even when its pom went missing mid-flight.
-            let jar_path = resolver.jar_path(&group, &artifact_id, &version);
-            if !jar_path.is_file() {
-                continue;
-            }
-            if seen.insert((group.clone(), artifact_id.clone(), version.clone())) {
-                artifacts.push((group, artifact_id, version));
-            }
-        }
-    }
-    artifacts
-}
-
-/// The notice to show when dependency sources will not be fetched: only when
-/// `JAVA_LSP_OFFLINE` is set *and* the workspace actually resolved a dependency.
-pub(crate) fn offline_notice(artifact_count: usize) -> Option<String> {
-    (crate::sources::offline() && artifact_count > 0).then(|| {
-        "Dependency sources are disabled (JAVA_LSP_OFFLINE is set): \
-         go-to-definition into library code is unavailable."
-            .to_string()
-    })
-}
-
-/// Indexes every resolved dependency jar that is on disk, publishing each as a
-/// base artifact (its entries and its declared types as one layer). Returns the
-/// number of jars indexed.
-///
-/// Each archive is served from [`crate::base_cache`] when its identity is
-/// unchanged, so a restart re-parses only what changed.
-pub(crate) fn index_jars(artifacts: &[Artifact], sink: &mut dyn FnMut(DriverMessage)) -> usize {
-    let resolver = Resolver::new(local_repository());
-    let store = crate::base_cache::ArchiveStore::new("jars");
-    let mut jars = 0usize;
-    for (group, artifact_id, version) in artifacts {
-        let jar_path = resolver.jar_path(group, artifact_id, version);
-        let Some(identity) = crate::base_cache::identity(&jar_path) else {
-            continue;
-        };
-        let output = match store.get::<crate::base_cache::ArchiveOutput>(&identity) {
-            Some(output) => output,
-            None => {
-                let Some((entries, types)) = crate::classfile::jar_outputs(&jar_path) else {
-                    continue;
-                };
-                let output = crate::base_cache::ArchiveOutput { entries, types };
-                store.insert(&identity, &output);
-                output
-            }
-        };
-        let Ok(jar_uri) = Url::from_file_path(&jar_path) else {
-            continue;
-        };
-        let mut types = crate::types::TypeModel::new();
-        types.extend(output.types);
-        sink(DriverMessage::BaseArtifact {
-            uri: jar_uri,
-            entries: Arc::new(output.entries),
-            types: Arc::new(types),
-        });
-        jars += 1;
-        sink(DriverMessage::Progress(ProgressUpdate::Update {
-            message: format!("Indexed {jars} dependency jars"),
-            percentage: None,
-        }));
-    }
-    jars
-}
-
-/// Indexes the standard library through the same path as dependency jars
-/// (offered in completions, filtered from navigation). A missing JDK is a
-/// no-op. Returns the number of classes indexed.
-///
-/// The whole JDK is served from [`crate::base_cache`] when its home and every
-/// archive's identity are unchanged; a JDK upgrade (any archive changed) or a
-/// missing archive re-parses it in full.
-pub(crate) fn index_jdk(sink: &mut dyn FnMut(DriverMessage)) -> usize {
-    let Some(home) = crate::jdk::locate_jdk() else {
-        sink(DriverMessage::Log {
-            level: LogLevel::Info,
-            message: "no usable JDK found; standard library not indexed".to_string(),
-        });
-        return 0;
-    };
-    let store = crate::base_cache::ArchiveStore::new("jdk");
-    let key = jdk_cache_key(&home);
-    let archives = match key
-        .as_ref()
-        .and_then(|key| store.get::<Vec<crate::base_cache::JdkArchive>>(key))
-    {
-        Some(archives) => archives,
-        None => {
-            let archives: Vec<crate::base_cache::JdkArchive> = crate::jdk::jdk_entries(&home)
-                .into_iter()
-                .map(|(uri, entries, types)| crate::base_cache::JdkArchive {
-                    uri,
-                    entries,
-                    types,
-                })
-                .collect();
-            if let Some(key) = &key {
-                store.insert(key, &archives);
-            }
-            archives
-        }
-    };
-    let mut jdk_classes = 0usize;
-    for archive in archives {
-        jdk_classes += archive.entries.len();
-        let mut types = crate::types::TypeModel::new();
-        types.extend(archive.types);
-        sink(DriverMessage::BaseArtifact {
-            uri: archive.uri,
-            entries: Arc::new(archive.entries),
-            types: Arc::new(types),
-        });
-    }
-    sink(DriverMessage::Progress(ProgressUpdate::Update {
-        message: format!("Indexed {jdk_classes} JDK classes"),
-        percentage: None,
-    }));
-    jdk_classes
-}
-
-/// The JDK's cache identity: its home plus every archive's identity, so a JDK
-/// upgrade (any archive changed) invalidates the cached parse. `None` when an
-/// archive cannot be identified, which forces a full parse.
-fn jdk_cache_key(home: &Path) -> Option<String> {
-    let archives = crate::jdk::jdk_archive_paths(home);
-    if archives.is_empty() {
-        return None;
-    }
-    let mut parts = Vec::with_capacity(archives.len() + 1);
-    parts.push(format!("jdk:{}", home.display()));
-    for archive in &archives {
-        parts.push(crate::base_cache::identity(archive)?);
-    }
-    Some(parts.join("|"))
-}
-
-/// Scans the workspace `.java` files, publishing each file's index entries and
-/// its declared-type model. Returns the number of files indexed.
-pub(crate) fn scan_sources(files: &[PathBuf], sink: &mut dyn FnMut(DriverMessage)) -> usize {
-    let mut parser = java_parser();
-    let mut indexed = 0usize;
-    for path in files {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            continue;
-        };
-        let Some(tree) = parser.parse(text.as_bytes(), None) else {
-            continue;
-        };
-        let Ok(uri) = Url::from_file_path(path) else {
-            continue;
-        };
-        let package = crate::types::file_package(&tree, &text);
-        let mut model = crate::types::TypeModel::new();
-        model.extend(crate::types::collect_type_infos(
-            package.as_deref(),
-            &tree,
-            &text,
-        ));
-        let entries = extract_entries(&uri, &tree, &text);
-        sink(DriverMessage::SourceFile {
-            uri,
-            entries: Arc::new(entries),
-            types: Arc::new(model),
-        });
-        indexed += 1;
-    }
-    sink(DriverMessage::Progress(ProgressUpdate::Update {
-        message: format!("Indexed {indexed} source files"),
-        percentage: None,
-    }));
-    indexed
-}
-
 /// The synchronous warm-up for unit tests (no runtime, no engine hub): runs the
 /// same producers the drivers run, applying their messages to the index
 /// directly. The shell's hub drives the real drivers instead.
 #[cfg(test)]
 pub(crate) fn warm_up_sync(root: &Url, index: &IndexHandle) {
-    index.apply(DriverMessage::Progress(ProgressUpdate::Begin {
-        title: "java-lsp".to_string(),
-        message: "Indexing workspace".to_string(),
-    }));
+    index.apply(DriverMessage::Progress(
+        crate::messages::ProgressUpdate::Begin {
+            title: "java-lsp".to_string(),
+            message: "Indexing workspace".to_string(),
+        },
+    ));
     let Ok(root_path) = root.to_file_path() else {
         index.apply(DriverMessage::Ready);
         return;
     };
-    let (model, files) = walk_project(&root_path);
-    let artifacts = resolve_artifacts(&model);
+    let (model, files) = crate::project::walk_project(&root_path);
+    let artifacts = crate::resolve::resolve_artifacts(&model);
     index.apply(DriverMessage::ProjectModel {
         model: Arc::new(model),
     });
     {
         let mut sink = |message| index.apply(message);
-        scan_sources(&files, &mut sink);
+        crate::scan::scan_sources(&files, &mut sink);
     }
     {
         let mut sink = |message| index.apply(message);
-        index_jars(&artifacts, &mut sink);
+        crate::jars::index_jars(&artifacts, &mut sink);
     }
     {
         let mut sink = |message| index.apply(message);
-        index_jdk(&mut sink);
+        crate::jdk::index_jdk(&mut sink);
     }
     index.apply(DriverMessage::Ready);
-}
-
-/// The local Maven repository: `$MAVEN_REPO` if set, else `~/.m2/repository`.
-pub(crate) fn local_repository() -> PathBuf {
-    if let Ok(override_path) = std::env::var("MAVEN_REPO") {
-        return PathBuf::from(override_path);
-    }
-    std::env::var("HOME")
-        .map(|home| PathBuf::from(home).join(".m2").join("repository"))
-        .unwrap_or_else(|_| PathBuf::from(".m2/repository"))
-}
-
-fn collect_java_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let hidden = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'));
-            if !hidden {
-                collect_java_files(&path, out);
-            }
-        } else if path.extension().is_some_and(|ext| ext == "java") {
-            out.push(path);
-        }
-    }
 }
 
 /// The index subsystem handle: a [`crate::bus::BusClient`], so the core and the
@@ -1165,7 +933,8 @@ impl NameLookup for IndexHandle {
 /// Starts the index module: a thread that owns the [`WorkspaceIndex`] and serves
 /// the bus — it applies the notifications that affect the index and answers the
 /// index requests. It exits when the hub drops its sink.
-pub fn spawn_module(client: &crate::bus::BusClient) {
+pub fn spawn(bus: &crate::bus::BusClient) {
+    let client = bus.labeled("index");
     let mut rx = client.serve(crate::bus::Module::Index);
     thread::Builder::new()
         .name("java-lsp-index".to_string())
@@ -1476,22 +1245,6 @@ mod tests {
     }
 
     #[test]
-    fn offline_notice_only_when_offline_with_dependencies() {
-        let _env = crate::jdk::env_lock();
-        std::env::remove_var("JAVA_LSP_OFFLINE");
-        assert!(offline_notice(3).is_none());
-
-        std::env::set_var("JAVA_LSP_OFFLINE", "1");
-        assert!(
-            offline_notice(0).is_none(),
-            "nothing to fetch, nothing to say"
-        );
-        let notice = offline_notice(2).expect("a workspace with dependencies is worth a notice");
-        assert!(notice.contains("JAVA_LSP_OFFLINE"), "{notice}");
-        std::env::remove_var("JAVA_LSP_OFFLINE");
-    }
-
-    #[test]
     fn extraction_covers_every_kind_and_container_chains() {
         let text = "\
 package demo;
@@ -1736,57 +1489,6 @@ class A {}
 
         std::env::remove_var("JAVA_LSP_JDK");
         let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A second warm-up over an unchanged JDK re-parses no class files: the whole
-    /// JDK is served from the base cache. Proven by emptying the cached archives
-    /// under the live key — a cache hit then emits no classes at all.
-    #[test]
-    fn a_second_jdk_warmup_is_served_from_the_cache() {
-        let _env = crate::jdk::env_lock();
-        let Some(home) = crate::jdk::locate_jdk() else {
-            return; // no JDK here; nothing to cache
-        };
-        let cache_root = std::env::temp_dir().join(format!(
-            "java-lsp-jdk-cache-{}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        std::env::set_var("JAVA_LSP_SOURCES_CACHE", &cache_root);
-
-        // First warm-up: parses the JDK and writes the cache.
-        let mut sink = |_message| {};
-        let classes = index_jdk(&mut sink);
-        if classes == 0 {
-            // No readable standard-library archive here; nothing to prove.
-            std::env::remove_var("JAVA_LSP_SOURCES_CACHE");
-            let _ = std::fs::remove_dir_all(&cache_root);
-            return;
-        }
-
-        // Empty the cached archives under the live key; a hit then emits none,
-        // so a zero-class second run proves the cache was used, not re-parsed.
-        let store = crate::base_cache::ArchiveStore::new("jdk");
-        let key = jdk_cache_key(&home).expect("a JDK key");
-        assert!(
-            store
-                .get::<Vec<crate::base_cache::JdkArchive>>(&key)
-                .is_some(),
-            "the JDK cache should be written"
-        );
-        store.insert(&key, &Vec::<crate::base_cache::JdkArchive>::new());
-
-        let mut second = |_message| {};
-        assert_eq!(
-            index_jdk(&mut second),
-            0,
-            "the second warm-up must be served from the cache"
-        );
-
-        std::env::remove_var("JAVA_LSP_SOURCES_CACHE");
-        let _ = std::fs::remove_dir_all(&cache_root);
     }
 
     #[test]

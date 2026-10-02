@@ -121,11 +121,12 @@ impl JavaLanguageServer {
     /// Builds the shell on `bus`, the client [`engine::start`] gives it.
     ///
     /// [`engine::start`]: crate::engine::start
-    pub fn new(client: Client, bus: BusClient) -> Self {
-        // The shell is a participant on the bus like any other: it subscribes
-        // for every notification, and this task renders the editor-facing ones
-        // as client notifications. Unbounded, so a slow client can never stall
-        // the bus.
+    pub fn new(client: Client, bus: &BusClient) -> Self {
+        // The shell is a participant on the bus like any other: it labels
+        // itself, subscribes for every notification, and this task renders the
+        // editor-facing ones as client notifications. Unbounded, so a slow
+        // client can never stall the bus.
+        let bus = bus.labeled("server");
         let progress = Arc::new(AtomicBool::new(false));
         let mut incoming = bus.subscribe();
         let publishing = client.clone();

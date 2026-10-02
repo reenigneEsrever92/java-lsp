@@ -21,8 +21,9 @@ use std::time::{Duration, Instant};
 
 use tower_lsp::lsp_types::Url;
 
+use crate::bus::{next_notification, BusClient};
 use crate::index::SymbolEntry;
-use crate::messages::{DriverMessage, LogLevel, ProgressUpdate};
+use crate::messages::{DriverMessage, LogLevel, ProgressUpdate, Stage};
 use crate::resolve::Artifact;
 use crate::types::TypeInfo;
 
@@ -77,7 +78,7 @@ pub async fn index_sources(artifacts: Vec<Artifact>, bus: crate::bus::BusClient)
     if artifacts.is_empty() || offline() {
         return;
     }
-    let repo = crate::index::local_repository();
+    let repo = crate::resolve::local_repository();
     let base = base_url();
     let started = Instant::now();
     let available = fetch_sources(&artifacts, &repo, &base, &bus).await;
@@ -102,6 +103,27 @@ pub async fn index_sources(artifacts: Vec<Artifact>, bus: crate::bus::BusClient)
         index_extracted(&mut sink, &available, &repo, &cache);
     })
     .await;
+}
+
+// -- the source downloader --------------------------------------------------
+
+/// Starts the source downloader on the bus: on the artifact list it fetches and
+/// indexes dependency sources, then the `Downloads` stage-done (which gates only
+/// the summary).
+pub fn spawn(bus: &BusClient) {
+    let client = bus.labeled("download");
+    let mut rx = client.subscribe();
+    tokio::spawn(async move {
+        while let Some(message) = next_notification(&mut rx).await {
+            if let DriverMessage::Artifacts { artifacts } = message {
+                index_sources((*artifacts).clone(), client.clone()).await;
+                let _ = client.notify(DriverMessage::StageDone {
+                    stage: Stage::Downloads,
+                    count: 0,
+                });
+            }
+        }
+    });
 }
 
 /// Returns the subset of `artifacts` whose sources jar is on disk after this

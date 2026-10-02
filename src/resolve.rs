@@ -8,6 +8,11 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use crate::bus::{next_notification, BusClient};
+use crate::messages::{DriverMessage, MessageLevel};
+use crate::project::ProjectModel;
 
 /// One `<dependency>` declaration (also used for `dependencyManagement`
 /// entries). Fields are interpolated by the time they are read.
@@ -562,9 +567,101 @@ fn trim(text: &str) -> String {
     text.trim().to_string()
 }
 
+/// The local Maven repository: `$MAVEN_REPO` if set, else `~/.m2/repository`.
+pub(crate) fn local_repository() -> PathBuf {
+    if let Ok(override_path) = std::env::var("MAVEN_REPO") {
+        return PathBuf::from(override_path);
+    }
+    std::env::var("HOME")
+        .map(|home| PathBuf::from(home).join(".m2").join("repository"))
+        .unwrap_or_else(|_| PathBuf::from(".m2/repository"))
+}
+
+/// Resolves each module's dependency closure against the local repository,
+/// keeping only coordinates whose jar is on disk, deduplicated. The dependency
+/// driver runs this off the request path.
+pub(crate) fn resolve_artifacts(model: &ProjectModel) -> Vec<Artifact> {
+    let mut resolver = Resolver::new(local_repository());
+    let mut artifacts: Vec<Artifact> = Vec::new();
+    let mut seen: std::collections::HashSet<Artifact> = Default::default();
+    for module in &model.modules {
+        let Some(effective) = &module.effective else {
+            continue;
+        };
+        for (group, artifact_id, version) in resolve_closure(effective, &mut resolver) {
+            // Resolution is pom-level; a jar present in the local repository is
+            // indexed even when its pom went missing mid-flight.
+            let jar_path = resolver.jar_path(&group, &artifact_id, &version);
+            if !jar_path.is_file() {
+                continue;
+            }
+            if seen.insert((group.clone(), artifact_id.clone(), version.clone())) {
+                artifacts.push((group, artifact_id, version));
+            }
+        }
+    }
+    artifacts
+}
+
+/// The notice to show when dependency sources will not be fetched: only when
+/// `JAVA_LSP_OFFLINE` is set *and* the workspace actually resolved a dependency.
+pub(crate) fn offline_notice(artifact_count: usize) -> Option<String> {
+    (crate::sources::offline() && artifact_count > 0).then(|| {
+        "Dependency sources are disabled (JAVA_LSP_OFFLINE is set): \
+         go-to-definition into library code is unavailable."
+            .to_string()
+    })
+}
+
+// -- the dependency driver --------------------------------------------------
+
+/// Starts the dependency driver on the bus: on the project model it resolves
+/// each module's closure against the local repository and emits the jar list
+/// (and the offline notice).
+pub fn spawn(bus: &BusClient) {
+    let client = bus.labeled("dependency");
+    let mut rx = client.subscribe();
+    tokio::spawn(async move {
+        while let Some(message) = next_notification(&mut rx).await {
+            if let DriverMessage::ProjectModel { model } = message {
+                let client = client.clone();
+                let _ = tokio::task::spawn_blocking(move || {
+                    let artifacts = resolve_artifacts(&model);
+                    if let Some(text) = offline_notice(artifacts.len()) {
+                        let _ = client.notify(DriverMessage::Notice {
+                            level: MessageLevel::Info,
+                            text,
+                        });
+                    }
+                    let _ = client.notify(DriverMessage::Artifacts {
+                        artifacts: Arc::new(artifacts),
+                    });
+                })
+                .await;
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn offline_notice_only_when_offline_with_dependencies() {
+        let _env = crate::jdk::env_lock();
+        std::env::remove_var("JAVA_LSP_OFFLINE");
+        assert!(offline_notice(3).is_none());
+
+        std::env::set_var("JAVA_LSP_OFFLINE", "1");
+        assert!(
+            offline_notice(0).is_none(),
+            "nothing to fetch, nothing to say"
+        );
+        let notice = offline_notice(2).expect("a workspace with dependencies is worth a notice");
+        assert!(notice.contains("JAVA_LSP_OFFLINE"), "{notice}");
+        std::env::remove_var("JAVA_LSP_OFFLINE");
+    }
 
     /// Builds a local repository in a temp dir from `path -> content` pairs
     /// (pom files laid out in the standard `{g/a/p}/{a}/{v}/` structure).
