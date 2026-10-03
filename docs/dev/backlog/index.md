@@ -12,4 +12,4 @@ holds only open work.
 | Request                                                             | Kind     | Priority | State       |
 | ------------------------------------------------------------------- | -------- | -------- | ----------- |
 | [index-entry-size](index-entry-size.md)                             | refactor | medium   | in-progress |
-| [module-owned-bus-subscriptions](module-owned-bus-subscriptions.md) | refactor | medium   | done        |
+| [module-owned-hub-subscriptions](module-owned-hub-subscriptions.md) | refactor | medium   | done        |

@@ -1,6 +1,6 @@
 //! Drives the server over JSON-RPC with `LspService` — no editor, no stdio.
 
-use java_lsp::bus::BusClient;
+use java_lsp::hub::HubClient;
 use java_lsp::index::IndexKind;
 use java_lsp::server::JavaLanguageServer;
 use serde_json::{json, Value};
@@ -220,7 +220,7 @@ async fn implementation_returns_the_workspace_subtypes() {
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -298,13 +298,13 @@ async fn did_open_and_incremental_did_change_update_the_store() {
     .await;
 
     let server = service.inner();
-    let docs = server.documents();
-    let doc = docs.read().await;
-    let document = doc
-        .get(&HELLO_URI.parse().unwrap())
+    let document = server
+        .hub()
+        .document_text(HELLO_URI.parse().unwrap())
+        .await
         .expect("document must be open");
-    assert_eq!(document.version, 2);
-    assert_eq!(document.bytes, b"class World {\n}\n");
+    assert_eq!(document.0, 2);
+    assert_eq!(document.1.as_str(), "class World {\n}\n");
 }
 
 #[tokio::test]
@@ -569,7 +569,7 @@ async fn workspace_index_scans_in_background_and_updates_incrementally() {
     assert_eq!(symbols[0]["name"], "Sample");
 
     // The scan finishes and indexes the fixture's declarations.
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -781,7 +781,7 @@ package com.example;\n\npublic class App {\n    private Lib lib;\n\n    public S
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries.iter().any(|e| e.name == "App" && e.kind == IndexKind::Class)
@@ -1091,7 +1091,7 @@ async fn library_sources_are_fetched_and_definition_reaches_them() {
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, _| {
         entries.iter().any(|e| e.name == "Lib" && e.library_source)
     })
@@ -1218,7 +1218,7 @@ class Main {\n    List names;\n    String greeting;\n}\n",
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -1386,7 +1386,7 @@ async fn unresolved_symbol_diagnostics_are_published_and_fixed_by_a_code_action(
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -1559,7 +1559,7 @@ async fn watched_file_changes_refresh_a_referring_document() {
         "**/*.java"
     );
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |_, ready| ready).await;
 
     respond(
@@ -1669,7 +1669,7 @@ async fn watched_files_are_not_registered_without_the_client_capability() {
     .await;
 
     // Wait for the warm-up, then drain for a bounded window: no registration.
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |_, ready| ready).await;
     let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
     while std::time::Instant::now() < deadline {
@@ -1734,7 +1734,7 @@ async fn inlay_hints_resolve_an_imported_name_shared_across_packages() {
         Request::build("initialized").params(json!({})).finish(),
     )
     .await;
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready && entries.iter().any(|e| e.name == "of")
     })
@@ -1835,7 +1835,7 @@ async fn inlay_hints_resolve_a_jdk_static_factory() {
         Request::build("initialized").params(json!({})).finish(),
     )
     .await;
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -2054,7 +2054,7 @@ fn test_stored_zip(entries: &[(&str, &[u8])]) -> Vec<u8> {
     out
 }
 async fn wait_for_index(
-    engine: &BusClient,
+    engine: &HubClient,
     mut pred: impl FnMut(&[java_lsp::index::SymbolEntry], bool) -> bool,
 ) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -2212,7 +2212,7 @@ async fn hover_and_member_completion_use_the_receiver_type() {
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready && entries.iter().any(|entry| entry.name == "getSize")
     })
@@ -2320,7 +2320,7 @@ async fn references_and_rename_span_the_workspace() {
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready && entries.iter().any(|entry| entry.name == "Widget")
     })
@@ -2443,7 +2443,7 @@ async fn completion_offers_keywords_locals_and_workspace_symbols() {
     .await;
 
     // Wait for the fixture's declarations before expecting a workspace hit.
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -2781,7 +2781,7 @@ class Hello {
     .await;
 
     // The scanned fixture files provide the navigation targets.
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -2906,7 +2906,7 @@ async fn workspace_symbol_finds_scanned_files_without_opening_them() {
     )
     .await;
 
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |entries, ready| {
         ready
             && entries
@@ -3092,7 +3092,7 @@ async fn progress_is_not_sent_without_the_client_capability() {
     .await;
 
     // Wait for the warm-up to actually finish, so the check is not vacuous.
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |_, ready| ready).await;
 
     // Then drain for a bounded window: nothing progress-like may appear.
@@ -3182,7 +3182,7 @@ async fn many_open_documents_keep_queries_answered_during_a_sweep() {
 
     let mut service = service();
     initialize_workspace(&mut service, &root).await;
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |_, ready| ready).await;
 
     // Many documents, each with a resolvable field and an unresolved one, so a
@@ -3288,7 +3288,7 @@ async fn references_across_a_large_workspace_are_bounded_and_complete() {
 
     let mut service = service();
     initialize_workspace(&mut service, &root).await;
-    let engine = service.inner().bus();
+    let engine = service.inner().hub();
     wait_for_index(&engine, |_, ready| ready).await;
 
     let user_path = root.join("demo").join("User0.java");

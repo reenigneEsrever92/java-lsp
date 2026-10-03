@@ -8,7 +8,7 @@
 //! through `IndexHandle`, so the subsystem holds no index state of its own. A
 //! sweep reads the index through a [`SweepIndex`]: the workspace layer once per
 //! sweep, and every name lookup from a cache one batched request fills, so a
-//! sweep costs a handful of bus round trips rather than one per reference.
+//! sweep costs a handful of hub round trips rather than one per reference.
 //!
 //! The pass is coalesced: a burst of edits bumps a generation and notifies a
 //! sweep task, which republishes the latest state at least once and collapses
@@ -27,7 +27,7 @@ use crate::analysis::{
     collect_imports, import_edit, import_target, lsp_range, package_line, ExistingImport,
 };
 use crate::index::{java_parser, IndexHandle, NameLookup, SymbolEntry};
-use crate::messages::{Bus, DriverMessage, Request};
+use crate::messages::{DriverMessage, Hub, Request};
 use crate::types::{self, SourceLayerIndex, Ty, TypeLookup, TypeQuery};
 
 /// Marks a semantic diagnostic and the quick fix it carries; the code-action
@@ -975,16 +975,16 @@ fn collect_errors(node: &Node, text: &str, out: &mut Vec<Diagnostic>) {
 
 /// Starts the diagnostics module: a thread that owns a parser and the open
 /// buffers' text, consumes the document notifications the hub broadcasts, and
-/// answers the diagnostics requests. It reads the index through its bus client
+/// answers the diagnostics requests. It reads the index through its hub client
 /// and reports each pass through the hub.
 ///
 /// A document notification only records (or drops) the text; the sweep runs on
 /// [`DriverMessage::AnalysisUpdated`], which the analysis module sends after it
 /// has applied the same event and sent the index its updates — so the sweep
 /// reads an index that already holds the edit.
-pub fn spawn(bus: &crate::bus::BusClient) {
-    let client = bus.labeled("diagnostics");
-    let mut rx = client.serve(crate::bus::Module::Diagnostics);
+pub fn spawn(hub: &crate::hub::HubClient) {
+    let client = hub.labeled("diagnostics");
+    let mut rx = client.serve(crate::hub::Module::Diagnostics);
     thread::Builder::new()
         .name("java-lsp-diagnostics".to_string())
         .spawn(move || {
@@ -997,13 +997,13 @@ pub fn spawn(bus: &crate::bus::BusClient) {
             };
             while let Some(message) = rx.blocking_recv() {
                 match message {
-                    Bus::Notify(DriverMessage::DocumentOpened { uri, text, version })
-                    | Bus::Notify(DriverMessage::DocumentChanged { uri, text, version }) => {
+                    Hub::Notify(DriverMessage::DocumentOpened { uri, text, version })
+                    | Hub::Notify(DriverMessage::DocumentChanged { uri, text, version }) => {
                         module.document(uri, text, version);
                     }
-                    Bus::Notify(DriverMessage::DocumentClosed { uri }) => module.closed(&uri),
-                    Bus::Notify(DriverMessage::AnalysisUpdated) => module.sweep(),
-                    Bus::Request(Request::DiagnosticsForDocument { uri, reply }) => {
+                    Hub::Notify(DriverMessage::DocumentClosed { uri }) => module.closed(&uri),
+                    Hub::Notify(DriverMessage::AnalysisUpdated) => module.sweep(),
+                    Hub::Request(Request::DiagnosticsForDocument { uri, reply }) => {
                         reply.send(module.diagnostics(&uri));
                     }
                     _ => {}
@@ -1131,7 +1131,7 @@ mod tests {
 
     /// Installs (once per test process) a global `debug` subscriber that writes
     /// into [`CAPTURED`]. Global, because the hub logs on its own thread.
-    fn capture_bus_log() {
+    fn capture_hub_log() {
         static INSTALLED: OnceLock<()> = OnceLock::new();
         INSTALLED.get_or_init(|| {
             let subscriber = tracing_subscriber::fmt()
@@ -1170,7 +1170,7 @@ mod tests {
         }
     }
 
-    /// A diagnostics module over a standalone bus whose index holds `Object`,
+    /// A diagnostics module over a standalone hub whose index holds `Object`,
     /// `String`, and `java.util.List`, and is ready.
     fn module(label: &str) -> DiagnosticsModule {
         let client = IndexHandle::standalone().labeled(label);
@@ -1200,7 +1200,7 @@ mod tests {
 
     #[test]
     fn a_sweep_reads_the_index_in_one_batch_for_every_open_document() {
-        capture_bus_log();
+        capture_hub_log();
         let label = "diagnostics-batch-test";
         let mut module = module(label);
         let a = Url::parse("file:///work/app/A.java").unwrap();
@@ -1258,7 +1258,7 @@ mod tests {
 
     #[test]
     fn a_sweep_without_semantic_diagnostics_does_not_query_names() {
-        capture_bus_log();
+        capture_hub_log();
         let label = "diagnostics-batch-test-off";
         let mut module = module(label);
         module.semantic = false;

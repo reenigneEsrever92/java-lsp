@@ -1,7 +1,7 @@
 ---
 type: Architecture
 title: Architecture
-description: Crate layout, the engine bus every component (the LSP shell included) is a client of, and the data flow inside java-lsp, including the drivers that index the workspace.
+description: Crate layout, the engine hub every component (the LSP shell included) is a client of, and the data flow inside java-lsp, including the drivers that index the workspace.
 tags: [architecture, lsp, rust]
 status: draft
 ---
@@ -10,7 +10,7 @@ status: draft
 
 java-lsp is a single cargo crate. A workspace split into shell/engine crates is
 deliberately deferred — the shell is already just another client on the engine
-bus (notifications and requests out, notifications in), so a future split is a
+hub (notifications and requests out, notifications in), so a future split is a
 transport change rather than a redesign.
 
 ## Layout
@@ -23,8 +23,9 @@ src/
   lib.rs      — library root so integration tests can drive the shell; the
                 analysis threads' stack size (RUNTIME_STACK_SIZE)
   server.rs   — JavaLanguageServer: the LSP shell (all editor-facing handlers),
-                a bus client that renders diagnostics, progress, and notices
-  document.rs — DocumentStore: URI -> { version, bytes }, incremental text sync
+                a hub client that renders diagnostics, progress, and notices
+  document.rs — the document module: DocumentStore (URI -> { version, bytes },
+                incremental text sync) and its hub client thread
   index.rs    — the index subsystem: WorkspaceIndex (workspace symbol entries
                 and the append-only declared-type base) and IndexHandle, the
                 message-based handle whose thread owns the index
@@ -34,7 +35,7 @@ src/
                 the index (the `Jars` stage)
   base_cache.rs — the cross-run cache of the class-file base (jars, JDK): one
                 guarded file per archive, read on demand
-  bus.rs      — the engine bus: BusClient (notify, subscribe/serve, and
+  hub.rs      — the engine hub: HubClient (notify, subscribe/serve, and
                 hub-routed requests answered as an awaitable Reply) and the hub
                 thread that broadcasts notifications, routes requests, and logs
   types.rs    — declared-type model (R7): types, members, hierarchies, binding
@@ -47,8 +48,8 @@ src/
   jdk.rs      — standard-library indexing (JDK discovery, jmods/src.zip/rt.jar)
                 and the JDK indexer driver
   sources.rs  — dependency sources: fetches -sources.jar, extracts, and
-                publishes them through the bus; the source downloader driver
-  messages.rs — the bus vocabulary: the DriverMessage notifications, the
+                publishes them through the hub; the source downloader driver
+  messages.rs — the hub vocabulary: the DriverMessage notifications, the
                 Request variants (AnalysisRequest for the editor's queries),
                 and the reply handle
   engine.rs   — the one setup path (`start`: the hub plus every participant's
@@ -62,7 +63,7 @@ src/
                 and the diagnostics cache
   analysis.rs — the engine core (TreeSitterEngine): parse trees, symbols,
                 folding, semantic tokens, completions, navigation, inlay hints;
-                and the analysis module that owns it on the bus
+                and the analysis module that owns it on the hub
 tests/
   harness.rs      — drives JavaLanguageServer through tower_lsp::LspService
   stdio_smoke.rs  — drives the real binary over stdio with raw LSP JSON-RPC
@@ -76,28 +77,60 @@ zed-java-lsp/           — Zed extension: Java language + tree-sitter-java gram
 ```mermaid
 graph TD
     C[Editor client] -- LSP over stdio --> S[JavaLanguageServer]
-    S -- versioned text --> D[(DocumentStore)]
-    S -- documents, root, watched files, capabilities; query requests --> HUB{{bus.rs hub}}
-    HUB -- Diagnostics, Progress, Notice --> S
-    HUB -- document events, queries --> AN{{analysis module}}
+
+    S -- "input notifications, query requests" --> HUB(("hub.rs — the hub"))
+    HUB -- "Diagnostics, Progress, Notice" --> S
+
+    HUB -- "document events, text requests" --> DOC{{document module}}
+    DOC -- owns --> D[(DocumentStore)]
+    DOC -- "text" --> HUB
+
+    HUB -- "document events, queries" --> AN{{analysis module}}
+    AN -- "index updates, AnalysisUpdated" --> HUB
     AN -- owns --> TS[analysis.rs: TreeSitterEngine]
-    AN -- index updates, AnalysisUpdated --> HUB
-    HUB -- document events, AnalysisUpdated --> DSUB{{diagnostics subsystem}}
+
+    HUB -- "document events, AnalysisUpdated" --> DSUB{{diagnostics subsystem}}
     DSUB -- Diagnostics --> HUB
-    HUB -- documents, code actions --> QF{{quick-fix subsystem}}
-    HUB -- index messages, index queries --> IDX{{index subsystem}}
+
+    HUB -- "documents, code actions" --> QF{{quick-fix subsystem}}
+
+    HUB -- "index messages, index queries" --> IDX{{index subsystem}}
     IDX -- owns --> WI[(WorkspaceIndex)]
-    IDX -- base + source types --> TL[(type base + source models)]
-    HUB -- every DriverMessage --> DR{{project, dependency, source, jar, JDK, download drivers}}
+    IDX -- "base + source types" --> TL[(type base + source models)]
+
+    HUB -- "every DriverMessage" --> DR{{drivers: project, dependency, source, jar, JDK, download}}
     DR -- DriverMessage --> HUB
-    HUB -- tracing logs (sender, latency), Log, Summary --> E[(stderr)]
-    DR -- source scan --> WS[workspace .java files]
-    DR -- class files --> JV[local repo jars]
-    DR -- archives --> ARCH[JDK jmods / src.zip]
-    DR -- download + extract --> SR[sources cache]
+    DR -- "source scan" --> WS[workspace .java files]
+    DR -- "class files" --> JV[local repo jars]
+    DR -- "archives" --> ARCH[JDK jmods / src.zip]
+    DR -- "download + extract" --> SR[sources cache]
+
+    HUB -- "tracing logs (sender, latency), Log, Summary" --> E[(stderr)]
 ```
 
-Every arrow into or out of the hub is a bus message: the analysis, diagnostics,
+**Hub and spoke.** The hub is the single **hub**; every component attached to it — the LSP shell included — is a **spoke**, a hub client that talks only to the hub and never to another spoke directly. A spoke **notifies** (a broadcast to every subscriber) or **requests** (routed to exactly one owning module and answered as an awaitable `Reply`), and every notification, request, reply, and log line passes through the hub. The shell is the only spoke that knows about the editor; the hub carries no editor knowledge. `messages.rs` holds the hub vocabulary — the `DriverMessage` notifications and the `Request` variants — that every spoke speaks.
+
+| Module                                                                                       | Description                                                                                                     | Responsibilities                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| -------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **Hub** (`hub.rs`)                                                                           | The engine's central mediator — the hub of the hub-and-spoke.                                                   | Owns the FIFO inbound channel; broadcasts notifications to every subscriber; routes each request to its owner and returns the reply; logs and times every message (`debug`/`trace`) and renders the `Log`/`Summary` lines. Carries no editor knowledge.                                                                                                                                                                                            |
+| **LSP shell** (`server.rs`)                                                                  | The `tower_lsp::LanguageServer` implementation — a hub client like any other, never touching the core directly. | Serves every editor-facing method; advertises capabilities in `initialize`; notifies input (`FolderAdded`, `ClientCapabilities`, `DocumentOpened`/`DocumentChanged`/`DocumentClosed`, `FileEvent`); requests queries; renders `Diagnostics`, `Progress` (as `$/progress`), and `Notice` (as `window/showMessage`) on its own drain task. Its hub channel is unbounded, so a slow client never stalls the hub.                                      |
+| **Document module / DocumentStore** (`document.rs`)                                          | The canonical document store — a hub client, not owned by the shell.                                            | Subscribes to `DocumentOpened`/`DocumentClosed`; applies the editor's incremental changes on a `DocumentChange` request and returns the new text (`None` when not open); answers `DocumentText`; converts LSP positions (line + UTF-16 code units) to byte offsets — the only place position semantics are handled on the way in.                                                                                                                  |
+| **Engine wiring** (`engine.rs`)                                                              | The single `start` path that builds the hub and boots every participant.                                        | Calls each participant's `spawn` — shell first, then modules, then drivers — each of which labels itself, registers (`subscribe` for notifications, `serve` for requests), and starts its own thread or task. Pure wiring: no channel, label, or receive loop.                                                                                                                                                                                     |
+| **Analysis module / engine core** (`analysis.rs`, `TreeSitterEngine`)                        | Owns the open documents' parse trees and answers the shell's queries.                                           | Parses each open document with `tree-sitter-java`; serves document symbols, folding ranges, semantic tokens, completions, hover, definition/declaration, implementation, references, rename, and inlay hints; applies editor input inline in arrival order and runs each query on the blocking pool, so a slow search never delays typing; notifies `AnalysisUpdated` after each applied document or file event (it does not compute diagnostics). |
+| **Type layer** (`types.rs`)                                                                  | The pure-Rust declared-type model (R7).                                                                         | Models types, members, hierarchies, generics, records, enums, and syntactically-read Lombok members; infers receiver types; resolves names in Java precedence order; selects overloads by argument types. Backs completion, hover, signature help, inlay hints, and semantic diagnostics through a cached, layered, dirty-overlay view of the base and per-source models.                                                                          |
+| **Diagnostics subsystem** (`diagnostics.rs`)                                                 | A self-contained parser and open-document state, separate from the core.                                        | Sweeps on `AnalysisUpdated` (the just-edited file first, then every open document) for syntax errors and unresolved symbols; reads the index and type layer through `IndexHandle` with per-sweep caches; publishes one `Diagnostics` per open document and keeps a queryable cache of each document's latest pass.                                                                                                                                 |
+| **Quick-fix subsystem** (`quickfix.rs`)                                                      | A self-contained parser and open-document text.                                                                 | Turns unresolved-symbol diagnostics into `CodeAction`s — add an import, change to a near member, or create a stub type/member; reads the symbol index (`IndexHandle`) and the diagnostics cache (`DiagnosticsForDocument`); answers the shell's `codeAction` request as an awaited hub request.                                                                                                                                                    |
+| **Index subsystem / WorkspaceIndex** (`index.rs`)                                            | A workspace-wide in-memory symbol index owned by a dedicated thread.                                            | Stores flat `SymbolEntry`s (name, kind, package, container chain, ranges, `dependency`/`synthetic` flags); answers `query_name`/`query_prefix`/`query_names`/`has_packages` through the message-based `IndexHandle`; re-extracts a file's entries on edits and watcher events (and re-reads disk on `didClose`); grows the declared-type base append-only, one layer per artifact.                                                                 |
+| **Maven project model & dependency resolution** (`project.rs`, `resolve.rs`, `classfile.rs`) | The project driver's model of the workspace and its strictly offline dependency resolver.                       | Walks the root on `FolderAdded` and discovers `pom.xml` modules and source roots (falling back to scanning the whole root); resolves the jar closure from the local repository with Maven mediation, never invoking `mvn` or the network; parses jars and class files into `dependency` index entries; coordinates `ready` and the warm-up summary.                                                                                                |
+| **JDK indexer** (`jdk.rs`)                                                                   | Indexes the installed JDK's standard library.                                                                   | Discovers the JDK (`$JAVA_LSP_JDK`, `$JAVA_HOME`, common locations incl. SDKMAN) and indexes `jmods/*.jmod`, `lib/src.zip`, or `rt.jar` with streaming per-entry reads; keeps only `java.*`/`javax.*`; a missing JDK is a graceful no-op.                                                                                                                                                                                                          |
+| **Dependency sources** (`sources.rs`)                                                        | Fetches and indexes `-sources.jar` for resolved artifacts.                                                      | Reuses local sources or downloads from Maven Central with bounded concurrency and `.sha1` verification; extracts under the sources cache; republishes source-backed dependency entries (real signatures and ranges), dropping the class-derived ones; disabled by `$JAVA_LSP_OFFLINE`.                                                                                                                                                             |
+| **Source scanner & jar indexer** (`scan.rs`, `jars.rs`)                                      | Warm-up drivers that fill the index.                                                                            | The source scanner parses the project's `.java` files into the index (`Sources` stage); the jar indexer parses resolved jars into it (`Jars` stage). Both speak only `DriverMessage`s.                                                                                                                                                                                                                                                             |
+
+## Implementation notes
+
+Detailed behaviour, edge cases, and the documented v1 limitations behind each module in the table above.
+
+Every arrow into or out of the hub is a hub message: the analysis, diagnostics,
 and quick-fix modules also read the index (and the quick-fix module the
 diagnostics cache) through hub-routed requests.
 
@@ -107,10 +140,11 @@ diagnostics cache) through hub-routed requests.
   symbols, folding
   ranges, semantic tokens, references, rename, code actions (kind `quickfix`),
   and inlay hints.
-  `didOpen`/`didChange`/`didClose` update the document store and notify the
-  bus (`DocumentOpened`/`DocumentChanged`/`DocumentClosed`, the full text
-  shared behind an `Arc`); the diagnostics come back as `Diagnostics`
-  notifications on the shell's own bus channel, which the shell's drain task
+  `didOpen`/`didChange`/`didClose` notify the hub
+  (`DocumentOpened`/`DocumentChanged`/`DocumentClosed`, the full text shared
+  behind an `Arc`); `didChange` first asks the document module for the new text,
+  since the shell holds no store; the diagnostics come back as `Diagnostics`
+  notifications on the shell's own hub channel, which the shell's drain task
   publishes. `initialized` also registers
   `workspace/didChangeWatchedFiles` for `**/*.java` when the client advertises
   `workspace.didChangeWatchedFiles.dynamicRegistration` — a fire-and-forget
@@ -118,7 +152,7 @@ diagnostics cache) through hub-routed requests.
   the `didChangeWatchedFiles` handler notifies one `FileEvent` per
   created/changed/deleted file; without the capability the watcher is simply
   skipped and everything else stands (D6).
-  Query handlers await their bus request's `Reply`. That
+  Query handlers await their hub request's `Reply`. That
   same drain task renders the `Progress` notifications as
   `window/workDoneProgress/create` plus `$/progress` — one status-bar item
   titled `java-lsp`, whose message names the current phase and whose percentage
@@ -127,13 +161,17 @@ diagnostics cache) through hub-routed requests.
   advertised `window.workDoneProgress` in `initialize`; without it they are
   dropped silently. A `window/workDoneProgress/cancel` is ignored — the
   background job is not cancellable.
-- **DocumentStore** (`document.rs`): keeps UTF-8 bytes per URI with the client
-  version. Incremental `TextDocumentContentChangeEvent`s are applied in order;
-  LSP positions (line + UTF-16 code units) are converted to byte offsets in the
-  store — bytes are what tree-sitter consumes, and UTF-16 conversion is the
-  only place position semantics are handled on the way in.
-- **The shell on the bus** (`server.rs`, `engine.rs`, `analysis.rs`): the shell
-  never touches the core directly — it is just another bus client.
+- **Document module** (`document.rs`): owns the canonical `DocumentStore`, a hub
+  client like any other — the shell holds no document state. It keeps UTF-8 bytes
+  per URI with the client version, subscribes to `DocumentOpened`/`DocumentClosed`,
+  and applies the editor's incremental `TextDocumentContentChangeEvent`s in order
+  when the shell sends a `DocumentChange` request, returning the new text; a
+  `DocumentText` request returns the current text and version. LSP positions
+  (line + UTF-16 code units) are converted to byte offsets here — bytes are what
+  tree-sitter consumes, and UTF-16 conversion is the only place position semantics
+  are handled on the way in.
+- **The shell on the hub** (`server.rs`, `engine.rs`, `analysis.rs`): the shell
+  never touches the core directly — it is just another hub client.
   `engine::start` (the `LspService` constructor) starts the hub and calls each
   participant's `spawn`: the shell first, then the modules, then the drivers.
   Each `spawn` labels itself, registers — `subscribe()` for every notification,
@@ -145,7 +183,7 @@ diagnostics cache) through hub-routed requests.
   `DocumentClosed`, and `FileEvent` — and **requests** each query as a
   `Request::Analysis(AnalysisRequest::…)`, which the hub routes to the
   **analysis module**; code actions go to the quick-fix module. Every
-  `BusClient` request returns a `Reply` — a thin wrapper over a `tokio` oneshot
+  `HubClient` request returns a `Reply` — a thin wrapper over a `tokio` oneshot
   receiver. A query handler awaits it, so no runtime worker blocks; the
   synchronous module code (the core, diagnostics, quick-fix), which runs on its
   own threads or the blocking pool, calls `Reply::blocking_recv` instead. The
@@ -165,8 +203,8 @@ diagnostics cache) through hub-routed requests.
   with a phase message, a count, and an optional download percentage) and
   `Notice { level, text }` notifications, which the shell renders, and `Log` and
   `Summary`, which the hub renders as `tracing` lines — the hub carries no editor
-  knowledge. The shell's bus channel is unbounded, so a slow client can never
-  stall the bus. A dropped reply — the module gone — yields the empty result
+  knowledge. The shell's hub channel is unbounded, so a slow client can never
+  stall the hub. A dropped reply — the module gone — yields the empty result
   rather than an error. The core itself:
 - **Diagnostics subsystem** (`diagnostics.rs`): owns a `tree-sitter-java` parser
   and the open documents' text, parses each open buffer itself, and computes the
@@ -519,7 +557,7 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   the analysis module records it and the project driver walks it. Every
   subsystem is a **driver** spawned at start — the project walker, the dependency
   resolver, the source scanner, the jar indexer, the JDK indexer, and the source
-  downloader — and each speaks only the bus's `DriverMessage`s. The index is
+  downloader — and each speaks only the hub's `DriverMessage`s. The index is
   itself a subsystem (`index.rs`): the hub broadcasts it the
   index-affecting messages and routes it the index queries, broadcasts every
   message to every driver, and renders the warm-up's log lines; the shell renders
@@ -544,7 +582,7 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   entries, and a file the editor currently has open is skipped because its
   `didChange` is authoritative (D2). Every such change also refreshes the
   declared-type model and republishes the open documents' diagnostics (see the
-  shell-on-the-bus and type-layer bullets). `index_ready()` flips when warm-up
+  shell-on-the-hub and type-layer bullets). `index_ready()` flips when warm-up
   completes so index-backed features can report themselves briefly
   unavailable during warm-up instead of blocking; completions consume the
   index via `query_prefix` (see the engine-core bullet above), and
@@ -568,7 +606,7 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   `src/main/java`/`src/test/java` unless `<build>` overrides them; roots that
   don't exist are dropped, and a workspace with no poms falls back to
   scanning the whole root (non-Maven projects keep working). The model and the
-  source inventory ride the bus; the dependency driver resolves the jar list.
+  source inventory ride the hub; the dependency driver resolves the jar list.
   **Dependency resolution** (`resolve.rs`) is static and strictly offline —
   it reads the local repository (`$MAVEN_REPO` if set, else
   `~/.m2/repository`) and never invokes `mvn` or the network. Each pom is
@@ -653,20 +691,20 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
 
 - **`tower-lsp` over stdio** — ergonomics first (decision recorded in
   `requirements.md`); revisit if it blocks cancellation or backpressure control.
-- **The shell is just another bus client** (`server.rs`, `engine.rs`) — the
+- **The shell is just another hub client** (`server.rs`, `engine.rs`) — the
   shell notifies the editor's input and requests the editor's queries on the
-  same bus every module uses, and consumes the editor-facing notifications on
+  same hub every module uses, and consumes the editor-facing notifications on
   its own channel; there is no separate command/event boundary and no
   dispatcher. The core is the **analysis module**, which applies mutations
   inline for ordering while queries run concurrently on the blocking pool
   (preserving R6); a strict single-task actor was rejected because it would
   serialize every request behind the slowest one (`message-based-engine`). This
   supersedes the earlier `Command`/`EngineEvent` boundary and the
-  `EngineHandle` dispatcher (`server-as-bus-client`).
-- **Every subsystem is a module or driver on one bus** (`messages.rs`,
-  `bus.rs`, `engine.rs`) — all messages live in `messages.rs`: the
+  `EngineHandle` dispatcher (`server-as-hub-client`).
+- **Every subsystem is a module or driver on one hub** (`messages.rs`,
+  `hub.rs`, `engine.rs`) — all messages live in `messages.rs`: the
   `DriverMessage` notifications and the `Request`s. Each participant is a module
-  that owns its whole bus life — its label, its subscription, and its own thread
+  that owns its whole hub life — its label, its subscription, and its own thread
   or task — so `engine::start` only builds the hub and calls each `spawn`. The
   warm-up drivers live with the work they drive (`project.rs`, `resolve.rs`,
   `scan.rs`, `jars.rs`, `jdk.rs`, `sources.rs`), and each reacts to the messages
@@ -682,11 +720,11 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   request to its owner (the index, analysis, diagnostics, or quick-fix module),
   and renders the `Log`/`Summary` lines — it carries no editor knowledge; the
   shell renders diagnostics, progress, and notices. The hub also logs every message it carries at `debug`
-  (`RUST_LOG=java_lsp::bus=debug`): each line is prefixed with the sender's name,
+  (`RUST_LOG=java_lsp::hub=debug`): each line is prefixed with the sender's name,
   and a request's reply is logged with the module that answered it and the time
   it took, so the whole flow is attributable from one place. The high-cardinality,
   per-item notifications (a source file, an artifact, a progress tick) are logged
-  at `trace` (`RUST_LOG=java_lsp::bus=trace`) so `debug` shows the flow rather than
+  at `trace` (`RUST_LOG=java_lsp::hub=trace`) so `debug` shows the flow rather than
   thousands of per-item lines.
   This supersedes the earlier "one driver that discovers, then spawns producers"
   shape and the `Reporter` indirection it threaded through the producers
@@ -697,7 +735,7 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   reply for a query), so no component holds the index state directly and the
   subsystem is its single reader and writer. The hub hands it the index-affecting
   `DriverMessage`s; the analysis core uses the handle for its symbol lookups and
-  edits. A query is an ordinary bus request: the hub routes it to the index
+  edits. A query is an ordinary hub request: the hub routes it to the index
   subsystem and that subsystem's reply is routed back through the hub (which logs
   and times it), so the hub never calls the index synchronously and cannot
   deadlock on it.
@@ -712,7 +750,7 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
 - **The quick-fix subsystem is its own subsystem** (`quickfix.rs`) — it generates
   the create/import/rename fixes from its own parse of the buffer, querying the
   symbol index (`IndexHandle`) and the diagnostics cache (`DiagnosticsForDocument`).
-  The shell's `codeAction` reaches it as an awaited bus request, so a fix never
+  The shell's `codeAction` reaches it as an awaited hub request, so a fix never
   blocks a runtime worker.
 - **The index is ordered by name for prefix queries** — `by_name` is a
   `BTreeMap`, so `query_prefix` (completions on every keystroke, and

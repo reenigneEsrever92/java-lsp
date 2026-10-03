@@ -1,23 +1,23 @@
-//! The engine bus: one mechanism every module uses.
+//! The engine hub: one mechanism every module uses.
 //!
 //! Modules never call each other directly and never share state. Each module
-//! owns its own state and holds a [`BusClient`], which is all it needs: it
-//! registers with the hub through it ([`BusClient::subscribe`], or
-//! [`BusClient::serve`] to also own a module's requests), sends
+//! owns its own state and holds a [`HubClient`], which is all it needs: it
+//! registers with the hub through it ([`HubClient::subscribe`], or
+//! [`HubClient::serve`] to also own a module's requests), sends
 //! **notifications** (which the hub broadcasts to every subscriber — each
 //! consumes the ones it cares about) and **requests** (which the hub routes to
-//! the one module that serves them, the reply riding the same bus). Every request returns a [`Reply`]: a
+//! the one module that serves them, the reply riding the same hub). Every request returns a [`Reply`]: a
 //! thin wrapper over a tokio oneshot receiver. Code on the runtime (the shell,
 //! the drivers) awaits it; synchronous module code — the analysis core, the
 //! diagnostics and quick-fix modules, which run on their own threads or the
 //! blocking pool — calls [`Reply::blocking_recv`]. The hub is a thread, so a
 //! blocked module never stalls it.
 //!
-//! `BusClient` mirrors the query surface its callers need, so a module that used
+//! `HubClient` mirrors the query surface its callers need, so a module that used
 //! to hold a neighbour's handle now holds a client instead.
 //!
 //! The hub **logs every message passing through** at `debug`
-//! (`RUST_LOG=java_lsp::bus=debug`): one line per message, each prefixed with the
+//! (`RUST_LOG=java_lsp::hub=debug`): one line per message, each prefixed with the
 //! sender's name, with the identifiers and counts that matter but never a payload
 //! (an open document's text is logged as its size). The high-cardinality, per-item
 //! notifications (a source file, an artifact, a progress tick) are logged at
@@ -41,30 +41,31 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
 use tower_lsp::lsp_types::{
     CodeAction, CompletionResponse, Diagnostic, DocumentSymbol, FoldingRange, Hover, InlayHint,
-    Location, Position, Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
-    WorkspaceEdit,
+    Location, Position, Range, SemanticTokens, SignatureHelp, SymbolInformation,
+    TextDocumentContentChangeEvent, Url, WorkspaceEdit,
 };
 
 use crate::index::SymbolEntry;
-use crate::messages::{self, AnalysisRequest, Bus, DriverMessage, Inbound, ReplyHandle, Request};
+use crate::messages::{self, AnalysisRequest, DriverMessage, Hub, Inbound, ReplyHandle, Request};
 use crate::project::ProjectModel;
 use crate::types::{ModelLayers, SourceLayerIndex, TypeModel};
 
 /// Which module owns a request.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Module {
+    Document,
     Index,
     Diagnostics,
     QuickFix,
     Analysis,
 }
 
-/// A cheap, cloneable client for talking on the bus. Everything — the core, the
+/// A cheap, cloneable client for talking on the hub. Everything — the core, the
 /// subsystems, and the shell — uses this; none of them reaches into another
 /// module. The client carries the name it logs under, so a clone may be relabeled
-/// with [`BusClient::labeled`].
+/// with [`HubClient::labeled`].
 #[derive(Clone)]
-pub struct BusClient {
+pub struct HubClient {
     inbound: tokio_mpsc::UnboundedSender<Inbound>,
     sender: String,
 }
@@ -73,7 +74,7 @@ pub struct BusClient {
 /// its request.
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
 
-impl BusClient {
+impl HubClient {
     /// A clone of this client that logs under `label`.
     pub fn labeled(&self, label: impl Into<String>) -> Self {
         Self {
@@ -94,18 +95,18 @@ impl BusClient {
     /// the thread or task that drains the receiver: the subscription rides the
     /// hub's FIFO inbound channel, so it is in place before any message sent
     /// afterwards. Dropping the receiver unsubscribes.
-    pub fn subscribe(&self) -> tokio_mpsc::UnboundedReceiver<Bus> {
+    pub fn subscribe(&self) -> tokio_mpsc::UnboundedReceiver<Hub> {
         self.register(None)
     }
 
     /// [`Self::subscribe`], and also makes this receiver the owner of
     /// `module`'s requests. A module already served keeps its first owner (the
     /// hub logs an error); dropping the receiver releases the ownership.
-    pub fn serve(&self, module: Module) -> tokio_mpsc::UnboundedReceiver<Bus> {
+    pub fn serve(&self, module: Module) -> tokio_mpsc::UnboundedReceiver<Hub> {
         self.register(Some(module))
     }
 
-    fn register(&self, serves: Option<Module>) -> tokio_mpsc::UnboundedReceiver<Bus> {
+    fn register(&self, serves: Option<Module>) -> tokio_mpsc::UnboundedReceiver<Hub> {
         let (sink, rx) = tokio_mpsc::unbounded_channel();
         let _ = self.inbound.send(Inbound::Subscribe {
             sender: self.sender.clone(),
@@ -124,7 +125,7 @@ impl BusClient {
     }
 
     /// Posts request `id` to the hub, which routes it to the owning module. If
-    /// the bus is gone the request (and its handle) is dropped, so the caller's
+    /// the hub is gone the request (and its handle) is dropped, so the caller's
     /// [`Reply`] resolves to the default.
     fn post(&self, id: u64, request: Request) {
         let _ = self.inbound.send(Inbound::Request {
@@ -132,6 +133,37 @@ impl BusClient {
             id,
             request,
         });
+    }
+
+    // -- document module ---------------------------------------------------
+
+    /// Applies `changes` to `uri`'s open document and returns its new text, or
+    /// `None` when the document is not open.
+    pub fn document_change(
+        &self,
+        uri: Url,
+        version: i32,
+        changes: Vec<TextDocumentContentChangeEvent>,
+    ) -> Reply<Option<Arc<String>>> {
+        let (reply, answer) = self.reply();
+        self.post(
+            reply.id(),
+            Request::DocumentChange {
+                uri,
+                version,
+                changes,
+                reply,
+            },
+        );
+        answer
+    }
+
+    /// The current text and version of an open document, or `None` when it is
+    /// not open.
+    pub fn document_text(&self, uri: Url) -> Reply<Option<(i32, Arc<String>)>> {
+        let (reply, answer) = self.reply();
+        self.post(reply.id(), Request::DocumentText { uri, reply });
+        answer
     }
 
     // -- index subsystem ---------------------------------------------------
@@ -455,10 +487,10 @@ impl BusClient {
     }
 }
 
-/// The pending answer to a bus request: a thin wrapper over the request's tokio
+/// The pending answer to a hub request: a thin wrapper over the request's tokio
 /// oneshot receiver. Await it on the runtime; synchronous module code (a module
 /// thread, the blocking pool, a sync test) calls [`Reply::blocking_recv`]. If
-/// the owner drops the request unanswered or the bus is gone, it resolves to
+/// the owner drops the request unanswered or the hub is gone, it resolves to
 /// `R::default()`.
 #[must_use = "a request's answer arrives only through its Reply"]
 pub struct Reply<R>(oneshot::Receiver<R>);
@@ -481,32 +513,32 @@ impl<R: Default> Future for Reply<R> {
     }
 }
 
-/// The next notification on a subscriber's receiver, or `None` once the bus is
+/// The next notification on a subscriber's receiver, or `None` once the hub is
 /// gone. A driver serves no module, so a request on the receiver is skipped.
 pub(crate) async fn next_notification(
-    rx: &mut tokio_mpsc::UnboundedReceiver<Bus>,
+    rx: &mut tokio_mpsc::UnboundedReceiver<Hub>,
 ) -> Option<DriverMessage> {
     loop {
         match rx.recv().await? {
-            Bus::Notify(message) => return Some(message),
-            Bus::Request(_) => continue,
+            Hub::Notify(message) => return Some(message),
+            Hub::Request(_) => continue,
         }
     }
 }
 
 /// Starts the hub thread, with no participants yet: every module, driver, and
-/// the shell registers through its client ([`BusClient::subscribe`],
-/// [`BusClient::serve`]). Every subscriber receives every notification; a
+/// the shell registers through its client ([`HubClient::subscribe`],
+/// [`HubClient::serve`]). Every subscriber receives every notification; a
 /// request is routed to the subscriber serving its module. The hub renders the
 /// log reporting (`Log`, `Summary`) itself and nothing else: the editor-facing
 /// notifications are the shell's to render.
-pub fn spawn_hub() -> BusClient {
+pub fn spawn_hub() -> HubClient {
     let (inbound, mut rx) = tokio_mpsc::unbounded_channel::<Inbound>();
     thread::Builder::new()
         .name("java-lsp-hub".to_string())
         .spawn(move || {
-            let mut subscribers: Vec<tokio_mpsc::UnboundedSender<Bus>> = Vec::new();
-            let mut owners: HashMap<Module, tokio_mpsc::UnboundedSender<Bus>> = HashMap::new();
+            let mut subscribers: Vec<tokio_mpsc::UnboundedSender<Hub>> = Vec::new();
+            let mut owners: HashMap<Module, tokio_mpsc::UnboundedSender<Hub>> = HashMap::new();
             // The requests the hub is still waiting on, so each reply can be
             // timed and attributed to the module that owned its request.
             let mut pending: HashMap<u64, Pending> = HashMap::new();
@@ -514,7 +546,7 @@ pub fn spawn_hub() -> BusClient {
                 // The hub logs every message passing through, so the whole
                 // message flow is observable from one place: each line names its
                 // sender, and a reply names its requester and latency. Detail is
-                // at `debug` (enable with `RUST_LOG=java_lsp::bus=debug`).
+                // at `debug` (enable with `RUST_LOG=java_lsp::hub=debug`).
                 match message {
                     Inbound::Notify { sender, message } => {
                         // Bulk, per-item notifications stay at `trace`; the rest of the
@@ -522,21 +554,21 @@ pub fn spawn_hub() -> BusClient {
                         if is_bulk(&message) {
                             if tracing::enabled!(tracing::Level::TRACE) {
                                 tracing::trace!(
-                                    target: "java_lsp::bus",
+                                    target: "java_lsp::hub",
                                     "sender={sender} notify {}",
                                     describe_notification(&message)
                                 );
                             }
                         } else if tracing::enabled!(tracing::Level::DEBUG) {
                             tracing::debug!(
-                                target: "java_lsp::bus",
+                                target: "java_lsp::hub",
                                 "sender={sender} notify {}",
                                 describe_notification(&message)
                             );
                         }
                         messages::log_reporting(&message);
                         // A failed send is a dropped receiver: unsubscribe it.
-                        subscribers.retain(|sink| sink.send(Bus::Notify(message.clone())).is_ok());
+                        subscribers.retain(|sink| sink.send(Hub::Notify(message.clone())).is_ok());
                     }
                     Inbound::Request {
                         sender,
@@ -548,7 +580,7 @@ pub fn spawn_hub() -> BusClient {
                             .then(|| describe_request(&request));
                         if let Some(desc) = &desc {
                             tracing::debug!(
-                                target: "java_lsp::bus",
+                                target: "java_lsp::hub",
                                 "sender={sender} request {desc}"
                             );
                         }
@@ -565,7 +597,7 @@ pub fn spawn_hub() -> BusClient {
                         // dropped here: its reply resolves to the default.
                         let delivered = owners
                             .get(&owner)
-                            .is_some_and(|sink| sink.send(Bus::Request(request)).is_ok());
+                            .is_some_and(|sink| sink.send(Hub::Request(request)).is_ok());
                         if !delivered {
                             owners.remove(&owner);
                         }
@@ -577,7 +609,7 @@ pub fn spawn_hub() -> BusClient {
                         let answered = deliver.is_some();
                         if let Some(done) = pending.remove(&id) {
                             if let Some(line) = reply_log(&done, answered) {
-                                tracing::debug!(target: "java_lsp::bus", "{line}");
+                                tracing::debug!(target: "java_lsp::hub", "{line}");
                             }
                         }
                         if let Some(deliver) = deliver {
@@ -592,7 +624,7 @@ pub fn spawn_hub() -> BusClient {
                         match serves {
                             Some(module) => {
                                 tracing::debug!(
-                                    target: "java_lsp::bus",
+                                    target: "java_lsp::hub",
                                     "sender={sender} serve {module:?}"
                                 );
                                 let taken = owners
@@ -600,7 +632,7 @@ pub fn spawn_hub() -> BusClient {
                                     .is_some_and(|owner| !owner.is_closed());
                                 if taken {
                                     tracing::error!(
-                                        target: "java_lsp::bus",
+                                        target: "java_lsp::hub",
                                         "sender={sender} cannot serve {module:?}: it already has an owner; keeping the first"
                                     );
                                 } else {
@@ -608,7 +640,7 @@ pub fn spawn_hub() -> BusClient {
                                 }
                             }
                             None => tracing::debug!(
-                                target: "java_lsp::bus",
+                                target: "java_lsp::hub",
                                 "sender={sender} subscribe"
                             ),
                         }
@@ -618,14 +650,14 @@ pub fn spawn_hub() -> BusClient {
             }
         })
         .expect("spawn the hub thread");
-    BusClient {
+    HubClient {
         inbound,
         sender: "engine".to_string(),
     }
 }
 
-impl BusClient {
-    /// A standalone bus with only the index module: for a core used on its own
+impl HubClient {
+    /// A standalone hub with only the index module: for a core used on its own
     /// (the unit tests, and `TreeSitterEngine::new`).
     pub fn standalone() -> Self {
         standalone_client()
@@ -633,13 +665,13 @@ impl BusClient {
 
     /// Wraps an existing hub's client (production, where the engine owns the
     /// hub).
-    pub fn from_client(client: BusClient) -> Self {
+    pub fn from_client(client: HubClient) -> Self {
         client
     }
 }
 
-/// A standalone bus with only the index module.
-fn standalone_client() -> BusClient {
+/// A standalone hub with only the index module.
+fn standalone_client() -> HubClient {
     let client = spawn_hub();
     crate::index::spawn(&client);
     client.labeled("core")
@@ -662,6 +694,7 @@ fn owner_of(request: &Request) -> Module {
         | Request::IndexSourceRoots { .. }
         | Request::IndexSourceLayerIndex { .. }
         | Request::IndexSourceModels { .. } => Module::Index,
+        Request::DocumentChange { .. } | Request::DocumentText { .. } => Module::Document,
         Request::DiagnosticsForDocument { .. } => Module::Diagnostics,
         Request::QuickFixForDocument { .. } => Module::QuickFix,
         Request::Analysis(_) => Module::Analysis,
@@ -679,6 +712,7 @@ struct Pending {
 /// The hub-log name of the module that owns a request.
 fn module_label(module: Module) -> &'static str {
     match module {
+        Module::Document => "document",
         Module::Index => "index",
         Module::Diagnostics => "diagnostics",
         Module::QuickFix => "quickfix",
@@ -817,6 +851,10 @@ fn describe_request(request: &Request) -> String {
         Request::IndexSourceRoots { .. } => "IndexSourceRoots".to_string(),
         Request::IndexSourceLayerIndex { .. } => "IndexSourceLayerIndex".to_string(),
         Request::IndexSourceModels { .. } => "IndexSourceModels".to_string(),
+        Request::DocumentChange { uri, changes, .. } => {
+            format!("DocumentChange {uri} changes={}", changes.len())
+        }
+        Request::DocumentText { uri, .. } => format!("DocumentText {uri}"),
         Request::DiagnosticsForDocument { uri, .. } => format!("DiagnosticsForDocument {uri}"),
         Request::QuickFixForDocument {
             uri, diagnostics, ..
@@ -904,9 +942,9 @@ mod tests {
     }
 
     /// Answers one `IndexFileCount` request arriving on `rx` with `count`.
-    fn answer_file_count(rx: &mut tokio_mpsc::UnboundedReceiver<Bus>, count: usize) {
+    fn answer_file_count(rx: &mut tokio_mpsc::UnboundedReceiver<Hub>, count: usize) {
         while let Some(message) = rx.blocking_recv() {
-            if let Bus::Request(Request::IndexFileCount { reply }) = message {
+            if let Hub::Request(Request::IndexFileCount { reply }) = message {
                 reply.send(count);
                 return;
             }

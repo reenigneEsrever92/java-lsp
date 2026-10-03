@@ -1,7 +1,7 @@
 //! The dependency-jar indexer: parses the class files of the resolved
 //! dependency jars into the index.
 //!
-//! The indexer is its own module on the bus. It subscribes for the artifact
+//! The indexer is its own module on the hub. It subscribes for the artifact
 //! list the dependency driver emits, indexes off the request path, and reports
 //! the `Jars` stage-done. Each archive is served from [`crate::base_cache`] when
 //! its identity is unchanged, so a restart re-parses only what changed.
@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::bus::{next_notification, BusClient};
+use crate::hub::{next_notification, HubClient};
 use crate::messages::{DriverMessage, ProgressUpdate, Stage};
 use crate::resolve::{local_repository, Artifact, Resolver};
 
-/// Starts the jar indexer on the bus: on the artifact list it reads each jar and
+/// Starts the jar indexer on the hub: on the artifact list it reads each jar and
 /// emits its entries and model, then the `Jars` stage-done.
-pub fn spawn(bus: &BusClient) {
-    let client = bus.labeled("jar");
+pub fn spawn(hub: &HubClient) {
+    let client = hub.labeled("jar");
     let mut rx = client.subscribe();
     tokio::spawn(async move {
         while let Some(message) = next_notification(&mut rx).await {

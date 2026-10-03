@@ -21,7 +21,7 @@ use tower_lsp::lsp_types::{Range, Url};
 use tree_sitter::{Node, Parser, Tree};
 
 use crate::analysis::LineIndex;
-use crate::messages::{Bus, DriverMessage, Request};
+use crate::messages::{DriverMessage, Hub, Request};
 use crate::types::{ModelLayers, TypeModel};
 
 /// What kind of declaration an indexed entry is.
@@ -910,20 +910,20 @@ pub(crate) fn warm_up_sync(root: &Url, index: &IndexHandle) {
     index.apply(DriverMessage::Ready);
 }
 
-/// The index subsystem handle: a [`crate::bus::BusClient`], so the core and the
+/// The index subsystem handle: a [`crate::hub::HubClient`], so the core and the
 /// other subsystems reach the index by message through the hub and never hold its
 /// state.
-pub type IndexHandle = crate::bus::BusClient;
+pub type IndexHandle = crate::hub::HubClient;
 
 /// Exact-name lookups against the index, by whatever path the caller reads it:
-/// the handle itself (one bus round trip per call), or a cache in front of it
+/// the handle itself (one hub round trip per call), or a cache in front of it
 /// such as the diagnostics sweep's.
 pub(crate) trait NameLookup {
     fn query_name(&self, name: &str) -> Vec<Arc<SymbolEntry>>;
 }
 
 impl NameLookup for IndexHandle {
-    /// Blocks for the bus reply: `NameLookup` serves the synchronous analysis
+    /// Blocks for the hub reply: `NameLookup` serves the synchronous analysis
     /// code, which runs off the runtime's workers.
     fn query_name(&self, name: &str) -> Vec<Arc<SymbolEntry>> {
         IndexHandle::query_name(self, name).blocking_recv()
@@ -931,19 +931,19 @@ impl NameLookup for IndexHandle {
 }
 
 /// Starts the index module: a thread that owns the [`WorkspaceIndex`] and serves
-/// the bus — it applies the notifications that affect the index and answers the
+/// the hub — it applies the notifications that affect the index and answers the
 /// index requests. It exits when the hub drops its sink.
-pub fn spawn(bus: &crate::bus::BusClient) {
-    let client = bus.labeled("index");
-    let mut rx = client.serve(crate::bus::Module::Index);
+pub fn spawn(hub: &crate::hub::HubClient) {
+    let client = hub.labeled("index");
+    let mut rx = client.serve(crate::hub::Module::Index);
     thread::Builder::new()
         .name("java-lsp-index".to_string())
         .spawn(move || {
             let index = WorkspaceIndex::new();
             while let Some(message) = rx.blocking_recv() {
                 match message {
-                    Bus::Notify(message) => apply_to_index(&message, &index),
-                    Bus::Request(request) => answer(&index, request),
+                    Hub::Notify(message) => apply_to_index(&message, &index),
+                    Hub::Request(request) => answer(&index, request),
                 }
             }
         })
@@ -1031,12 +1031,12 @@ fn apply_to_index(message: &DriverMessage, index: &WorkspaceIndex) {
         DriverMessage::RemoveBase { uri } => index.remove_base_layer(uri),
         DriverMessage::Ready => {
             index.set_ready();
-            tracing::info!(target: "java_lsp::bus", "{}", index.composition());
+            tracing::info!(target: "java_lsp::hub", "{}", index.composition());
         }
         DriverMessage::StageDone {
             stage: crate::messages::Stage::Downloads,
             ..
-        } => tracing::info!(target: "java_lsp::bus", "{}", index.composition()),
+        } => tracing::info!(target: "java_lsp::hub", "{}", index.composition()),
         DriverMessage::SourceEntries { uri, entries } => {
             index.upsert_file(uri, (**entries).clone())
         }

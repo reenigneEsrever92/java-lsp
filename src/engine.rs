@@ -1,11 +1,12 @@
 //! The engine wiring.
 //!
 //! [`start`] is the one setup path: it starts the hub and builds every
-//! participant on it — the LSP shell, the index, the analysis core, the
-//! diagnostics and quick-fix modules, and the warm-up drivers. Each participant
-//! takes the hub's [`crate::bus::BusClient`], labels itself, subscribes, and
+//! participant on it — the LSP shell, the document module, the index, the
+//! analysis core, the diagnostics and quick-fix modules, and the warm-up
+//! drivers. Each participant
+//! takes the hub's [`crate::hub::HubClient`], labels itself, subscribes, and
 //! starts its own thread or task, so nothing here wires channels or knows a
-//! participant's bus identity. Nothing here talks to the editor.
+//! participant's hub identity. Nothing here talks to the editor.
 
 use crate::server::JavaLanguageServer;
 
@@ -15,25 +16,26 @@ use crate::server::JavaLanguageServer;
 /// Must run inside a tokio runtime: the drivers are tasks and the analysis
 /// module runs its queries on the runtime's blocking pool.
 pub fn start(client: tower_lsp::Client) -> JavaLanguageServer {
-    let bus = crate::bus::spawn_hub();
-    let server = JavaLanguageServer::new(client, &bus);
+    let hub = crate::hub::spawn_hub();
+    let server = JavaLanguageServer::new(client, &hub);
 
     // The request-serving modules: each owns its state on its own thread,
     // consumes the notifications it cares about, and answers the requests it
     // serves.
-    crate::index::spawn(&bus);
-    crate::analysis::spawn(&bus, tokio::runtime::Handle::current());
-    crate::diagnostics::spawn(&bus);
-    crate::quickfix::spawn(&bus);
+    crate::index::spawn(&hub);
+    crate::document::spawn(&hub);
+    crate::analysis::spawn(&hub, tokio::runtime::Handle::current());
+    crate::diagnostics::spawn(&hub);
+    crate::quickfix::spawn(&hub);
 
     // The warm-up drivers: each owns the work it drives and its own
     // subscription.
-    crate::project::spawn(&bus);
-    crate::resolve::spawn(&bus);
-    crate::scan::spawn(&bus);
-    crate::jars::spawn(&bus);
-    crate::sources::spawn(&bus);
-    crate::jdk::spawn(&bus);
+    crate::project::spawn(&hub);
+    crate::resolve::spawn(&hub);
+    crate::scan::spawn(&hub);
+    crate::jars::spawn(&hub);
+    crate::sources::spawn(&hub);
+    crate::jdk::spawn(&hub);
 
     server
 }
@@ -45,7 +47,7 @@ mod tests {
     use tower_lsp::lsp_types::Url;
 
     use crate::index::IndexHandle;
-    use crate::messages::{Bus, DriverMessage, MessageLevel};
+    use crate::messages::{DriverMessage, Hub, MessageLevel};
 
     #[test]
     fn the_index_subsystem_applies_messages() {
@@ -65,7 +67,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_subscriber_receives_the_editor_facing_notifications() {
-        let client = crate::bus::spawn_hub();
+        let client = crate::hub::spawn_hub();
         let mut received = client.labeled("server").subscribe();
         client.notify(DriverMessage::Notice {
             level: MessageLevel::Info,
@@ -73,7 +75,7 @@ mod tests {
         });
         loop {
             match received.recv().await.expect("the subscription stays open") {
-                Bus::Notify(DriverMessage::Notice { level, text }) => {
+                Hub::Notify(DriverMessage::Notice { level, text }) => {
                     assert_eq!(level, MessageLevel::Info);
                     assert_eq!(text, "note");
                     break;

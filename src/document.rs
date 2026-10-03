@@ -1,8 +1,14 @@
-//! Versioned document store with incremental text sync.
+//! Versioned document store with incremental text sync, owned by the document
+//! module — one hub client among the others.
 
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::thread;
 
 use tower_lsp::lsp_types::{Position, TextDocumentContentChangeEvent, Url};
+
+use crate::hub::{HubClient, Module};
+use crate::messages::{DriverMessage, Hub, Request};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Document {
@@ -68,6 +74,53 @@ impl DocumentStore {
     pub fn get(&self, uri: &Url) -> Option<&Document> {
         self.documents.get(uri)
     }
+}
+
+/// Starts the document module: a thread that owns the canonical
+/// [`DocumentStore`], consumes the document lifecycle notifications the hub
+/// broadcasts, and answers the shell's text and change requests. The shell
+/// holds no document state; it asks the module for the new text after a change.
+pub fn spawn(hub: &HubClient) {
+    let client = hub.labeled("document");
+    let mut rx = client.serve(Module::Document);
+    thread::Builder::new()
+        .name("java-lsp-document".to_string())
+        .spawn(move || {
+            let mut store = DocumentStore::default();
+            while let Some(message) = rx.blocking_recv() {
+                match message {
+                    Hub::Notify(DriverMessage::DocumentOpened { uri, text, version }) => {
+                        store.open(uri, version, text.as_str());
+                    }
+                    Hub::Notify(DriverMessage::DocumentClosed { uri }) => {
+                        store.close(&uri);
+                    }
+                    Hub::Request(Request::DocumentChange {
+                        uri,
+                        version,
+                        changes,
+                        reply,
+                    }) => {
+                        let text = if store.change(&uri, version, &changes) {
+                            store.get(&uri).map(text_of)
+                        } else {
+                            None
+                        };
+                        reply.send(text);
+                    }
+                    Hub::Request(Request::DocumentText { uri, reply }) => {
+                        reply.send(store.get(&uri).map(|doc| (doc.version, text_of(doc))));
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .expect("spawn the document module thread");
+}
+
+/// A document's text for a reply; the store keeps bytes for position conversion.
+fn text_of(document: &Document) -> Arc<String> {
+    Arc::new(String::from_utf8_lossy(&document.bytes).into_owned())
 }
 
 /// Converts an LSP position (line + UTF-16 code units) to a byte offset.

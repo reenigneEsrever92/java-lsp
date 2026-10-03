@@ -1,5 +1,5 @@
 //! The LSP shell: editor-facing handlers. The shell is just another client on
-//! the engine bus ([`crate::bus`]): it notifies the editor's input, requests the
+//! the engine hub ([`crate::hub`]): it notifies the editor's input, requests the
 //! editor's queries, and renders the editor-facing notifications (diagnostics,
 //! progress, notices) it receives on its own subscription. It is built by
 //! [`crate::engine::start`], with every other participant.
@@ -8,7 +8,6 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use tokio::sync::RwLock;
 use tower_lsp::jsonrpc::Result;
 use tower_lsp::lsp_types::request::{
     GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
@@ -35,9 +34,8 @@ use tower_lsp::lsp_types::{
 };
 use tower_lsp::{Client, LanguageServer};
 
-use crate::bus::BusClient;
-use crate::document::DocumentStore;
-use crate::messages::{Bus, DriverMessage, MessageLevel, ProgressUpdate, WatchedChange};
+use crate::hub::HubClient;
+use crate::messages::{DriverMessage, Hub, MessageLevel, ProgressUpdate, WatchedChange};
 
 /// The single background job's progress token.
 const PROGRESS_TOKEN: &str = "java-lsp/warm-up";
@@ -97,9 +95,8 @@ async fn send_progress(client: &Client, token: NumberOrString, update: ProgressU
 }
 
 pub struct JavaLanguageServer {
-    documents: Arc<RwLock<DocumentStore>>,
-    /// The shell's client on the engine bus (logged as `server`).
-    bus: BusClient,
+    /// The shell's client on the engine hub (logged as `server`).
+    hub: HubClient,
     /// The client, so `initialized` can register the watched-file capability.
     client: Client,
     workspace_root: Mutex<Option<Url>>,
@@ -118,17 +115,17 @@ impl std::fmt::Debug for JavaLanguageServer {
 }
 
 impl JavaLanguageServer {
-    /// Builds the shell on `bus`, the client [`engine::start`] gives it.
+    /// Builds the shell on `hub`, the client [`engine::start`] gives it.
     ///
     /// [`engine::start`]: crate::engine::start
-    pub fn new(client: Client, bus: &BusClient) -> Self {
-        // The shell is a participant on the bus like any other: it labels
+    pub fn new(client: Client, hub: &HubClient) -> Self {
+        // The shell is a participant on the hub like any other: it labels
         // itself, subscribes for every notification, and this task renders the
         // editor-facing ones as client notifications. Unbounded, so a slow
-        // client can never stall the bus.
-        let bus = bus.labeled("server");
+        // client can never stall the hub.
+        let hub = hub.labeled("server");
         let progress = Arc::new(AtomicBool::new(false));
-        let mut incoming = bus.subscribe();
+        let mut incoming = hub.subscribe();
         let publishing = client.clone();
         let supported = progress.clone();
         tokio::spawn(async move {
@@ -136,7 +133,7 @@ impl JavaLanguageServer {
             let token = NumberOrString::String(PROGRESS_TOKEN.to_string());
             let mut created = false;
             while let Some(message) = incoming.recv().await {
-                let Bus::Notify(message) = message else {
+                let Hub::Notify(message) = message else {
                     continue;
                 };
                 match message {
@@ -171,8 +168,7 @@ impl JavaLanguageServer {
             }
         });
         Self {
-            documents: Arc::new(RwLock::new(DocumentStore::default())),
-            bus,
+            hub,
             client,
             workspace_root: Mutex::new(None),
             progress,
@@ -180,14 +176,9 @@ impl JavaLanguageServer {
         }
     }
 
-    /// The shell's document store, shared with tests (and later, other tasks).
-    pub fn documents(&self) -> Arc<RwLock<DocumentStore>> {
-        Arc::clone(&self.documents)
-    }
-
-    /// The shell's bus client, shared with tests.
-    pub fn bus(&self) -> BusClient {
-        self.bus.clone()
+    /// The shell's hub client, shared with tests.
+    pub fn hub(&self) -> HubClient {
+        self.hub.clone()
     }
 
     /// Registers `workspace/didChangeWatchedFiles` for `**/*.java` (D1).
@@ -232,7 +223,7 @@ impl LanguageServer for JavaLanguageServer {
             .and_then(|workspace| workspace.workspace_edit.as_ref())
             .and_then(|edit| edit.resource_operations.as_ref())
             .is_some_and(|operations| operations.contains(&ResourceOperationKind::Create));
-        self.bus.notify(DriverMessage::ClientCapabilities {
+        self.hub.notify(DriverMessage::ClientCapabilities {
             resource_operations,
         });
         // The watched-file fix is only registered with a client that supports
@@ -324,7 +315,7 @@ impl LanguageServer for JavaLanguageServer {
             .ok()
             .and_then(|slot| slot.clone());
         if let Some(root) = root {
-            self.bus.notify(DriverMessage::FolderAdded { uri: root });
+            self.hub.notify(DriverMessage::FolderAdded { uri: root });
         }
     }
 
@@ -338,7 +329,7 @@ impl LanguageServer for JavaLanguageServer {
             } else {
                 WatchedChange::Changed
             };
-            self.bus.notify(DriverMessage::FileEvent {
+            self.hub.notify(DriverMessage::FileEvent {
                 uri: event.uri,
                 change,
             });
@@ -353,7 +344,7 @@ impl LanguageServer for JavaLanguageServer {
     async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
         let uri = params.text_document.uri;
         let actions = self
-            .bus
+            .hub
             .code_actions(&uri, params.context.diagnostics)
             .await;
         if actions.is_empty() {
@@ -372,12 +363,9 @@ impl LanguageServer for JavaLanguageServer {
         let version = params.text_document.version;
         let text = params.text_document.text;
         tracing::info!(uri = %uri, version, "didOpen");
-        {
-            let mut docs = self.documents.write().await;
-            docs.open(uri.clone(), version, &text);
-        }
-        // Diagnostics follow as a bus notification; the shell need not ask.
-        self.bus.notify(DriverMessage::DocumentOpened {
+        // The document module stores the text; diagnostics follow as a hub
+        // notification, so the shell need not ask.
+        self.hub.notify(DriverMessage::DocumentOpened {
             uri,
             text: Arc::new(text),
             version,
@@ -388,38 +376,33 @@ impl LanguageServer for JavaLanguageServer {
         let uri = params.text_document.uri;
         let version = params.text_document.version;
         tracing::debug!(uri = %uri, version, changes = params.content_changes.len(), "didChange");
-        let text = {
-            let mut docs = self.documents.write().await;
-            if !docs.change(&uri, version, &params.content_changes) {
-                tracing::warn!(uri = %uri, "didChange for unopened document");
-                return;
-            }
-            docs.get(&uri)
-                .map(|doc| String::from_utf8_lossy(&doc.bytes).into_owned())
+        // The document module owns the store: it applies the changes and returns
+        // the new text, and the shell awaits it before notifying, so an edit still
+        // lands before the query the client sends at the new cursor.
+        let Some(text) = self
+            .hub
+            .document_change(uri.clone(), version, params.content_changes)
+            .await
+        else {
+            tracing::warn!(uri = %uri, "didChange for unopened document");
+            return;
         };
-        let Some(text) = text else { return };
-        self.bus.notify(DriverMessage::DocumentChanged {
-            uri,
-            text: Arc::new(text),
-            version,
-        });
+        self.hub
+            .notify(DriverMessage::DocumentChanged { uri, text, version });
     }
 
     async fn did_close(&self, params: DidCloseTextDocumentParams) {
         let uri = params.text_document.uri;
         tracing::info!(uri = %uri, "didClose");
-        {
-            let mut docs = self.documents.write().await;
-            docs.close(&uri);
-        }
-        // The diagnostics module clears the closed document's diagnostics.
-        self.bus.notify(DriverMessage::DocumentClosed { uri });
+        // The document module drops the text; the diagnostics module clears the
+        // closed document's diagnostics.
+        self.hub.notify(DriverMessage::DocumentClosed { uri });
     }
 
     async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        Ok(self.bus.hover(uri, position).await)
+        Ok(self.hub.hover(uri, position).await)
     }
 
     async fn goto_definition(
@@ -429,7 +412,7 @@ impl LanguageServer for JavaLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .bus
+            .hub
             .definition(uri, position)
             .await
             .map(GotoDefinitionResponse::Scalar))
@@ -445,7 +428,7 @@ impl LanguageServer for JavaLanguageServer {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
         Ok(self
-            .bus
+            .hub
             .definition(uri, position)
             .await
             .map(GotoDeclarationResponse::Scalar))
@@ -457,7 +440,7 @@ impl LanguageServer for JavaLanguageServer {
     ) -> Result<Option<GotoImplementationResponse>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        let locations = self.bus.implementation(uri, position).await;
+        let locations = self.hub.implementation(uri, position).await;
         // An empty result is a refusal as much as a "none found": report null
         // rather than claiming the contract has no implementations.
         if locations.is_empty() {
@@ -470,7 +453,7 @@ impl LanguageServer for JavaLanguageServer {
     async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        Ok(self.bus.completions(uri, position).await)
+        Ok(self.hub.completions(uri, position).await)
     }
 
     async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
@@ -478,7 +461,7 @@ impl LanguageServer for JavaLanguageServer {
         let position = params.text_document_position.position;
         let include_declaration = params.context.include_declaration;
         let references = self
-            .bus
+            .hub
             .references(uri, position, include_declaration)
             .await;
         // An empty result is a refusal as much as a "none found": report null
@@ -493,7 +476,7 @@ impl LanguageServer for JavaLanguageServer {
     async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
         let uri = params.text_document_position.text_document.uri;
         let position = params.text_document_position.position;
-        Ok(self.bus.rename(uri, position, params.new_name).await)
+        Ok(self.hub.rename(uri, position, params.new_name).await)
     }
 
     async fn document_symbol(
@@ -502,7 +485,7 @@ impl LanguageServer for JavaLanguageServer {
     ) -> Result<Option<DocumentSymbolResponse>> {
         let uri = params.text_document.uri;
         Ok(self
-            .bus
+            .hub
             .document_symbols(uri)
             .await
             .map(DocumentSymbolResponse::Nested))
@@ -512,12 +495,12 @@ impl LanguageServer for JavaLanguageServer {
         &self,
         params: WorkspaceSymbolParams,
     ) -> Result<Option<Vec<SymbolInformation>>> {
-        Ok(Some(self.bus.workspace_symbols(params.query).await))
+        Ok(Some(self.hub.workspace_symbols(params.query).await))
     }
 
     async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
         let uri = params.text_document.uri;
-        Ok(self.bus.folding_ranges(uri).await)
+        Ok(self.hub.folding_ranges(uri).await)
     }
 
     async fn semantic_tokens_full(
@@ -526,7 +509,7 @@ impl LanguageServer for JavaLanguageServer {
     ) -> Result<Option<SemanticTokensResult>> {
         let uri = params.text_document.uri;
         Ok(self
-            .bus
+            .hub
             .semantic_tokens(uri)
             .await
             .map(SemanticTokensResult::Tokens))
@@ -535,12 +518,12 @@ impl LanguageServer for JavaLanguageServer {
     async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
         let uri = params.text_document.uri;
         let range = params.range;
-        Ok(Some(self.bus.inlay_hints(uri, range).await))
+        Ok(Some(self.hub.inlay_hints(uri, range).await))
     }
 
     async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
         let uri = params.text_document_position_params.text_document.uri;
         let position = params.text_document_position_params.position;
-        Ok(self.bus.signature_help(uri, position).await)
+        Ok(self.hub.signature_help(uri, position).await)
     }
 }

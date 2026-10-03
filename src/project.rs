@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::bus::{next_notification, BusClient};
+use crate::hub::{next_notification, HubClient};
 use crate::messages::{DriverMessage, ProgressUpdate, Stage};
 use crate::resolve::{local_repository, EffectivePom, Resolver};
 
@@ -176,11 +176,11 @@ fn collect_java_files(dir: &Path, out: &mut Vec<PathBuf>) {
 
 // -- the project driver -----------------------------------------------------
 
-/// Starts the project driver on the bus: on an added folder it walks for the
+/// Starts the project driver on the hub: on an added folder it walks for the
 /// Maven model and the source inventory, and once the core stages and the
 /// downloader have reported it flips `ready` and closes the progress item.
-pub fn spawn(bus: &BusClient) {
-    let client = bus.labeled("project");
+pub fn spawn(hub: &HubClient) {
+    let client = hub.labeled("project");
     let mut rx = client.subscribe();
     tokio::spawn(async move {
         let mut root: Option<Url> = None;

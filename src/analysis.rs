@@ -5,7 +5,7 @@
 //! workspace-symbol queries.
 //!
 //! A concrete, synchronous, `Send + Sync` type: the analysis module
-//! ([`spawn`]) owns it on the engine bus, applying the editor's document
+//! ([`spawn`]) owns it on the engine hub, applying the editor's document
 //! notifications and answering the shell's query requests.
 //!
 //! Trees are rebuilt from the full document text on every `open`/`change`.
@@ -29,7 +29,7 @@ use tree_sitter::{Node, Parser, Tree};
 
 use crate::diagnostics::semantic_diagnostics_enabled;
 use crate::index::{extract_entries, java_parser, IndexHandle, IndexKind, NameLookup, SymbolEntry};
-use crate::messages::{AnalysisRequest, Bus, DriverMessage, Request, WatchedChange};
+use crate::messages::{AnalysisRequest, DriverMessage, Hub, Request, WatchedChange};
 use crate::types::{
     self, Member, ModelLayers, SourceLayerIndex, Ty, TypeInfo, TypeLookup, TypeModel, TypeQuery,
 };
@@ -4497,9 +4497,9 @@ fn offer(
 /// [`DriverMessage::AnalysisUpdated`], so the diagnostics sweep follows the
 /// index updates the core just sent. Each [`AnalysisRequest`] runs on the
 /// runtime's blocking pool, so a slow query never delays a later edit.
-pub fn spawn(bus: &crate::bus::BusClient, runtime: tokio::runtime::Handle) {
-    let client = bus.labeled("analysis");
-    let mut rx = client.serve(crate::bus::Module::Analysis);
+pub fn spawn(hub: &crate::hub::HubClient, runtime: tokio::runtime::Handle) {
+    let client = hub.labeled("analysis");
+    let mut rx = client.serve(crate::hub::Module::Analysis);
     let engine = Arc::new(TreeSitterEngine::with_index(client.clone()));
     std::thread::Builder::new()
         .name("java-lsp-analysis".to_string())
@@ -4509,16 +4509,16 @@ pub fn spawn(bus: &crate::bus::BusClient, runtime: tokio::runtime::Handle) {
         .spawn(move || {
             while let Some(message) = rx.blocking_recv() {
                 match message {
-                    Bus::Notify(message) => {
+                    Hub::Notify(message) => {
                         if apply_notification(&engine, message) {
                             client.notify(DriverMessage::AnalysisUpdated);
                         }
                     }
-                    Bus::Request(Request::Analysis(request)) => {
+                    Hub::Request(Request::Analysis(request)) => {
                         let engine = Arc::clone(&engine);
                         runtime.spawn_blocking(move || answer(&engine, request));
                     }
-                    Bus::Request(_) => {}
+                    Hub::Request(_) => {}
                 }
             }
         })

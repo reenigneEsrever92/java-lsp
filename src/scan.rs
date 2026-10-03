@@ -1,7 +1,7 @@
 //! The workspace source scanner: parses the project's `.java` files and
 //! publishes each file's index entries and its declared-type model.
 //!
-//! The scanner is its own module on the bus. It subscribes for the source
+//! The scanner is its own module on the hub. It subscribes for the source
 //! inventory the project driver emits, scans off the request path, and reports
 //! the `Sources` stage-done.
 
@@ -10,14 +10,14 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::bus::{next_notification, BusClient};
+use crate::hub::{next_notification, HubClient};
 use crate::index::{extract_entries, java_parser};
 use crate::messages::{DriverMessage, ProgressUpdate, Stage};
 
-/// Starts the source scanner on the bus: on the source inventory it parses each
+/// Starts the source scanner on the hub: on the source inventory it parses each
 /// file and emits its entries and model, then the `Sources` stage-done.
-pub fn spawn(bus: &BusClient) {
-    let client = bus.labeled("source");
+pub fn spawn(hub: &HubClient) {
+    let client = hub.labeled("source");
     let mut rx = client.subscribe();
     tokio::spawn(async move {
         while let Some(message) = next_notification(&mut rx).await {

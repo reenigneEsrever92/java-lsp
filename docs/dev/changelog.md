@@ -10,48 +10,65 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-10-03
+
+- **The engine bus is the engine hub** — `bus.rs` is `hub.rs`, `BusClient` is
+  `HubClient`, the received-message enum `Bus` is `Hub`, and the `hub` module,
+  `crate::hub`/`java_lsp::hub` paths, the `hub()` accessor and the
+  `RUST_LOG=java_lsp::hub=debug` log target all follow; no `bus` name remains.
+
+- **The document store is a hub client** — `DocumentStore` moves out of the shell
+  into the document module (`document.rs`, serving `Module::Document`): it
+  subscribes to `DocumentOpened`/`DocumentClosed`, applies the editor's
+  incremental edits on a `DocumentChange` request (returning the new text), and
+  answers a `DocumentText` request. The shell holds no document state;
+  `didChange` awaits the module before notifying, so an edit still lands before
+  the query the client sends at the new cursor. Verified by 299 library tests and
+  29 harness tests (the loopback-socket `sources` cases and one harness case
+  cannot bind in the sandbox).
+
 ## 2026-10-02
 
-- **Every module owns its own bus subscription** — the six warm-up drivers
+- **Every module owns its own hub subscription** — the six warm-up drivers
   (`project`, `dependency`, `source`, `jar`, `jdk`, `download`) are now their own
   modules (`project.rs`, `resolve.rs`, `scan.rs`, `jars.rs`, `jdk.rs`,
   `sources.rs`), each `spawn` labels itself, subscribes, and starts its own
   thread or task, and `engine.rs::start` is pure wiring (no labels, no
   `subscribe`/`serve`, no driver bodies). Verified by 299 library tests, 29
   harness tests, and the stdio smoke test. See
-  [Every module handles its own bus subscription](backlog/module-owned-bus-subscriptions.md).
+  [Every module handles its own hub subscription](backlog/module-owned-hub-subscriptions.md).
 
 ## 2026-10-01
 
-- **Every participant subscribes through its BusClient** — the hub starts
-  empty (`bus::spawn_hub`) and learns its participants at runtime:
-  `BusClient::subscribe()` for every notification, `serve(Module)` to also own
+- **Every participant subscribes through its HubClient** — the hub starts
+  empty (`hub::spawn_hub`) and learns its participants at runtime:
+  `HubClient::subscribe()` for every notification, `serve(Module)` to also own
   a module's requests. Modules and drivers take only their client; the drivers
-  now receive `Bus` like the modules. `engine::start` is the one setup path,
+  now receive `Hub` like the modules. `engine::start` is the one setup path,
   building the hub and every participant, the server included. A second owner
   is logged and ignored, and dropped receivers are pruned. `spawn_router`,
-  `bus::channel` and the hand-wired channels are gone. Verified by 299 library
+  `hub::channel` and the hand-wired channels are gone. Verified by 299 library
   tests, 29 harness tests, and the stdio smoke test. See
-  [Every participant subscribes to the bus through its BusClient](backlog/summary.md#every-participant-subscribes-to-the-bus-through-its-busclient).
+  [Every participant subscribes to the hub through its HubClient](backlog/summary.md#every-participant-subscribes-to-the-hub-through-its-hubclient).
 
-- **Bus requests return an awaitable reply** — every `BusClient` request now
+- **Hub requests return an awaitable reply** — every `HubClient` request now
   returns a `Reply<R>` (a thin wrapper over a tokio oneshot receiver): the shell
   and tokio tests `.await` it, the synchronous analysis, diagnostics and
   quick-fix code calls `blocking_recv()`. The closure-built requests, the boxed
   reply deliverer, the `std`-channel blocking path and the `_async` method twins
   are gone. Verified by 297 library tests, 29 harness tests, and the stdio smoke
-  test. See [Bus requests return an awaitable reply receiver](backlog/summary.md#bus-requests-return-an-awaitable-reply-receiver).
+  test. See [Hub requests return an awaitable reply receiver](backlog/summary.md#hub-requests-return-an-awaitable-reply-receiver).
 
-- **The LSP shell is just another bus client** — `JavaLanguageServer` holds a
-  `BusClient`: it notifies `DocumentOpened/Changed/Closed`, `FolderAdded`,
+- **The LSP shell is just another hub client** — `JavaLanguageServer` holds a
+  `HubClient`: it notifies `DocumentOpened/Changed/Closed`, `FolderAdded`,
   `FileEvent`, and `ClientCapabilities`, awaits `Request::Analysis(…)` queries
   answered by the new analysis module (`analysis::spawn_module`), and renders
-  `Diagnostics`/`Progress`/`Notice` from its own bus channel; `Command`,
+  `Diagnostics`/`Progress`/`Notice` from its own hub channel; `Command`,
   `EngineHandle`, `EngineEvent`, the dispatcher, and `messages::translate` are
   gone, the diagnostics sweep runs on the new `AnalysisUpdated`, and the close
   clear comes from the diagnostics module. Verified by 297 library tests, 29
   harness tests, and the stdio smoke test. See
-  [Make the LSP shell just another bus client](backlog/summary.md#make-the-lsp-shell-just-another-bus-client).
+  [Make the LSP shell just another hub client](backlog/summary.md#make-the-lsp-shell-just-another-hub-client).
 
 - **Go-to-declaration** — `initialize` now advertises `declarationProvider` and
   `textDocument/declaration` is answered by the go-to-definition resolution
@@ -97,7 +114,7 @@ named change.
   one guarded file per archive, read only when that archive is needed and written
   only when it is reparsed; the legacy file is dropped on first use. See
   [Cache each archive's parse in its own file, read on demand](backlog/summary.md#cache-each-archives-parse-in-its-own-file-read-on-demand).
-- **The hub debug log no longer floods with per-item lines** — `src/bus.rs` logs
+- **The hub debug log no longer floods with per-item lines** — `src/hub.rs` logs
   the high-cardinality per-item notifications (`SourceFile`, `BaseArtifact`,
   `Progress`, …) at `trace` and the rest at `debug`, and the extraction progress
   is emitted ~5 % of the way instead of per archive. See
@@ -137,32 +154,32 @@ named change.
 - **Dependency sources are one base artifact per jar** — `src/sources.rs`'s
   `index_extracted` now publishes a single `BaseArtifact` for a whole sources jar
   (keyed by the sources-jar URI) instead of one per extracted `.java` file, so the
-  bus, the hub log, and the index base no longer grow per file. See
+  hub, the hub log, and the index base no longer grow per file. See
   [Publish each dependency's sources as one base artifact, not one per file](backlog/summary.md#publish-each-dependencys-sources-as-one-base-artifact-not-one-per-file).
 - **The hub no longer logs a reply for an unanswered request** — the reply line in
-  `src/bus.rs` is emitted only for a real reply (`deliver.is_some()`), not for a
+  `src/hub.rs` is emitted only for a real reply (`deliver.is_some()`), not for a
   dropped request, and `docs/architecture.md`'s index bullet now describes the
   request/reply round-trip accurately. See
   [Stop the hub logging a reply for an unanswered request](backlog/summary.md#stop-the-hub-logging-a-reply-for-an-unanswered-request).
 - **The hub log names the sender and times replies** — each `debug` line from
-  the hub (`src/bus.rs`) is prefixed `sender=<label>` (the core, the dispatcher,
+  the hub (`src/hub.rs`) is prefixed `sender=<label>` (the core, the dispatcher,
   the six drivers, the diagnostics, and the quick fixes each name themselves),
   and a request's reply is routed back through the hub and logged as
   `sender=<owner> reply to=<requester> … elapsed=<ms>`. See
   [Identify the sender, replies, and reply latency in the hub log](backlog/summary.md#identify-the-sender-replies-and-reply-latency-in-the-hub-log).
-- **The hub logs every bus message** — `src/bus.rs` logs each notification and
-  request passing through the hub at `debug` (`RUST_LOG=java_lsp::bus=debug`),
+- **The hub logs every hub message** — `src/hub.rs` logs each notification and
+  request passing through the hub at `debug` (`RUST_LOG=java_lsp::hub=debug`),
   with a concise description (identifiers and counts, never a payload). See
-  [One engine bus with broadcast notifications and hub-routed request/response](backlog/summary.md#one-engine-bus-with-broadcast-notifications-and-hub-routed-requestresponse).
+  [One engine hub with broadcast notifications and hub-routed request/response](backlog/summary.md#one-engine-hub-with-broadcast-notifications-and-hub-routed-requestresponse).
 
 ## 2026-09-29
 
-- **One engine bus** — every module (the drivers, the index, the diagnostics, the
-  quick fixes, and the core) now speaks a single bus (`src/bus.rs`): notifications
+- **One engine hub** — every module (the drivers, the index, the diagnostics, the
+  quick fixes, and the core) now speaks a single hub (`src/hub.rs`): notifications
   are broadcast to every module, and a request is routed by the hub thread to the
   module that owns it. The per-module `IndexHandle`, `DiagnosticsHandle`,
   `QuickFixHandle`, and the filesystem driver are gone. See
-  [One engine bus with broadcast notifications and hub-routed request/response](backlog/summary.md#one-engine-bus-with-broadcast-notifications-and-hub-routed-requestresponse).
+  [One engine hub with broadcast notifications and hub-routed request/response](backlog/summary.md#one-engine-hub-with-broadcast-notifications-and-hub-routed-requestresponse).
 - **A quick-fix subsystem, a queryable diagnostics cache, and a prefix-ordered
   index** — `src/quickfix.rs` now generates the create/import/rename fixes from
   its own parse, querying the symbol index and a new diagnostics cache
@@ -201,14 +218,14 @@ named change.
   no same-kind sibling is dropped, and `src/messages.rs` compiles again. See
   [Member completion after a dot is empty for dotted nested-type receivers and partial type names](backlog/summary.md#member-completion-after-a-dot-is-empty-for-dotted-nested-type-receivers-and-partial-type-names).
 
-- **Route every subsystem through one engine-owned message bus** — all messages
+- **Route every subsystem through one engine-owned message hub** — all messages
   now live in `src/messages.rs`, the `Reporter` indirection is gone, and every
   subsystem (filesystem, project walk, dependency resolution, source scan, jar and
   JDK indexing, source download) is a driver spawned at start that speaks only
   `DriverMessage`; the engine hub applies the index-affecting ones and is the sole
   emitter of the warm-up's client events, so discovery is message-based and
   nothing else mutates the index or talks to the editor. See
-  [Make every subsystem a message-driven driver on one engine-owned bus](backlog/summary.md#make-every-subsystem-a-message-driven-driver-on-one-engine-owned-bus).
+  [Make every subsystem a message-driven driver on one engine-owned hub](backlog/summary.md#make-every-subsystem-a-message-driven-driver-on-one-engine-owned-hub).
 
 - **Model a source enum's members** — an enum's constants and the fields,
   methods, and constructors in its `;`-introduced declaration section are now

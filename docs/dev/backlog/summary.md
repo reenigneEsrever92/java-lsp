@@ -29,7 +29,7 @@ retired here as a compact section and the original is deleted; the
 - The JDK keeps one key for the whole JDK — it is small and indexed as a unit.
 - Drop the legacy `<kind>.json` on first use — it could be 3.7 GB and is no longer read.
 
-**Acceptance criteria** — No code path loads or rewrites a whole-kind cache (a warm run writes nothing); a hit is guarded by version + identity, a miss reparses to unchanged answers; build/`fmt --check` clean and `base_cache`/`bus`/`sources` tests pass.
+**Acceptance criteria** — No code path loads or rewrites a whole-kind cache (a warm run writes nothing); a hit is guarded by version + identity, a miss reparses to unchanged answers; build/`fmt --check` clean and `base_cache`/`hub`/`sources` tests pass.
 
 ## Keep the hub debug log readable and emit progress in steps
 
@@ -46,43 +46,43 @@ retired here as a compact section and the original is deleted; the
 - Progress in ~5% steps (`progress_step = (total / 20).max(1)`, plus the final total) — enough to see it move, ~20 lines not thousands.
 - Timing `Log` lines stay at `debug` — they are `Log`, not `Progress`, so the per-phase split stays visible.
 
-**Acceptance criteria** — `RUST_LOG=java_lsp::bus=debug` no longer prints a line per source file/artifact/progress tick while the flow and timing lines remain; `=trace` still prints every message; the extraction pass emits ~20 progress updates; build/`fmt --check` clean and `bus`/`sources` tests pass.
+**Acceptance criteria** — `RUST_LOG=java_lsp::hub=debug` no longer prints a line per source file/artifact/progress tick while the flow and timing lines remain; `=trace` still prints every message; the extraction pass emits ~20 progress updates; build/`fmt --check` clean and `hub`/`sources` tests pass.
 
-## Bus requests return an awaitable reply receiver
+## Hub requests return an awaitable reply receiver
 
 `kind: refactor` · `state: done` · `priority: low` · `owner: felix` · finished 2026-10-01
 
-**Problem** — `BusClient` had two callback-built request paths plus per-method `_async` copies, and a boxed reply deliverer that made the request flow hard to read.
+**Problem** — `HubClient` had two callback-built request paths plus per-method `_async` copies, and a boxed reply deliverer that made the request flow hard to read.
 
-**Proposal** — Every `BusClient` request returns a `Reply<R>`, a newtype over a `tokio::sync::oneshot::Receiver<R>` implementing `Future` with a `blocking_recv()` for synchronous callers; `ReplyHandle` carries the oneshot sender and the client builds requests directly.
+**Proposal** — Every `HubClient` request returns a `Reply<R>`, a newtype over a `tokio::sync::oneshot::Receiver<R>` implementing `Future` with a `blocking_recv()` for synchronous callers; `ReplyHandle` carries the oneshot sender and the client builds requests directly.
 
 **Decisions**
 
 - Synchronous callers stay synchronous (option A) — the deep recursive tree-sitter walks already run off the runtime's workers and just `blocking_recv` at the call site; making them `async` was a large rewrite for no gain.
-- A thin `Reply<R>` wrapper, not a bare receiver — keeps the bus contract that an unanswered request or gone bus resolves to `R::default()`.
+- A thin `Reply<R>` wrapper, not a bare receiver — keeps the hub contract that an unanswered request or gone hub resolves to `R::default()`.
 - The reply still rides the hub — `ReplyHandle::send` posts through the hub (logging and timing it) before the oneshot, keeping type-erased `Inbound::Reply` delivery.
 - The `_async` methods are gone — `code_actions`, `all_symbols`, and `ready` serve both caller kinds, behaviour unchanged.
 
-**Acceptance criteria** — `BusClient` has no blocking request method, no `request_async`, and no `_async` methods; every request returns `Reply<R>`; `ReplyHandle` holds a `oneshot::Sender<R>` (std mpsc delivery gone); async callers await, sync modules `blocking_recv`; existing tests pass unchanged in behaviour.
+**Acceptance criteria** — `HubClient` has no blocking request method, no `request_async`, and no `_async` methods; every request returns `Reply<R>`; `ReplyHandle` holds a `oneshot::Sender<R>` (std mpsc delivery gone); async callers await, sync modules `blocking_recv`; existing tests pass unchanged in behaviour.
 
-## Every participant subscribes to the bus through its BusClient
+## Every participant subscribes to the hub through its HubClient
 
 `kind: refactor` · `state: done` · `priority: medium` · `owner: felix` · finished 2026-10-01
 
 **Problem** — The hub's routing table was fixed at `spawn_router` start, forcing `engine::spawn` and the server to pre-create a channel per module and driver and thread receivers through every spawn function.
 
-**Proposal** — Start the hub empty (`bus::spawn_hub() -> BusClient`) and let participants register at runtime via `client.subscribe()` / `client.serve(Module::X)`; one `engine::start(lsp_client) -> JavaLanguageServer` builds the hub and every participant, server included.
+**Proposal** — Start the hub empty (`hub::spawn_hub() -> HubClient`) and let participants register at runtime via `client.subscribe()` / `client.serve(Module::X)`; one `engine::start(lsp_client) -> JavaLanguageServer` builds the hub and every participant, server included.
 
 **Decisions**
 
-- One message type for everyone — drivers receive `Bus` like modules and match `Bus::Notify` (a driver never serves a module).
-- One setup function builds everything, the server included — `engine::start` starts the hub, builds the server (which subscribes on its own client), then the modules and drivers; `JavaLanguageServer::new` takes the LSP client and its `BusClient`.
+- One message type for everyone — drivers receive `Hub` like modules and match `Hub::Notify` (a driver never serves a module).
+- One setup function builds everything, the server included — `engine::start` starts the hub, builds the server (which subscribes on its own client), then the modules and drivers; `JavaLanguageServer::new` takes the LSP client and its `HubClient`.
 - No message is lost — every participant subscribes synchronously in its spawn function over the hub's FIFO inbound channel before sending; the listening drivers subscribe, the JDK driver does not.
 - A second owner is a wiring bug — log an error and keep the first owner; the newcomer still receives notifications (a panic would kill the hub thread).
 - Dropped receivers are pruned — a failed send or closed owner is removed, and its requests then resolve to the default reply.
 - Behaviour is unchanged — same participants, labels, and FIFO ordering; each subscription logs at `debug`.
 
-**Acceptance criteria** — `spawn_router`, `bus::channel`, and every module/driver `rx` parameter are gone (`spawn_module` takes only a client, plus the runtime handle for analysis); `BusClient::subscribe`/`serve` exist with first-owner-wins and pruning; `engine::start` is the single setup path and `JavaLanguageServer::new` no longer starts the engine; `cargo build --all-targets` warning-free and `cargo test` passes.
+**Acceptance criteria** — `spawn_router`, `hub::channel`, and every module/driver `rx` parameter are gone (`spawn_module` takes only a client, plus the runtime handle for analysis); `HubClient::subscribe`/`serve` exist with first-owner-wins and pruning; `engine::start` is the single setup path and `JavaLanguageServer::new` no longer starts the engine; `cargo build --all-targets` warning-free and `cargo test` passes.
 
 ## Do not rewrite dependency sources already extracted to the cache
 
@@ -98,13 +98,13 @@ retired here as a compact section and the original is deleted; the
 - Directory creation deduped per artifact — distinct artifacts extract to distinct `<group>/<id>/<version>` subtrees, so per-artifact dedupe is complete.
 - The `write` phase timing now shows the saving — `Timers::write` covers the (usually skipped) directory + file I/O.
 
-**Acceptance criteria** — On a warm cache the `write` phase is ~0 versus seconds cold, with extracted files still present and correct; build/`fmt --check` clean and `sources`/`bus` tests pass.
+**Acceptance criteria** — On a warm cache the `write` phase is ~0 versus seconds cold, with extracted files still present and correct; build/`fmt --check` clean and `sources`/`hub` tests pass.
 
 ## Batch and cache the diagnostics pass's index queries
 
 `kind: improvement` · `state: done` · `priority: medium` · `owner: felix` · finished 2026-10-01
 
-**Problem** — The semantic diagnostics pass issued an `IndexQueryName` bus round trip per lookup, several per type reference, repeated for every open document and every keystroke-triggered sweep.
+**Problem** — The semantic diagnostics pass issued an `IndexQueryName` hub round trip per lookup, several per type reference, repeated for every open document and every keystroke-triggered sweep.
 
 **Proposal** — Give the pass a per-sweep name cache with batched prefetch (`Request::IndexQueryNames`, `Request::IndexHasPackages`) and fetch `ready`/`type_model`/`type_layers` once per sweep; diagnostics output unchanged.
 
@@ -117,7 +117,7 @@ retired here as a compact section and the original is deleted; the
 - `import_edit` takes a trait abstraction (`query_name`) instead of `&IndexHandle` — diagnostics reads through the cache while completion call sites keep the handle unchanged.
 - Out of scope — re-checking only the changed document, filtering non-Java `FileEvent`s, and moving these requests to `trace`.
 - Noted, not fixed — a burst of edits triggers one sweep per message (the module does not drain the queue), contradicting the architecture's collapsed-sweep claim.
-- Measured by a bus-log test using the `tracing`-capture approach — no new benchmark.
+- Measured by a hub-log test using the `tracing`-capture approach — no new benchmark.
 
 **Acceptance criteria** — Existing diagnostics and quick-fix tests pass unchanged; a two-document sweep emits exactly one `IndexQueryNames`, at most one `IndexHasPackages`, no repeated `IndexQueryName`, and one `IndexReady`/`IndexTypeModel`/`IndexTypeLayers`, while a semantic-off sweep sends no name/ready/type-model requests; the new requests log as `count=N` and their replies log like any other request; build/`fmt --check`/`test` clean.
 
@@ -132,7 +132,7 @@ retired here as a compact section and the original is deleted; the
 **Decisions**
 
 - Counts by kind plus approximate bytes, not exact — the split between entries and the type model is what matters.
-- Logged by the index module at `target: "java_lsp::bus"` — the module has no bus client and the hub must not block on its own request, so it logs directly under the existing debug filter.
+- Logged by the index module at `target: "java_lsp::hub"` — the module has no hub client and the hub must not block on its own request, so it logs directly under the existing debug filter.
 - At `Ready` and `StageDone(Downloads)` — the delta shows how much extracted library sources add on top of jars/JDK.
 - Measurement only, no behaviour change.
 
@@ -152,29 +152,29 @@ retired here as a compact section and the original is deleted; the
 - A shared helper on `index.rs`, not an inline `retain` — both library passes need it and its doc records why imports are safe to drop.
 - `kind: improvement` — it removes wasted work/storage without changing what any feature answers.
 
-**Acceptance criteria** — The dependency-source and JDK passes store no `IndexKind::Import` entries while workspace extraction still does; the two workspace-import `index` tests pass unchanged; build/`fmt --check` clean and `index`/`bus`/`base_cache`/non-network `sources` tests pass with `tests/example_features.rs` green; the composition line's `imports=` count drops from ~2.9M toward zero with other counts unchanged.
+**Acceptance criteria** — The dependency-source and JDK passes store no `IndexKind::Import` entries while workspace extraction still does; the two workspace-import `index` tests pass unchanged; build/`fmt --check` clean and `index`/`hub`/`base_cache`/non-network `sources` tests pass with `tests/example_features.rs` green; the composition line's `imports=` count drops from ~2.9M toward zero with other counts unchanged.
 
-## Make the LSP shell just another bus client
+## Make the LSP shell just another hub client
 
 `kind: refactor` · `state: done` · `priority: medium` · `owner: felix` · finished 2026-10-01
 
-**Problem** — The shell still reached the engine over bespoke `EngineHandle`/`Command`/`EngineEvent` channels and the `engine::dispatch` task, leaving it the one component that was not a bus module and putting editor knowledge in the hub.
+**Problem** — The shell still reached the engine over bespoke `EngineHandle`/`Command`/`EngineEvent` channels and the `engine::dispatch` task, leaving it the one component that was not a hub module and putting editor knowledge in the hub.
 
-**Proposal** — Give the shell a `BusClient` labeled `server`, register it as a module, and send its lifecycle/root/watched-file/capability notifications and all queries as bus messages; add a new `Module::Analysis` wrapping `TreeSitterEngine` that owns the query requests, and delete `Command`, `EngineHandle`, `EngineEvent`, `dispatch`, and `translate`.
+**Proposal** — Give the shell a `HubClient` labeled `server`, register it as a module, and send its lifecycle/root/watched-file/capability notifications and all queries as hub messages; add a new `Module::Analysis` wrapping `TreeSitterEngine` that owns the query requests, and delete `Command`, `EngineHandle`, `EngineEvent`, `dispatch`, and `translate`.
 
 **Decisions**
 
-- The shell is a peer module and the core is a request-owning module — one vocabulary and one mechanism for every component; `DocumentStore` stays in the shell as turning incremental LSP edits into text is LSP-specific.
-- Async requests on `BusClient` — handlers are async and the harness runs a current-thread runtime, so the shell awaits a `tokio` oneshot while blocking callers are kept.
+- The shell is a peer module and the core is a request-owning module — one vocabulary and one mechanism for every component; `DocumentStore` stays in the shell as turning incremental LSP edits into text is LSP-specific. Superseded 2026-10-03: `DocumentStore` moved into the document module, a hub client (`document.rs`), so the shell holds no document state; see the [changelog](../changelog.md).
+- Async requests on `HubClient` — handlers are async and the harness runs a current-thread runtime, so the shell awaits a `tokio` oneshot while blocking callers are kept.
 - The Analysis module runs on its own thread with queries on the blocking pool — matches index/diagnostics, and ordering holds via the FIFO hub and module channel.
 - The hub becomes neutral — no `events` sender, no `translate`; the hub renders `Log`/`Summary`, while the shell renders `Diagnostics`, `Progress`, and `Notice`.
 - The diagnostics module clears a closed document — it emits `Diagnostics { version: None }` on `DocumentClosed` and the shell publishes no clear.
-- Naming and test hooks — `engine.rs` keeps its name as wiring + drivers, `engine()` becomes `bus()`, the dead `TreeSitterEngine.events`/`set_events` is deleted.
+- Naming and test hooks — `engine.rs` keeps its name as wiring + drivers, `engine()` becomes `hub()`, the dead `TreeSitterEngine.events`/`set_events` is deleted.
 - Behaviour preserved — LSP surface, diagnostics (including clear on close and republish), progress, notices, watcher registration, and warm-up are unchanged.
 - The diagnostics sweep follows `AnalysisUpdated` — the analysis module notifies it after applying an edit so the sweep reads an index holding the edit.
 - The analysis thread gets the runtime's stack size — `RUNTIME_STACK_SIZE` moves to `lib.rs` to avoid reintroducing the stack-overflow abort.
 
-**Acceptance criteria** — `JavaLanguageServer` holds a `BusClient` and bus channel with no `EngineHandle`; `Command`, `EngineHandle`, `EngineEvent`, `dispatch`, and `translate` no longer exist and `spawn_router` takes no editor sender; `Module::Analysis` owns the query requests with the hub naming `analysis` as responder; `BusClient` offers both blocking and async requests; closing a document clears diagnostics via the diagnostics module; `TreeSitterEngine.events`/`set_events` is gone; build is warning-free and library, harness, and `stdio_smoke` tests pass; an edit immediately followed by a query at the new position sees the edit.
+**Acceptance criteria** — `JavaLanguageServer` holds a `HubClient` and hub channel with no `EngineHandle`; `Command`, `EngineHandle`, `EngineEvent`, `dispatch`, and `translate` no longer exist and `spawn_router` takes no editor sender; `Module::Analysis` owns the query requests with the hub naming `analysis` as responder; `HubClient` offers both blocking and async requests; closing a document clears diagnostics via the diagnostics module; `TreeSitterEngine.events`/`set_events` is gone; build is warning-free and library, harness, and `stdio_smoke` tests pass; an edit immediately followed by a query at the new position sees the edit.
 
 ## Log per-phase timings for the dependency-source pass
 
@@ -190,9 +190,9 @@ retired here as a compact section and the original is deleted; the
 - `inflate` is measured as `for_each_zip_entry` wall time minus callback time — the callback-owned phases are direct, the remainder is the reader.
 - Always on — a handful of `Instant::now` per file is negligible against what it measures.
 - Logged periodically, not only at the end — every 200 archives and once at the end, each line named `(attempted/total archives)`.
-- The lines are `DriverMessage::Log` — they surface on `java_lsp::bus` debug and `java_lsp::messages` info (note `RUST_LOG=java_lsp=debug` is needed to see both).
+- The lines are `DriverMessage::Log` — they surface on `java_lsp::hub` debug and `java_lsp::messages` info (note `RUST_LOG=java_lsp=debug` is needed to see both).
 
-**Acceptance criteria** — A warm-up logs the fetch line and the extract phase line periodically (every 200 archives) and once at the end, with phases summing to roughly the pass wall clock times the worker count; build/`fmt --check` clean and `sources`/`bus` tests pass.
+**Acceptance criteria** — A warm-up logs the fetch line and the extract phase line periodically (every 200 archives) and once at the end, with phases summing to roughly the pass wall clock times the worker count; build/`fmt --check` clean and `sources`/`hub` tests pass.
 
 ## Extract and parse dependency sources across worker threads
 
@@ -210,7 +210,7 @@ retired here as a compact section and the original is deleted; the
 - Extract the per-artifact body into `index_one` returning an `Extracted` enum — safe to run off the calling thread.
 - Worker count is `min(available_parallelism(), artifacts.len())` — a one-artifact run spawns no thread.
 
-**Acceptance criteria** — artifacts extract/parse concurrently with one parser per worker and emission only from the calling thread; published messages are unchanged (`RemoveBase` + `BaseArtifact` per artifact, same progress/indexing sequence); the 30-jar measurement drops from ~18.7 s to a few seconds; `cargo build`/`fmt --check` clean and `sources`/`bus` tests pass.
+**Acceptance criteria** — artifacts extract/parse concurrently with one parser per worker and emission only from the calling thread; published messages are unchanged (`RemoveBase` + `BaseArtifact` per artifact, same progress/indexing sequence); the 30-jar measurement drops from ~18.7 s to a few seconds; `cargo build`/`fmt --check` clean and `sources`/`hub` tests pass.
 
 ## Make byte-offset to LSP position conversion linear, not quadratic, per file
 
@@ -239,7 +239,7 @@ retired here as a compact section and the original is deleted; the
 
 **Decisions**
 
-- Scope is the `message-hub-log-sender` work only — the wider `unified-bus`/`quickfix-subsystem` refactor is already captured elsewhere.
+- Scope is the `message-hub-log-sender` work only — the wider `unified-hub`/`quickfix-subsystem` refactor is already captured elsewhere.
 - Kind is `bug` — the dominant finding asserts something false.
 - One request covers findings 1–3 — the doc correction and test are caused by the same behaviour.
 - Detect a cancellation by `deliver` (`is_some()`), not a new flag — the distinction already exists in the protocol.
@@ -251,29 +251,29 @@ retired here as a compact section and the original is deleted; the
 
 `kind: improvement` · `state: done` · `priority: low` · `owner: felix` · finished 2026-09-30
 
-**Problem** — Hub log lines named only the message, not its sender (all clients shared one identity-less `BusClient`), and replies bypassed the hub entirely, so the request/response path was invisible and unmeasured.
+**Problem** — Hub log lines named only the message, not its sender (all clients shared one identity-less `HubClient`), and replies bypassed the hub entirely, so the request/response path was invisible and unmeasured.
 
-**Proposal** — Give every `BusClient` a name, wrap the hub's inbound in an envelope, and route replies back through the hub to log each request/reply pair with round-trip time.
+**Proposal** — Give every `HubClient` a name, wrap the hub's inbound in an envelope, and route replies back through the hub to log each request/reply pair with round-trip time.
 
 **Decisions**
 
-- The label is a free-form `String` set by each client — lets a client name itself without enumerating senders in the bus type.
+- The label is a free-form `String` set by each client — lets a client name itself without enumerating senders in the hub type.
 - Every sender is distinct (`core`, `dispatch`, the six drivers, `diagnostics`, `quickfix`), splitting the core and dispatcher that shared one client — makes each origin attributable.
-- The hub inbound channel is an envelope (`Notify`/`Request`/`Reply`) while the module-facing `Bus` is unchanged — leaves all module match arms untouched.
-- Log shape prefixed `sender=<label>`, replies as `sender=<owner> reply to=<requester> <desc> elapsed=<ms>` — still debug-gated, target `java_lsp::bus`, never a payload.
+- The hub inbound channel is an envelope (`Notify`/`Request`/`Reply`) while the module-facing `Hub` is unchanged — leaves all module match arms untouched.
+- Log shape prefixed `sender=<label>`, replies as `sender=<owner> reply to=<requester> <desc> elapsed=<ms>` — still debug-gated, target `java_lsp::hub`, never a payload.
 - Route replies through the hub and time them there — makes the hub the single observer/timer, at the cost of a second hop per request even when logging is off.
 - Change each `Request`'s `reply` field to `ReplyHandle<R>` whose `send(self, value)` consumes the handle — call sites stay textually unchanged.
 - A dropped `Reply` posts a cancellation so the hub drops the pending entry — keeps the pending map from leaking.
 - Labels are not asserted in tests — the improvement is verified by their presence and correctness.
 - Out of scope: shell `Command`s and per-message payload rendering.
 
-**Acceptance criteria** — every hub line carries a `sender=<label>`, with distinct labels for the ten senders; each request/reply yields a matching reply line with elapsed time and unanswered requests yield none; the module-facing `Bus`, `channel()`, and match arms are unchanged; logging stays debug-gated and payload-free; existing behaviour and the test suite are preserved.
+**Acceptance criteria** — every hub line carries a `sender=<label>`, with distinct labels for the ten senders; each request/reply yields a matching reply line with elapsed time and unanswered requests yield none; the module-facing `Hub`, `channel()`, and match arms are unchanged; logging stays debug-gated and payload-free; existing behaviour and the test suite are preserved.
 
 ## Publish each dependency's sources as one base artifact, not one per file
 
 `kind: improvement` · `state: done` · `priority: low` · `owner: felix` · finished 2026-09-30
 
-**Problem** — `index_extracted` emitted one `BaseArtifact` per extracted `.java` file, flooding the bus, hub log, and base with thousands of messages/layers for one dependency, contradicting the documented "one layer per artifact URI" model.
+**Problem** — `index_extracted` emitted one `BaseArtifact` per extracted `.java` file, flooding the hub, hub log, and base with thousands of messages/layers for one dependency, contradicting the documented "one layer per artifact URI" model.
 
 **Proposal** — Accumulate each artifact's entries and type infos into a single `BaseArtifact` keyed by the sources-jar URI, with the class-jar `RemoveBase` still emitted first.
 
@@ -316,7 +316,7 @@ retired here as a compact section and the original is deleted; the
 
 - Per-archive progress in the extraction loop, in the same `x/N` + percentage shape as `Fetched x/N` — the two phases should look alike and the count reaches N/N.
 - Emitted after each archive, with skip paths moved into a labeled block — keeps the bar honest and fires the line for every archive.
-- No new message types or bus changes — progress rides the existing `DriverMessage::Progress`.
+- No new message types or hub changes — progress rides the existing `DriverMessage::Progress`.
 - Out of scope: the fetch phase's already-adequate reporting and the per-artifact `debug` lines.
 
 **Acceptance criteria** — one `Progress(Update)` per artifact, `Parsed x/N …`, with `x` running `1..=N` and the percentage reaching 100 on the last; start/end messages unchanged; a server-free test asserts the per-archive update; build/fmt clean and `sources` tests pass.
@@ -376,25 +376,25 @@ retired here as a compact section and the original is deleted; the
 
 **Acceptance criteria** — `src/main.rs` builds the runtime via `Builder` with `.thread_stack_size(..)` that applies with `RUST_MIN_STACK` unset; the reported reproduction no longer aborts and analysis still answers; `cargo test --all-targets` stays green; the chosen size and rationale are commented at the construction.
 
-## One engine bus with broadcast notifications and hub-routed request/response
+## One engine hub with broadcast notifications and hub-routed request/response
 
 `kind: refactor` · `state: done` · `priority: high` · `owner: felix` · finished 2026-09-29
 
 **Problem** — After the subsystem extractions, modules still communicated through bespoke channels and cross-module handles, so "each module encapsulated, communicating by message" held only in spirit and every new interaction meant new wiring.
 
-**Proposal** — Replace the per-module channels and handles with a single bus: the hub broadcasts notifications to every module and routes each request to the one module that owns it, with the reply on the same bus.
+**Proposal** — Replace the per-module channels and handles with a single hub: the hub broadcasts notifications to every module and routes each request to the one module that owns it, with the reply on the same hub.
 
 **Decisions**
 
-- One message module, one client, one router — `Bus`, `Request`, and `translate` in `messages.rs`; `BusClient` and `spawn_router` in `bus.rs`.
+- One message module, one client, one router — `Hub`, `Request`, and `translate` in `messages.rs`; `HubClient` and `spawn_router` in `hub.rs`.
 - The hub is a thread, not a task — a blocking request from a runtime worker would deadlock a current-thread runtime (the harness).
-- The index is a bus module — `IndexHandle` becomes `BusClient`; its applying code stays with the module.
-- Diagnostics and quick fixes are bus modules owning their own parser and buffers, answering their requests; `DiagnosticsHandle`, `QuickFixHandle`, and `FsInput` are gone.
+- The index is a hub module — `IndexHandle` becomes `HubClient`; its applying code stays with the module.
+- Diagnostics and quick fixes are hub modules owning their own parser and buffers, answering their requests; `DiagnosticsHandle`, `QuickFixHandle`, and `FsInput` are gone.
 - File events and the root become notifications, removing the filesystem driver and `FsInput`.
-- The core keeps its synchronous algorithms, with only its index access moved onto the bus — safe because the hub is a thread.
+- The core keeps its synchronous algorithms, with only its index access moved onto the hub — safe because the hub is a thread.
 - Behaviour preserved — the same index, diagnostics, and quick fixes, with targeted tests passing.
 
-**Acceptance criteria** — one `BusClient`/router used by all drivers, modules, and the core; notifications reach every module and each request is answered only by its owner; subsystems hold no other module's handle and the retired handles/driver are gone; `cargo build` clean and targeted tests pass.
+**Acceptance criteria** — one `HubClient`/router used by all drivers, modules, and the core; notifications reach every module and each request is answered only by its owner; subsystems hold no other module's handle and the retired handles/driver are gone; `cargo build` clean and targeted tests pass.
 
 ## Cache the class-file base across warm-ups
 
@@ -432,7 +432,7 @@ retired here as a compact section and the original is deleted; the
 
 **Acceptance criteria** — Build and tests compile cleanly; `Greeter.Inner.` offers statics (`CONST`) and `Greeter.Inner.CON…` narrows while `i.` still offers instance members; while typing `Greeter.Inn`, `SumType.T…`, and their `new` forms the qualifier's nested types/members are offered narrowed by prefix; `SumType.`/`SumType.T…`/`new SumType.T…` offer `Type1..Type4` and an instance offers `val`; `java.util.Li` offers `List`; existing controls stay green; two same-kind nested types are both offered; regression tests cover each in `src/analysis.rs` and `src/types.rs`.
 
-## Make every subsystem a message-driven driver on one engine-owned bus
+## Make every subsystem a message-driven driver on one engine-owned hub
 
 `kind: refactor` · `state: done` · `priority: high` · `owner: felix` · finished 2026-09-28
 
@@ -442,10 +442,10 @@ retired here as a compact section and the original is deleted; the
 
 **Decisions**
 
-- One engine-owned module defines the whole vocabulary (`Command`, bus messages, `EngineEvent`, reporting types) and `Reporter` is deleted — the boundary is defined and changed in one place.
+- One engine-owned module defines the whole vocabulary (`Command`, hub messages, `EngineEvent`, reporting types) and `Reporter` is deleted — the boundary is defined and changed in one place.
 - The engine is a dumb broadcast hub, not a router; each driver self-selects by variant — adding a driver changes neither the engine nor other drivers.
 - The engine is the sole translator to the editor, with `apply_message` moved from `src/index.rs` into the engine module — only the engine sends reporting.
-- Discovery dissolves: the project driver walks and derives, the dependency driver resolves, and model/files/artifacts ride the bus — removing the last non-message path and the one index mutation outside the writer.
+- Discovery dissolves: the project driver walks and derives, the dependency driver resolves, and model/files/artifacts ride the hub — removing the last non-message path and the one index mutation outside the writer.
 - The filesystem driver emits the root as an added-folder message and relays client watched-file events, never enumerating or OS-watching — no new dependency and the project driver owns the walk.
 - The model is dynamic: a folder added after start recomputes and updates its dependents — a correctness property to preserve, not an optimization to chase.
 - Behaviour is preserved: identical final index/model, `ready`, summary line, progress/notice surface, and diagnostics gating.

@@ -1,12 +1,12 @@
 ---
 type: ChangeRequest
 kind: refactor
-title: Every module handles its own bus subscription
+title: Every module handles its own hub subscription
 description: Move the six warm-up drivers out of engine.rs into one module each, and have every module label, subscribe, and start itself, so engine.rs is pure wiring and the warm-up producers stop leaking as pub(crate).
 state: done
 verified: { by: felix, at: 2026-10-02T16:05:00Z }
 priority: medium
-tags: [dev, refactor, bus]
+tags: [dev, refactor, hub]
 owner: felix
 ---
 
@@ -22,7 +22,7 @@ are the outlier: a module's own subscription sits in the engine, far from the
 work it drives.
 
 The cost is twofold. `engine.rs` grows with each participant and knows each
-driver's bus identity, receive loop, and label, so the "wiring only" module is
+driver's hub identity, receive loop, and label, so the "wiring only" module is
 really a sixth module by accident. And because the drivers reach into `index.rs`
 for the work they drive (`walk_project`, `resolve_artifacts`, `offline_notice`,
 `scan_sources`, `index_jars`, `index_jdk`), those producers are `pub(crate)` only
@@ -30,7 +30,7 @@ to be callable from the engine, so the index's internals leak across the crate.
 
 # Proposal
 
-Give every driver its own module and have every module own its whole bus life —
+Give every driver its own module and have every module own its whole hub life —
 label, subscribe, and start — so `engine::start` becomes the hub plus spawn calls
 and nothing else. Each driver's module also owns the producer function it drives,
 so the warm-up producers stop being `pub(crate)` and `index.rs` keeps only the
@@ -45,7 +45,7 @@ index itself:
 | jdk (`jdk`)               | `jdk.rs`        | `index_jdk`, `jdk_cache_key`                              |
 | download (`download`)     | `sources.rs`    | `index_sources` (already there)                           |
 
-Each new module exposes one `spawn(client: &BusClient)` that does
+Each new module exposes one `spawn(client: &HubClient)` that does
 `client.labeled("<label>")`, `subscribe()`, and `tokio::spawn`s its own receive
 loop. The four existing modules (`index`, `analysis`, `diagnostics`, `quickfix`)
 take the **raw** client instead of a pre-labelled one and do the same with
@@ -72,7 +72,7 @@ take the **raw** client instead of a pre-labelled one and do the same with
   home — and the moved producers call them there. Only the warm-up producers
   move.
 - **D4 — Every module labels, subscribes, and starts itself.** `spawn` takes the
-  raw `BusClient`; the module applies its own label (`labeled("index")`,
+  raw `HubClient`; the module applies its own label (`labeled("index")`,
   `labeled("project")`, …), then `serve(Module::X)` (the request-serving modules)
   or `subscribe()` (the drivers), then starts its own thread (modules) or task
   (drivers). The shell labels itself `server` inside `JavaLanguageServer::new`.
@@ -81,8 +81,8 @@ take the **raw** client instead of a pre-labelled one and do the same with
   four module labels are unchanged, and every participant still subscribes
   synchronously before its thread or task starts, so no message is lost.
   Behaviour is unchanged.
-- **D6 — `next_notification` becomes a shared `bus.rs` helper.** The `Bus::Notify`
-  filter the drivers share moves to `bus.rs` as a `pub(crate)` function rather
+- **D6 — `next_notification` becomes a shared `hub.rs` helper.** The `Hub::Notify`
+  filter the drivers share moves to `hub.rs` as a `pub(crate)` function rather
   than being duplicated across six modules.
 - **D7 — `warm_up_sync` (test-only) stays in `index.rs`** and imports the moved
   producers, so `analysis.rs`'s test-only synchronous warm-up is unchanged.
@@ -90,18 +90,18 @@ take the **raw** client instead of a pre-labelled one and do the same with
   producer move with it (e.g. `offline_notice_only_when_offline_with_dependencies`
   to `resolve.rs`, `a_second_jdk_warmup_is_served_from_the_cache` to `jdk.rs`).
 - **D9 — `engine.rs` becomes pure wiring.** After the change it holds only
-  `start()`: the hub, `JavaLanguageServer::new`, and ten `spawn(&bus)` calls — no
+  `start()`: the hub, `JavaLanguageServer::new`, and ten `spawn(&hub)` calls — no
   labels, no `subscribe`/`serve`, no driver bodies.
 
 # Acceptance criteria
 
 1. `src/engine.rs` contains no `subscribe`/`serve` call, no `labeled(...)`, and no
-   driver body; `start` is the hub plus one `spawn(&bus)` per participant and
+   driver body; `start` is the hub plus one `spawn(&hub)` per participant and
    `JavaLanguageServer::new`.
 2. Each of the six drivers lives in its own module (`project.rs`, `resolve.rs`,
    `scan.rs`, `jars.rs`, `jdk.rs`, `sources.rs`) and its `spawn` labels,
    subscribes, and starts itself.
-3. Every module's `spawn` takes the raw `BusClient`; `JavaLanguageServer::new`
+3. Every module's `spawn` takes the raw `HubClient`; `JavaLanguageServer::new`
    labels itself `server`; no caller passes a pre-labelled client.
 4. `index.rs` no longer exposes `walk_project`, `collect_java_files`,
    `resolve_artifacts`, `offline_notice`, `local_repository`, `scan_sources`,
@@ -119,21 +119,21 @@ plan must update:
 
 - `docs/architecture.md` — the **Layout** module list (add `scan.rs` and
   `jars.rs`; correct `index.rs` and `engine.rs` one-liners), the **components and
-  data flow** diagram and the **"The shell on the bus"** prose (each participant,
+  data flow** diagram and the **"The shell on the hub"** prose (each participant,
   drivers included, now labels/subscribes itself in its own module), and the
-  **"Every subsystem is a module or driver on one bus"** decision (the drivers
+  **"Every subsystem is a module or driver on one hub"** decision (the drivers
   are no longer spawned by the engine but by their own modules).
 - `src/index.rs` module doc — "the drivers the engine spawns" becomes the
   warm-up drivers in their own modules.
-- `src/index.rs`, `src/engine.rs`, and `src/bus.rs` module docs — describe
+- `src/index.rs`, `src/engine.rs`, and `src/hub.rs` module docs — describe
   `engine::start` as pure wiring and note the shared `next_notification` helper.
 
 # Implementation plan
 
 ## Approach
 
-Each participant becomes a module that owns its whole bus life. A module's
-`spawn(bus: &BusClient)` (analysis also takes the runtime `Handle`) applies its
+Each participant becomes a module that owns its whole hub life. A module's
+`spawn(hub: &HubClient)` (analysis also takes the runtime `Handle`) applies its
 own label, subscribes (`serve(Module::X)` for the request-serving modules,
 `subscribe()` for the drivers), and starts its own thread or task — so
 `engine::start` holds only the hub, `JavaLanguageServer::new`, and the ten
@@ -149,50 +149,50 @@ stay `pub(crate)` so `index.rs`'s test-only `warm_up_sync` can still run the sam
 pipeline synchronously. Shared parsing (`java_parser`, `extract_entries`,
 `drop_import_entries`) and the index itself stay in `index.rs`.
 
-The driver receive loop's shared helper `next_notification` moves to `bus.rs` as
+The driver receive loop's shared helper `next_notification` moves to `hub.rs` as
 a `pub(crate)` function. Labels (`project`, `dependency`, `source`, `jar`,
 `download`, `jdk`, `index`, `analysis`, `diagnostics`, `quickfix`, `server`) and
 the subscription order are unchanged, so behaviour and the hub log are preserved.
 
 ## Steps
 
-- [x] `src/bus.rs` — add a shared `pub(crate) async fn next_notification` (the
-      `Bus::Notify` filter `engine.rs`'s drivers share), and change
+- [x] `src/hub.rs` — add a shared `pub(crate) async fn next_notification` (the
+      `Hub::Notify` filter `engine.rs`'s drivers share), and change
       `standalone_client` to call `index::spawn(&client)`.
 - [x] `src/project.rs` — move `walk_project` and `collect_java_files` from
-      `index.rs`; add `pub fn spawn(bus: &BusClient)` that labels `project`,
+      `index.rs`; add `pub fn spawn(hub: &HubClient)` that labels `project`,
       subscribes, and `tokio::spawn`s the project driver (the walk plus the
       `Ready`/`Summary`/`Progress End` coordination).
 - [x] `src/resolve.rs` — move `local_repository`, `resolve_artifacts`, and
-      `offline_notice` from `index.rs`; add `pub fn spawn(bus: &BusClient)` (the
+      `offline_notice` from `index.rs`; add `pub fn spawn(hub: &HubClient)` (the
       dependency driver); move the `offline_notice` unit test here.
 - [x] `src/scan.rs` (new) + `src/lib.rs` — move `scan_sources` in; add
-      `pub fn spawn(bus: &BusClient)` (the source driver); declare `pub mod scan`.
+      `pub fn spawn(hub: &HubClient)` (the source driver); declare `pub mod scan`.
 - [x] `src/jars.rs` (new) + `src/lib.rs` — move `index_jars` in; add
-      `pub fn spawn(bus: &BusClient)` (the jar driver); declare `pub mod jars`.
+      `pub fn spawn(hub: &HubClient)` (the jar driver); declare `pub mod jars`.
 - [x] `src/jdk.rs` — move `index_jdk` and `jdk_cache_key` from `index.rs`; add
-      `pub fn spawn(bus: &BusClient)` (the JDK driver); move the JDK-cache unit
+      `pub fn spawn(hub: &HubClient)` (the JDK driver); move the JDK-cache unit
       test here.
-- [x] `src/sources.rs` — add `pub fn spawn(bus: &BusClient)` (the download
+- [x] `src/sources.rs` — add `pub fn spawn(hub: &HubClient)` (the download
       driver wrapping `index_sources`); repoint `local_repository` to
       `crate::resolve`.
 - [x] `src/index.rs` — drop the moved producers and helpers; rename
-      `spawn_module` to `spawn(bus: &BusClient)` (labels `index`, serves
+      `spawn_module` to `spawn(hub: &HubClient)` (labels `index`, serves
       `Module::Index`); keep `warm_up_sync` calling the moved crate-visible
       producers; prune now-unused imports.
 - [x] `src/analysis.rs`, `src/diagnostics.rs`, `src/quickfix.rs` — rename
-      `spawn_module` to `spawn`, take `&BusClient`, and label themselves
+      `spawn_module` to `spawn`, take `&HubClient`, and label themselves
       (`analysis`/`diagnostics`/`quickfix`).
-- [x] `src/server.rs` — `JavaLanguageServer::new(client, bus: &BusClient)` labels
+- [x] `src/server.rs` — `JavaLanguageServer::new(client, hub: &HubClient)` labels
       itself `server` and stores the labeled client.
 - [x] `src/engine.rs` — reduce `start` to the hub, `JavaLanguageServer::new`, and
-      the ten `spawn(&bus)` calls; delete the driver functions and the local
+      the ten `spawn(&hub)` calls; delete the driver functions and the local
       `next_notification`; correct the module doc.
 - [x] `docs/architecture.md` — update the **Layout** module list (add `scan.rs`
       and `jars.rs`, correct `index.rs`/`engine.rs`), the components/data-flow
-      diagram, the **"The shell on the bus"** paragraph, and the **"Every
-      subsystem is a module or driver on one bus"** decision.
-- [x] `src/index.rs`, `src/engine.rs`, `src/bus.rs` module docs — describe
+      diagram, the **"The shell on the hub"** paragraph, and the **"Every
+      subsystem is a module or driver on one hub"** decision.
+- [x] `src/index.rs`, `src/engine.rs`, `src/hub.rs` module docs — describe
       `engine::start` as pure wiring and note the shared `next_notification`.
 - [x] Verify with `cargo build --all-targets`, `cargo fmt --check`, and
       `cargo test` (library, harness, `example/` features).
@@ -205,8 +205,8 @@ the subscription order are unchanged, so behaviour and the hub log are preserved
   `resolve_artifacts`/`offline_notice`/`local_repository`, `scan_sources`,
   `index_jars`, and `index_jdk`/`jdk_cache_key` moved with their driver. The
   index, analysis, diagnostics, and quick-fix modules and the shell now label
-  themselves too, and `engine::start` is the hub plus ten `spawn(&bus)` calls.
-  `next_notification` is shared from `bus.rs`. Verified: `cargo build
+  themselves too, and `engine::start` is the hub plus ten `spawn(&hub)` calls.
+  `next_notification` is shared from `hub.rs`. Verified: `cargo build
 --all-targets` warning-free, `cargo fmt --all -- --check` clean, and `cargo
 test` green (299 library, 7 bench, 1 `example/` feature, 29 harness, 1 stdio
   smoke).

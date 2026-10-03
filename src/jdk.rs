@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
-use crate::bus::BusClient;
 use crate::classfile::{for_each_zip_entry, parse_class};
+use crate::hub::HubClient;
 use crate::index::SymbolEntry;
 use crate::messages::{DriverMessage, LogLevel, ProgressUpdate, Stage};
 
@@ -276,11 +276,11 @@ fn src_zip_entries(src: &Path) -> Vec<(Url, Vec<SymbolEntry>, Vec<crate::types::
 
 // -- the JDK indexer driver -------------------------------------------------
 
-/// Starts the JDK indexer on the bus: it runs once at start, independent of the
+/// Starts the JDK indexer on the hub: it runs once at start, independent of the
 /// workspace, and emits its archives' entries and models, then the `Jdk`
 /// stage-done. It listens to nothing, so it does not subscribe.
-pub fn spawn(bus: &BusClient) {
-    let client = bus.labeled("jdk");
+pub fn spawn(hub: &HubClient) {
+    let client = hub.labeled("jdk");
     tokio::spawn(async move {
         let _ = tokio::task::spawn_blocking(move || {
             let count = {

@@ -1,4 +1,4 @@
-//! The engine's message vocabulary: every message on the bus, in one place.
+//! The engine's message vocabulary: every message on the hub, in one place.
 //!
 //! Every component — the LSP shell, the analysis core, the index, the
 //! diagnostics and quick-fix modules, and the drivers (project walker,
@@ -16,8 +16,8 @@ use tokio::sync::mpsc as tokio_mpsc;
 use tokio::sync::oneshot;
 use tower_lsp::lsp_types::{
     CodeAction, CompletionResponse, Diagnostic, DocumentSymbol, FoldingRange, Hover, InlayHint,
-    Location, Position, Range, SemanticTokens, SignatureHelp, SymbolInformation, Url,
-    WorkspaceEdit,
+    Location, Position, Range, SemanticTokens, SignatureHelp, SymbolInformation,
+    TextDocumentContentChangeEvent, Url, WorkspaceEdit,
 };
 
 use crate::index::SymbolEntry;
@@ -74,7 +74,7 @@ pub enum Stage {
     Downloads,
 }
 
-/// A notification on the bus, broadcast by the hub to every module and driver;
+/// A notification on the hub, broadcast by the hub to every module and driver;
 /// each consumes the ones it cares about. Large payloads are shared behind an
 /// `Arc`, so broadcasting is a pointer copy.
 #[derive(Clone)]
@@ -220,6 +220,21 @@ pub enum DriverMessage {
 /// answers with the [`ReplyHandle`] it carries; the hub sees that reply, logs and
 /// times it, and delivers the value to the requester waiting on its own channel.
 pub enum Request {
+    // -- document module --
+    /// Applies the editor's incremental changes to an open document and returns
+    /// its new text; `None` when the document is not open.
+    DocumentChange {
+        uri: Url,
+        version: i32,
+        changes: Vec<TextDocumentContentChangeEvent>,
+        reply: ReplyHandle<Option<Arc<String>>>,
+    },
+    /// The current text and version of an open document, or `None` when the
+    /// document is not open.
+    DocumentText {
+        uri: Url,
+        reply: ReplyHandle<Option<(i32, Arc<String>)>>,
+    },
     // -- index subsystem --
     IndexQueryName {
         name: String,
@@ -369,18 +384,18 @@ impl AnalysisRequest {
     }
 }
 
-/// A message on the engine bus: a notification every module may consume, or a
+/// A message on the engine hub: a notification every module may consume, or a
 /// request the hub routes to the one module that answers it. This is the value a
 /// module or driver receives; the sender's name and a request's correlation id
 /// ride the hub's own [`Inbound`] envelope, not this.
-pub enum Bus {
+pub enum Hub {
     Notify(DriverMessage),
     Request(Request),
 }
 
 /// A message a client posts to the hub. It carries the sender's name (and a
 /// request's correlation id) so the hub can attribute and time every line it
-/// logs; the value the modules and drivers receive (`Bus`) carries neither.
+/// logs; the value the modules and drivers receive (`Hub`) carries neither.
 pub enum Inbound {
     /// A notification from `sender`; the hub broadcasts it to every module and
     /// every driver.
@@ -406,8 +421,8 @@ pub enum Inbound {
     /// the owner of that module's requests.
     Subscribe {
         sender: String,
-        sink: tokio_mpsc::UnboundedSender<Bus>,
-        serves: Option<crate::bus::Module>,
+        sink: tokio_mpsc::UnboundedSender<Hub>,
+        serves: Option<crate::hub::Module>,
     },
 }
 
@@ -417,7 +432,7 @@ pub enum Inbound {
 /// forget the request.
 ///
 /// The requester holds the other end of the handle's oneshot channel (a
-/// [`crate::bus::Reply`]), which it awaits or, from synchronous module code,
+/// [`crate::hub::Reply`]), which it awaits or, from synchronous module code,
 /// receives blocking.
 pub struct ReplyHandle<R> {
     inbound: tokio_mpsc::UnboundedSender<Inbound>,

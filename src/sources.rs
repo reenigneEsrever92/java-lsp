@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use tower_lsp::lsp_types::Url;
 
-use crate::bus::{next_notification, BusClient};
+use crate::hub::{next_notification, HubClient};
 use crate::index::SymbolEntry;
 use crate::messages::{DriverMessage, LogLevel, ProgressUpdate, Stage};
 use crate::resolve::Artifact;
@@ -72,21 +72,21 @@ pub fn cache_dir() -> PathBuf {
 }
 
 /// Fetches and indexes the sources of `artifacts`, publishing the index updates
-/// and progress onto the bus. A no-op when downloads are disabled or
+/// and progress onto the hub. A no-op when downloads are disabled or
 /// nothing resolved. Runs concurrently with the workspace source scan.
-pub async fn index_sources(artifacts: Vec<Artifact>, bus: crate::bus::BusClient) {
+pub async fn index_sources(artifacts: Vec<Artifact>, hub: crate::hub::HubClient) {
     if artifacts.is_empty() || offline() {
         return;
     }
     let repo = crate::resolve::local_repository();
     let base = base_url();
     let started = Instant::now();
-    let available = fetch_sources(&artifacts, &repo, &base, &bus).await;
+    let available = fetch_sources(&artifacts, &repo, &base, &hub).await;
     let fetch_ms = started.elapsed().as_millis();
     if available.is_empty() {
         return;
     }
-    let _ = bus.notify(DriverMessage::Log {
+    let _ = hub.notify(DriverMessage::Log {
         level: LogLevel::Info,
         message: format!(
             "dependency source fetch: {} of {} archives available in {fetch_ms}ms",
@@ -95,10 +95,10 @@ pub async fn index_sources(artifacts: Vec<Artifact>, bus: crate::bus::BusClient)
         ),
     });
     let cache = cache_dir();
-    let extract_bus = bus.clone();
+    let extract_hub = hub.clone();
     let _ = tokio::task::spawn_blocking(move || {
         let mut sink = |message| {
-            let _ = extract_bus.notify(message);
+            let _ = extract_hub.notify(message);
         };
         index_extracted(&mut sink, &available, &repo, &cache);
     })
@@ -107,11 +107,11 @@ pub async fn index_sources(artifacts: Vec<Artifact>, bus: crate::bus::BusClient)
 
 // -- the source downloader --------------------------------------------------
 
-/// Starts the source downloader on the bus: on the artifact list it fetches and
+/// Starts the source downloader on the hub: on the artifact list it fetches and
 /// indexes dependency sources, then the `Downloads` stage-done (which gates only
 /// the summary).
-pub fn spawn(bus: &BusClient) {
-    let client = bus.labeled("download");
+pub fn spawn(hub: &HubClient) {
+    let client = hub.labeled("download");
     let mut rx = client.subscribe();
     tokio::spawn(async move {
         while let Some(message) = next_notification(&mut rx).await {
@@ -133,7 +133,7 @@ async fn fetch_sources(
     artifacts: &[Artifact],
     repo: &Path,
     base: &str,
-    bus: &crate::bus::BusClient,
+    hub: &crate::hub::HubClient,
 ) -> Vec<Artifact> {
     let mut available = Vec::new();
     let mut missing = Vec::new();
@@ -150,7 +150,7 @@ async fn fetch_sources(
     }
 
     let total = missing.len();
-    let _ = bus.notify(DriverMessage::Progress(ProgressUpdate::Update {
+    let _ = hub.notify(DriverMessage::Progress(ProgressUpdate::Update {
         message: format!("Fetching {total} dependency sources"),
         percentage: Some(0),
     }));
@@ -162,7 +162,7 @@ async fn fetch_sources(
     {
         Ok(client) => client,
         Err(error) => {
-            let _ = bus.notify(DriverMessage::Log {
+            let _ = hub.notify(DriverMessage::Log {
                 level: LogLevel::Warn,
                 message: format!(
                     "no HTTP client for dependency sources; keeping class files ({error})"
@@ -183,7 +183,7 @@ async fn fetch_sources(
         let client = client.clone();
         let base = base.to_string();
         let repo = repo.to_path_buf();
-        let log = bus.clone();
+        let log = hub.clone();
         tasks.spawn(async move {
             let _permit = permit;
             match download_sources(&client, &base, &repo, &artifact).await {
@@ -207,7 +207,7 @@ async fn fetch_sources(
         if let Ok(Some(artifact)) = joined {
             available.push(artifact);
         }
-        let _ = bus.notify(DriverMessage::Progress(ProgressUpdate::Update {
+        let _ = hub.notify(DriverMessage::Progress(ProgressUpdate::Update {
             message: format!("Fetched {done}/{total} dependency sources"),
             percentage: Some((done * 100 / total) as u32),
         }));
@@ -336,7 +336,7 @@ fn log_timings(
 /// moving; the artifacts are extracted and parsed across `available_parallelism`
 /// worker threads (each its own parser), and the workers hand their finished
 /// layers to this thread, which is the only one that touches the sink (and so the
-/// bus).
+/// hub).
 fn index_extracted(
     sink: &mut dyn FnMut(DriverMessage),
     artifacts: &[Artifact],
@@ -357,7 +357,7 @@ fn index_extracted(
         .unwrap_or(4)
         .min(total);
     // Report progress ~5 % of the way, not per archive: a large closure would
-    // otherwise be thousands of bus messages and log lines.
+    // otherwise be thousands of hub messages and log lines.
     let progress_step = (total / 20).max(1);
     let next = AtomicUsize::new(0);
     let timers = Timers::default();
@@ -558,7 +558,7 @@ fn index_one(
     let class_uri = Url::from_file_path(class_jar_path(repo, group, id, version)).ok();
     // One base layer for the whole artifact, as the jar and JDK indexers do and as
     // the base model documents ("one layer per artifact URI"). Each file's entries
-    // keep their own source URI, so navigation is unchanged, while the bus, the hub
+    // keep their own source URI, so navigation is unchanged, while the hub, the hub
     // log, and the base stay at one per artifact instead of one per file.
     let mut entries_all: Vec<SymbolEntry> = Vec::new();
     let mut types = crate::types::TypeModel::new();
@@ -832,8 +832,8 @@ mod tests {
             Some(&sha1_hex(&sources)),
         ));
 
-        let bus = crate::bus::BusClient::standalone();
-        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &bus).await;
+        let hub = crate::hub::HubClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &hub).await;
         assert_eq!(available, vec![artifact()]);
         assert!(sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
 
@@ -843,7 +843,7 @@ mod tests {
             tower_lsp::lsp_types::Position::new(0, 0),
             tower_lsp::lsp_types::Position::new(0, 0),
         );
-        bus.upsert_file(
+        hub.upsert_file(
             &class_uri,
             vec![SymbolEntry {
                 uri: std::sync::Arc::new(class_uri.clone()),
@@ -860,7 +860,7 @@ mod tests {
         );
 
         let mut sink = |message| {
-            let _ = bus.notify(message);
+            let _ = hub.notify(message);
         };
         index_extracted(&mut sink, &available, &repo, &cache);
 
@@ -875,18 +875,18 @@ mod tests {
             "the source should be extracted to the cache"
         );
         assert!(
-            bus.all_symbols()
+            hub.all_symbols()
                 .await
                 .iter()
                 .all(|entry| *entry.uri != class_uri),
             "the class-file entries should be dropped"
         );
-        let entries = bus.query_name("Thing").await;
+        let entries = hub.query_name("Thing").await;
         assert_eq!(entries.len(), 1);
         assert!(entries[0].dependency && entries[0].library_source);
         assert_eq!(entries[0].uri.to_file_path().unwrap(), extracted);
         // The cache is never a references or rename candidate.
-        assert!(bus.source_files().await.is_empty());
+        assert!(hub.source_files().await.is_empty());
     }
 
     #[tokio::test]
@@ -897,8 +897,8 @@ mod tests {
         let sources = stored_zip(&[("demo/Thing.java", SOURCE)]);
         let server = TestServer::start(sources_jar_routes(sources, None));
 
-        let bus = crate::bus::BusClient::standalone();
-        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &bus).await;
+        let hub = crate::hub::HubClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &hub).await;
         assert_eq!(available, vec![artifact()]);
         assert!(sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
     }
@@ -914,8 +914,8 @@ mod tests {
             Some("0000000000000000000000000000000000000000"),
         ));
 
-        let bus = crate::bus::BusClient::standalone();
-        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &bus).await;
+        let hub = crate::hub::HubClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, &server.base_url(), &hub).await;
         assert!(available.is_empty());
         assert!(!sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
     }
@@ -926,8 +926,8 @@ mod tests {
         let fixture = TempDir::new("unreachable");
         let repo = fixture.path().join("repo");
         // Port 1 is not served; the fetch must fail without panicking.
-        let bus = crate::bus::BusClient::standalone();
-        let available = fetch_sources(&[artifact()], &repo, "http://127.0.0.1:1", &bus).await;
+        let hub = crate::hub::HubClient::standalone();
+        let available = fetch_sources(&[artifact()], &repo, "http://127.0.0.1:1", &hub).await;
         assert!(available.is_empty());
         assert!(!sources_jar_path(&repo, "demo", "lib", "1.0").is_file());
     }
@@ -943,8 +943,8 @@ mod tests {
         std::env::set_var("JAVA_LSP_OFFLINE", "1");
         std::env::set_var("MAVEN_REPO", &repo);
         std::env::set_var("JAVA_LSP_MAVEN_CENTRAL_URL", server.base_url());
-        let bus = crate::bus::BusClient::standalone();
-        index_sources(vec![artifact()], bus).await;
+        let hub = crate::hub::HubClient::standalone();
+        index_sources(vec![artifact()], hub).await;
         std::env::remove_var("JAVA_LSP_OFFLINE");
         std::env::remove_var("MAVEN_REPO");
         std::env::remove_var("JAVA_LSP_MAVEN_CENTRAL_URL");
@@ -966,11 +966,11 @@ mod tests {
         std::fs::create_dir_all(jar.parent().unwrap()).unwrap();
         std::fs::write(&jar, &sources).unwrap();
 
-        let bus = crate::bus::BusClient::standalone();
+        let hub = crate::hub::HubClient::standalone();
         let mut published: Vec<DriverMessage> = Vec::new();
         {
             let mut sink = |message: DriverMessage| {
-                let _ = bus.notify(message.clone());
+                let _ = hub.notify(message.clone());
                 published.push(message);
             };
             index_extracted(&mut sink, &[artifact()], &repo, &cache);
@@ -995,7 +995,7 @@ mod tests {
             "expected a per-archive progress update"
         );
         // Both files' entries are in that single layer.
-        assert_eq!(bus.query_name("Thing").blocking_recv().len(), 1);
-        assert_eq!(bus.query_name("Other").blocking_recv().len(), 1);
+        assert_eq!(hub.query_name("Thing").blocking_recv().len(), 1);
+        assert_eq!(hub.query_name("Other").blocking_recv().len(), 1);
     }
 }

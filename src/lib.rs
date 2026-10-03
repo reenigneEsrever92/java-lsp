@@ -3,11 +3,11 @@
 
 pub mod analysis;
 pub mod base_cache;
-pub mod bus;
 pub mod classfile;
 pub mod diagnostics;
 pub mod document;
 pub mod engine;
+pub mod hub;
 pub mod index;
 pub mod jars;
 pub mod jdk;

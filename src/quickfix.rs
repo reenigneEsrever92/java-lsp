@@ -29,7 +29,7 @@ use crate::diagnostics::{
     FIX_ADD_IMPORT, FIX_CREATE_RECEIVER_MEMBER, FIX_CREATE_SYMBOL, FIX_CREATE_TYPE, FIX_RENAME,
 };
 use crate::index::{java_parser, IndexHandle};
-use crate::messages::{Bus, DriverMessage, Request};
+use crate::messages::{DriverMessage, Hub, Request};
 use crate::types::{self, SourceLayerIndex, Ty, TypeLookup, TypeQuery};
 
 /// The context of one quick-fix request: the open document (its tree and text),
@@ -671,10 +671,10 @@ fn workspace_edit_changes(uri: &Url, edits: Vec<TextEdit>) -> WorkspaceEdit {
 /// Starts the quick-fix module: a thread that owns a parser and the open
 /// buffers' text, consumes the document notifications the hub broadcasts, and
 /// answers the quick-fix requests. It reads the symbol index and the diagnostics
-/// cache through its bus client.
-pub fn spawn(bus: &crate::bus::BusClient) {
-    let client = bus.labeled("quickfix");
-    let mut rx = client.serve(crate::bus::Module::QuickFix);
+/// cache through its hub client.
+pub fn spawn(hub: &crate::hub::HubClient) {
+    let client = hub.labeled("quickfix");
+    let mut rx = client.serve(crate::hub::Module::QuickFix);
     thread::Builder::new()
         .name("java-lsp-quickfix".to_string())
         .spawn(move || {
@@ -686,17 +686,17 @@ pub fn spawn(bus: &crate::bus::BusClient) {
             };
             while let Some(message) = rx.blocking_recv() {
                 match message {
-                    Bus::Notify(DriverMessage::DocumentOpened { uri, text, .. })
-                    | Bus::Notify(DriverMessage::DocumentChanged { uri, text, .. }) => {
+                    Hub::Notify(DriverMessage::DocumentOpened { uri, text, .. })
+                    | Hub::Notify(DriverMessage::DocumentChanged { uri, text, .. }) => {
                         module.docs.insert(uri, text);
                     }
-                    Bus::Notify(DriverMessage::DocumentClosed { uri }) => {
+                    Hub::Notify(DriverMessage::DocumentClosed { uri }) => {
                         module.docs.remove(&uri);
                     }
-                    Bus::Notify(DriverMessage::ClientCapabilities {
+                    Hub::Notify(DriverMessage::ClientCapabilities {
                         resource_operations,
                     }) => module.resource_operations = resource_operations,
-                    Bus::Request(Request::QuickFixForDocument {
+                    Hub::Request(Request::QuickFixForDocument {
                         uri,
                         diagnostics,
                         reply,
@@ -713,7 +713,7 @@ pub fn spawn(bus: &crate::bus::BusClient) {
 /// The quick-fix module's state: a parser, the open buffers' text, the client it
 /// answers through, and the client capability the create-type fix needs.
 struct QuickFixModule {
-    client: crate::bus::BusClient,
+    client: crate::hub::HubClient,
     parser: Parser,
     docs: HashMap<Url, Arc<String>>,
     resource_operations: bool,
@@ -756,7 +756,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_module_generates_a_fix_from_the_request_diagnostics() {
-        let client = crate::bus::spawn_hub();
+        let client = crate::hub::spawn_hub();
         crate::index::spawn(&client);
         crate::quickfix::spawn(&client);
         let client = client.labeled("test");

@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::bus::{next_notification, BusClient};
+use crate::hub::{next_notification, HubClient};
 use crate::messages::{DriverMessage, MessageLevel};
 use crate::project::ProjectModel;
 
@@ -615,11 +615,11 @@ pub(crate) fn offline_notice(artifact_count: usize) -> Option<String> {
 
 // -- the dependency driver --------------------------------------------------
 
-/// Starts the dependency driver on the bus: on the project model it resolves
+/// Starts the dependency driver on the hub: on the project model it resolves
 /// each module's closure against the local repository and emits the jar list
 /// (and the offline notice).
-pub fn spawn(bus: &BusClient) {
-    let client = bus.labeled("dependency");
+pub fn spawn(hub: &HubClient) {
+    let client = hub.labeled("dependency");
     let mut rx = client.subscribe();
     tokio::spawn(async move {
         while let Some(message) = next_notification(&mut rx).await {
