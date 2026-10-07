@@ -51,8 +51,11 @@ All use cases belong to the Java developer.
   fetched from a Maven repository (Maven Central by default) on by default,
   written into the local Maven repository, and extracted under
   `$JAVA_LSP_SOURCES_CACHE` (default `~/.cache/java-lsp/sources`).
-  `$JAVA_LSP_OFFLINE` disables all network work. Deployment: native binaries
-  built with cargo. A second native binary (analysis daemon) is a possible
+  `$JAVA_LSP_OFFLINE` disables all network work (equivalently `--no-downloads`).
+  Deployment: native binaries built with cargo; individual subsystems — the
+  workspace index, dependency resolution and indexing, JDK indexing,
+  diagnostics, and quick fixes — can be switched off with `--no-*` command-line
+  flags. A second native binary (analysis daemon) is a possible
   future shape, not built now.
 - **Constraints**: no JVM at runtime; performance — especially project
   open → responsive — is a standing general concern (no fixed numeric targets

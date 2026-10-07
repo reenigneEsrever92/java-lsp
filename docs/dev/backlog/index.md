@@ -13,3 +13,4 @@ holds only open work.
 | ------------------------------------------------------------------- | -------- | -------- | ----------- |
 | [index-entry-size](index-entry-size.md)                             | refactor | medium   | in-progress |
 | [module-owned-hub-subscriptions](module-owned-hub-subscriptions.md) | refactor | medium   | done        |
+| [cli-module-toggles](cli-module-toggles.md)                         | feature  | medium   | done        |

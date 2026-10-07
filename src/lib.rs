@@ -3,7 +3,9 @@
 
 pub mod analysis;
 pub mod base_cache;
+
 pub mod classfile;
+pub mod cli;
 pub mod diagnostics;
 pub mod document;
 pub mod engine;
@@ -18,7 +20,10 @@ pub mod resolve;
 pub mod scan;
 pub mod server;
 pub mod sources;
+pub mod startup;
 pub mod types;
+
+pub use engine::start;
 
 /// Thread stack size for every thread that runs analysis: the runtime's worker
 /// and blocking-pool threads (`main.rs`) and the analysis module's thread.

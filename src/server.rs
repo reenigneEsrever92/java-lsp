@@ -106,6 +106,9 @@ pub struct JavaLanguageServer {
     /// Whether the client supports dynamic registration of
     /// `workspace/didChangeWatchedFiles`, read in `initialize` (D6).
     watched_files: Arc<AtomicBool>,
+    /// Whether the quick-fix module is enabled; when it is, `initialize`
+    /// advertises `codeActionProvider`.
+    quickfix: bool,
 }
 
 impl std::fmt::Debug for JavaLanguageServer {
@@ -117,8 +120,11 @@ impl std::fmt::Debug for JavaLanguageServer {
 impl JavaLanguageServer {
     /// Builds the shell on `hub`, the client [`engine::start`] gives it.
     ///
+    /// `quickfix` mirrors the launch configuration so `initialize` only
+    /// advertises `codeActionProvider` when the quick-fix module is running.
+    ///
     /// [`engine::start`]: crate::engine::start
-    pub fn new(client: Client, hub: &HubClient) -> Self {
+    pub fn new(client: Client, hub: &HubClient, quickfix: bool) -> Self {
         // The shell is a participant on the hub like any other: it labels
         // itself, subscribes for every notification, and this task renders the
         // editor-facing ones as client notifications. Unbounded, so a slow
@@ -173,6 +179,7 @@ impl JavaLanguageServer {
             workspace_root: Mutex::new(None),
             progress,
             watched_files: Arc::new(AtomicBool::new(false)),
+            quickfix,
         }
     }
 
@@ -272,12 +279,12 @@ impl LanguageServer for JavaLanguageServer {
                 workspace_symbol_provider: Some(OneOf::Left(true)),
                 references_provider: Some(OneOf::Left(true)),
                 rename_provider: Some(OneOf::Left(true)),
-                code_action_provider: Some(CodeActionProviderCapability::Options(
-                    CodeActionOptions {
+                code_action_provider: self.quickfix.then(|| {
+                    CodeActionProviderCapability::Options(CodeActionOptions {
                         code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
                         ..CodeActionOptions::default()
-                    },
-                )),
+                    })
+                }),
                 inlay_hint_provider: Some(OneOf::Left(true)),
                 folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
                 semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(

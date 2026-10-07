@@ -19,9 +19,12 @@ transport change rather than a redesign.
 Cargo.toml
 Hello.java              — example Java file to open by hand while trying the server
 src/
-  main.rs     — thin stdio binary: tracing setup (stderr), tokio runtime, tower-lsp server
+  main.rs     — thin stdio binary: parses the command line (`cli.rs`), tracing
+                setup (stderr), tokio runtime, tower-lsp server
   lib.rs      — library root so integration tests can drive the shell; the
                 analysis threads' stack size (RUNTIME_STACK_SIZE)
+  cli.rs      — the launch configuration: the `clap` flags (`Cli`) and the
+                resolved module toggles (`Modules`) the engine consumes
   server.rs   — JavaLanguageServer: the LSP shell (all editor-facing handlers),
                 a hub client that renders diagnostics, progress, and notices
   document.rs — the document module: DocumentStore (URI -> { version, bytes },
@@ -40,8 +43,8 @@ src/
                 thread that broadcasts notifications, routes requests, and logs
   types.rs    — declared-type model (R7): types, members, hierarchies, binding
   project.rs  — Maven project model (pom discovery, modules, source roots) and
-                the project driver: walks the model + inventory and coordinates
-                `ready` and the summary
+                the `walk_project`/`collect_java_files` helpers the startup
+                coordinator drives
   resolve.rs  — static Maven dependency resolution (effective poms, closure)
                 and the dependency driver
   classfile.rs— minimal jar (ZIP) + class-file reader for dependency indexing
@@ -52,8 +55,12 @@ src/
   messages.rs — the hub vocabulary: the DriverMessage notifications, the
                 Request variants (AnalysisRequest for the editor's queries),
                 and the reply handle
-  engine.rs   — the one setup path (`start`: the hub plus every participant's
-                `spawn`, the shell included)
+  startup.rs  — the warm-up coordinator: walks the project model, emits `Ready`,
+                the summary, and progress for the enabled stages, and warns when
+                dependency sources are disabled
+  engine.rs   — the one setup path (`start_with`: the hub plus every enabled
+                participant's `spawn`, the shell included; `start` runs
+                everything the environment enables)
   diagnostics.rs — the diagnostics subsystem: its own parser and open-document
                 state, computing syntax and unresolved-symbol diagnostics and
                 reporting them to the hub, plus a queryable cache of the latest
@@ -98,7 +105,7 @@ graph TD
     IDX -- owns --> WI[(WorkspaceIndex)]
     IDX -- "base + source types" --> TL[(type base + source models)]
 
-    HUB -- "every DriverMessage" --> DR{{drivers: project, dependency, source, jar, JDK, download}}
+    HUB -- "every DriverMessage" --> DR{{startup + drivers: startup, dependency, source, jar, JDK, download}}
     DR -- DriverMessage --> HUB
     DR -- "source scan" --> WS[workspace .java files]
     DR -- "class files" --> JV[local repo jars]
@@ -115,13 +122,14 @@ graph TD
 | **Hub** (`hub.rs`)                                                                           | The engine's central mediator — the hub of the hub-and-spoke.                                                   | Owns the FIFO inbound channel; broadcasts notifications to every subscriber; routes each request to its owner and returns the reply; logs and times every message (`debug`/`trace`) and renders the `Log`/`Summary` lines. Carries no editor knowledge.                                                                                                                                                                                            |
 | **LSP shell** (`server.rs`)                                                                  | The `tower_lsp::LanguageServer` implementation — a hub client like any other, never touching the core directly. | Serves every editor-facing method; advertises capabilities in `initialize`; notifies input (`FolderAdded`, `ClientCapabilities`, `DocumentOpened`/`DocumentChanged`/`DocumentClosed`, `FileEvent`); requests queries; renders `Diagnostics`, `Progress` (as `$/progress`), and `Notice` (as `window/showMessage`) on its own drain task. Its hub channel is unbounded, so a slow client never stalls the hub.                                      |
 | **Document module / DocumentStore** (`document.rs`)                                          | The canonical document store — a hub client, not owned by the shell.                                            | Subscribes to `DocumentOpened`/`DocumentClosed`; applies the editor's incremental changes on a `DocumentChange` request and returns the new text (`None` when not open); answers `DocumentText`; converts LSP positions (line + UTF-16 code units) to byte offsets — the only place position semantics are handled on the way in.                                                                                                                  |
-| **Engine wiring** (`engine.rs`)                                                              | The single `start` path that builds the hub and boots every participant.                                        | Calls each participant's `spawn` — shell first, then modules, then drivers — each of which labels itself, registers (`subscribe` for notifications, `serve` for requests), and starts its own thread or task. Pure wiring: no channel, label, or receive loop.                                                                                                                                                                                     |
+| **Engine wiring** (`engine.rs`, `cli.rs`)                                                    | The single `start_with` path that builds the hub and boots every participant the launch configuration enables.  | Calls each enabled participant's `spawn` — shell first, then modules, then the startup coordinator and drivers — each of which labels itself, registers (`subscribe` for notifications, `serve` for requests), and starts its own thread or task. `start` runs everything the environment enables. Pure wiring: no channel, label, or receive loop.                                                                                                |
 | **Analysis module / engine core** (`analysis.rs`, `TreeSitterEngine`)                        | Owns the open documents' parse trees and answers the shell's queries.                                           | Parses each open document with `tree-sitter-java`; serves document symbols, folding ranges, semantic tokens, completions, hover, definition/declaration, implementation, references, rename, and inlay hints; applies editor input inline in arrival order and runs each query on the blocking pool, so a slow search never delays typing; notifies `AnalysisUpdated` after each applied document or file event (it does not compute diagnostics). |
 | **Type layer** (`types.rs`)                                                                  | The pure-Rust declared-type model (R7).                                                                         | Models types, members, hierarchies, generics, records, enums, and syntactically-read Lombok members; infers receiver types; resolves names in Java precedence order; selects overloads by argument types. Backs completion, hover, signature help, inlay hints, and semantic diagnostics through a cached, layered, dirty-overlay view of the base and per-source models.                                                                          |
 | **Diagnostics subsystem** (`diagnostics.rs`)                                                 | A self-contained parser and open-document state, separate from the core.                                        | Sweeps on `AnalysisUpdated` (the just-edited file first, then every open document) for syntax errors and unresolved symbols; reads the index and type layer through `IndexHandle` with per-sweep caches; publishes one `Diagnostics` per open document and keeps a queryable cache of each document's latest pass.                                                                                                                                 |
 | **Quick-fix subsystem** (`quickfix.rs`)                                                      | A self-contained parser and open-document text.                                                                 | Turns unresolved-symbol diagnostics into `CodeAction`s — add an import, change to a near member, or create a stub type/member; reads the symbol index (`IndexHandle`) and the diagnostics cache (`DiagnosticsForDocument`); answers the shell's `codeAction` request as an awaited hub request.                                                                                                                                                    |
 | **Index subsystem / WorkspaceIndex** (`index.rs`)                                            | A workspace-wide in-memory symbol index owned by a dedicated thread.                                            | Stores flat `SymbolEntry`s (name, kind, package, container chain, ranges, `dependency`/`synthetic` flags); answers `query_name`/`query_prefix`/`query_names`/`has_packages` through the message-based `IndexHandle`; re-extracts a file's entries on edits and watcher events (and re-reads disk on `didClose`); grows the declared-type base append-only, one layer per artifact.                                                                 |
-| **Maven project model & dependency resolution** (`project.rs`, `resolve.rs`, `classfile.rs`) | The project driver's model of the workspace and its strictly offline dependency resolver.                       | Walks the root on `FolderAdded` and discovers `pom.xml` modules and source roots (falling back to scanning the whole root); resolves the jar closure from the local repository with Maven mediation, never invoking `mvn` or the network; parses jars and class files into `dependency` index entries; coordinates `ready` and the warm-up summary.                                                                                                |
+| **Warm-up coordinator** (`startup.rs`)                                                       | Drives the warm-up sequence and shapes its events to the launch configuration.                                  | On `FolderAdded` it walks the project model and emits the source inventory; tracks `StageDone` for the enabled stages only; emits `Ready`, the summary, and the progress end; and warns when dependency sources are disabled. The warm-up drivers stay configuration-free.                                                                                                                                                                         |
+| **Maven project model & dependency resolution** (`project.rs`, `resolve.rs`, `classfile.rs`) | The workspace model and its strictly offline dependency resolver.                                               | The coordinator walks the root and discovers `pom.xml` modules and source roots (falling back to scanning the whole root); resolves the jar closure from the local repository with Maven mediation, never invoking `mvn` or the network; parses jars and class files into `dependency` index entries.                                                                                                                                              |
 | **JDK indexer** (`jdk.rs`)                                                                   | Indexes the installed JDK's standard library.                                                                   | Discovers the JDK (`$JAVA_LSP_JDK`, `$JAVA_HOME`, common locations incl. SDKMAN) and indexes `jmods/*.jmod`, `lib/src.zip`, or `rt.jar` with streaming per-entry reads; keeps only `java.*`/`javax.*`; a missing JDK is a graceful no-op.                                                                                                                                                                                                          |
 | **Dependency sources** (`sources.rs`)                                                        | Fetches and indexes `-sources.jar` for resolved artifacts.                                                      | Reuses local sources or downloads from Maven Central with bounded concurrency and `.sha1` verification; extracts under the sources cache; republishes source-backed dependency entries (real signatures and ranges), dropping the class-derived ones; disabled by `$JAVA_LSP_OFFLINE`.                                                                                                                                                             |
 | **Source scanner & jar indexer** (`scan.rs`, `jars.rs`)                                      | Warm-up drivers that fill the index.                                                                            | The source scanner parses the project's `.java` files into the index (`Sources` stage); the jar indexer parses resolved jars into it (`Jars` stage). Both speak only `DriverMessage`s.                                                                                                                                                                                                                                                             |
@@ -705,13 +713,17 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   `hub.rs`, `engine.rs`) — all messages live in `messages.rs`: the
   `DriverMessage` notifications and the `Request`s. Each participant is a module
   that owns its whole hub life — its label, its subscription, and its own thread
-  or task — so `engine::start` only builds the hub and calls each `spawn`. The
-  warm-up drivers live with the work they drive (`project.rs`, `resolve.rs`,
-  `scan.rs`, `jars.rs`, `jdk.rs`, `sources.rs`), and each reacts to the messages
-  it cares about: the project driver walks for the model and inventory on
-  `FolderAdded` (and coordinates `ready` and the summary); the dependency driver
-  resolves the jars; the source scanner, jar indexer, JDK indexer, and source
-  downloader produce the index data. The hub starts empty: every participant
+  or task — so `engine::start_with` only builds the hub and calls each enabled
+  `spawn` (`engine::start` runs everything the environment enables). The launch
+  configuration (`cli.rs`) decides which participants to build and which stages
+  the startup coordinator waits on, so the drivers themselves take no
+  configuration. The warm-up drivers live with the work they drive
+  (`resolve.rs`, `scan.rs`, `jars.rs`, `jdk.rs`, `sources.rs`), and each reacts
+  to the messages it cares about: the startup coordinator (`startup.rs`) walks
+  for the model and inventory on `FolderAdded` and owns `ready` and the summary;
+  the dependency driver resolves the jars; the source scanner, jar indexer, JDK
+  indexer, and source downloader produce the index data. The hub starts empty:
+  every participant
   registers through its own client (`subscribe`/`serve`) before its thread or
   task starts,
   and the registration rides the hub's FIFO inbound channel, so it is in place

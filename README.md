@@ -116,7 +116,7 @@ and skips dependencies with a warning.
 
 ## Configuration
 
-`java-lsp` is configured entirely through the environment:
+`java-lsp` is configured through command-line flags and the environment:
 
 | Variable                        | Effect                                                                                                                |
 | ------------------------------- | --------------------------------------------------------------------------------------------------------------------- |
@@ -129,6 +129,28 @@ and skips dependencies with a warning.
 | `JAVA_LSP_SEMANTIC_DIAGNOSTICS` | `0`/`false` disables the unresolved-symbol diagnostics (parse errors still report). On by default.                    |
 | `JAVA_LSP_MAVEN_CENTRAL_URL`    | Base URL for dependency-source downloads. Default Maven Central (`https://repo1.maven.org/maven2`).                   |
 | `JAVA_LSP_SOURCES_CACHE`        | Where extracted sources are cached. Default `$XDG_CACHE_HOME/java-lsp/sources`, else `~/.cache/java-lsp/sources`.     |
+
+### Command-line flags
+
+A few flags switch whole modules off; `java-lsp --help` lists them all. Flags
+override the environment, and with no flags every module runs. `--no-downloads`
+and `--no-semantic-diagnostics` are the flag equivalents of `JAVA_LSP_OFFLINE`
+and `JAVA_LSP_SEMANTIC_DIAGNOSTICS=0`, and `--no-jdk` is the clean way to opt out
+of JDK indexing.
+
+| Flag                        | Effect                                                                                   |
+| --------------------------- | ---------------------------------------------------------------------------------------- |
+| `--no-workspace-index`      | Do not index the workspace's own `.java` files.                                          |
+| `--no-dependencies`         | Do not resolve or index Maven dependencies (implies `--no-jars`, `--no-downloads`).      |
+| `--no-jars`                 | Do not index dependency jars.                                                            |
+| `--no-downloads`            | Do not fetch or index dependency sources.                                                |
+| `--no-jdk`                  | Do not index the JDK's standard library.                                                 |
+| `--no-diagnostics`          | Do not publish diagnostics (implies `--no-quickfix`).                                    |
+| `--no-semantic-diagnostics` | Keep parse-error diagnostics, drop the unresolved-symbol pass (implies `--no-quickfix`). |
+| `--no-quickfix`             | Do not serve quick fixes (`codeAction` is not advertised).                               |
+
+The shell, document store, index, analysis engine, and warm-up coordinator always
+run; `--stdio` is accepted and ignored.
 
 Dependency _resolution_ is always offline. Dependency **source** fetching is the
 one part that uses the network: for each resolved artifact it reuses a

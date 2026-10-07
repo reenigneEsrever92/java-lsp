@@ -5,6 +5,7 @@ edition = "2021"
 description = "A JVM-free Java language server written in Rust"
 
 [dependencies]
+clap = { version = "4", features = ["derive"] }
 tower-lsp = "0.20"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "io-std", "time"] }
 tracing = "0.1"

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::hub::{next_notification, HubClient};
-use crate::messages::{DriverMessage, MessageLevel};
+use crate::messages::DriverMessage;
 use crate::project::ProjectModel;
 
 /// One `<dependency>` declaration (also used for `dependencyManagement`
@@ -603,21 +603,10 @@ pub(crate) fn resolve_artifacts(model: &ProjectModel) -> Vec<Artifact> {
     artifacts
 }
 
-/// The notice to show when dependency sources will not be fetched: only when
-/// `JAVA_LSP_OFFLINE` is set *and* the workspace actually resolved a dependency.
-pub(crate) fn offline_notice(artifact_count: usize) -> Option<String> {
-    (crate::sources::offline() && artifact_count > 0).then(|| {
-        "Dependency sources are disabled (JAVA_LSP_OFFLINE is set): \
-         go-to-definition into library code is unavailable."
-            .to_string()
-    })
-}
-
 // -- the dependency driver --------------------------------------------------
 
 /// Starts the dependency driver on the hub: on the project model it resolves
-/// each module's closure against the local repository and emits the jar list
-/// (and the offline notice).
+/// each module's closure against the local repository and emits the jar list.
 pub fn spawn(hub: &HubClient) {
     let client = hub.labeled("dependency");
     let mut rx = client.subscribe();
@@ -627,12 +616,6 @@ pub fn spawn(hub: &HubClient) {
                 let client = client.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     let artifacts = resolve_artifacts(&model);
-                    if let Some(text) = offline_notice(artifacts.len()) {
-                        let _ = client.notify(DriverMessage::Notice {
-                            level: MessageLevel::Info,
-                            text,
-                        });
-                    }
                     let _ = client.notify(DriverMessage::Artifacts {
                         artifacts: Arc::new(artifacts),
                     });
@@ -646,22 +629,6 @@ pub fn spawn(hub: &HubClient) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn offline_notice_only_when_offline_with_dependencies() {
-        let _env = crate::jdk::env_lock();
-        std::env::remove_var("JAVA_LSP_OFFLINE");
-        assert!(offline_notice(3).is_none());
-
-        std::env::set_var("JAVA_LSP_OFFLINE", "1");
-        assert!(
-            offline_notice(0).is_none(),
-            "nothing to fetch, nothing to say"
-        );
-        let notice = offline_notice(2).expect("a workspace with dependencies is worth a notice");
-        assert!(notice.contains("JAVA_LSP_OFFLINE"), "{notice}");
-        std::env::remove_var("JAVA_LSP_OFFLINE");
-    }
 
     /// Builds a local repository in a temp dir from `path -> content` pairs
     /// (pom files laid out in the standard `{g/a/p}/{a}/{v}/` structure).

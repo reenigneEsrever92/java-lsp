@@ -15,9 +15,10 @@ struct Server {
 }
 
 impl Server {
-    fn start() -> Self {
+    fn start(args: &[&str]) -> Self {
         let mut child = Command::new(env!("CARGO_BIN_EXE_java-lsp"))
             .env("JAVA_LSP_OFFLINE", "1")
+            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -111,7 +112,7 @@ impl Drop for Server {
 
 #[test]
 fn binary_completes_the_lifecycle_over_stdio() {
-    let mut server = Server::start();
+    let mut server = Server::start(&[]);
 
     // Handshake: incremental sync, hover, definition, completions.
     let init = server.request(1, "initialize", json!({ "capabilities": {} }));
@@ -176,6 +177,55 @@ fn binary_completes_the_lifecycle_over_stdio() {
     assert!(hover["result"].is_null(), "{hover}");
 
     // Graceful shutdown: null result, no error, clean exit code.
+    let shutdown = server.request_no_params(3, "shutdown");
+    assert!(shutdown["result"].is_null(), "{shutdown}");
+    assert!(shutdown.get("error").is_none(), "{shutdown}");
+
+    let status = server.exit_and_wait();
+    assert!(status.success(), "binary must exit cleanly, got {status}");
+}
+
+#[test]
+fn binary_completes_the_lifecycle_with_modules_switched_off() {
+    let mut server = Server::start(&[
+        "--no-jdk",
+        "--no-dependencies",
+        "--no-diagnostics",
+        "--no-quickfix",
+    ]);
+
+    let init = server.request(1, "initialize", json!({ "capabilities": {} }));
+    let caps = &init["result"]["capabilities"];
+    assert_eq!(caps["textDocumentSync"], 2, "2 = incremental, got {caps}");
+    assert_eq!(caps["hoverProvider"], true, "{caps}");
+    assert!(
+        caps["codeActionProvider"].is_null(),
+        "--no-quickfix must drop codeActionProvider: {caps}"
+    );
+
+    // The diagnostics module is off, so didOpen publishes nothing; the server
+    // still answers a query without an error.
+    server.notify(
+        "textDocument/didOpen",
+        json!({
+            "textDocument": {
+                "uri": HELLO_URI,
+                "languageId": "java",
+                "version": 1,
+                "text": "class Hello {}\n",
+            }
+        }),
+    );
+    let hover = server.request(
+        2,
+        "textDocument/hover",
+        json!({
+            "textDocument": { "uri": HELLO_URI },
+            "position": { "line": 0, "character": 2 },
+        }),
+    );
+    assert!(hover.get("error").is_none(), "{hover}");
+
     let shutdown = server.request_no_params(3, "shutdown");
     assert!(shutdown["result"].is_null(), "{shutdown}");
     assert!(shutdown.get("error").is_none(), "{shutdown}");

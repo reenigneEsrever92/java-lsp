@@ -39,6 +39,14 @@ fn service() -> LspService<JavaLanguageServer> {
     service
 }
 
+/// A service built with an explicit launch configuration (bypassing the
+/// environment and the command line).
+fn service_with(modules: java_lsp::cli::Modules) -> LspService<JavaLanguageServer> {
+    let (service, _socket) =
+        LspService::new(move |client| java_lsp::engine::start_with(client, modules));
+    service
+}
+
 async fn respond(service: &mut LspService<JavaLanguageServer>, request: Request) -> Option<Value> {
     let response = service.ready().await.unwrap().call(request).await.unwrap();
     response.and_then(|r| r.result().cloned())
@@ -160,6 +168,23 @@ async fn initialize_advertises_incremental_sync_and_language_capabilities() {
             .len()
             >= 10
     );
+}
+
+#[tokio::test]
+async fn initialize_omits_code_action_provider_when_quickfix_is_off() {
+    let mut service = service_with(java_lsp::cli::Modules {
+        quickfix: false,
+        ..java_lsp::cli::Modules::all()
+    });
+    let result = initialize(&mut service).await;
+
+    let capabilities = &result["capabilities"];
+    assert!(
+        capabilities["codeActionProvider"].is_null(),
+        "codeActionProvider must be absent when quickfix is off: {capabilities}"
+    );
+    // The rest of the surface is unchanged.
+    assert_eq!(capabilities["hoverProvider"], true);
 }
 
 #[tokio::test]
@@ -3073,7 +3098,7 @@ async fn progress_is_not_sent_without_the_client_capability() {
     let _offline = EnvVar::set("JAVA_LSP_OFFLINE", "1");
 
     let root = progress_fixture("no-progress");
-    let (mut service, mut socket) = LspService::new(java_lsp::engine::start);
+    let (mut service, mut socket) = LspService::new(java_lsp::start);
     let root_uri = Url::from_file_path(&root).unwrap();
     // No `window.workDoneProgress`: progress must be suppressed entirely.
     respond(

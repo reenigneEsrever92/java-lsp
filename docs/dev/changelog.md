@@ -10,6 +10,19 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-10-06
+
+- **Modules can be switched off from the command line** — `main.rs` parses
+  `clap` flags through a new `cli.rs` (`--no-workspace-index`,
+  `--no-dependencies`, `--no-jars`, `--no-downloads`, `--no-jdk`,
+  `--no-diagnostics`, `--no-semantic-diagnostics`, `--no-quickfix`),
+  `engine::start_with` builds only the enabled participants, and a new
+  `startup.rs` coordinator owns the configuration-aware warm-up (`Ready` and the
+  summary for the enabled stages). The environment still applies and flags
+  override it. Verified by 310 library tests, 7 bench tests, 1 `example/`
+  feature test, 30 harness tests, and 2 stdio smoke tests. See
+  [Command-line flags to switch engine modules on and off](backlog/cli-module-toggles.md).
+
 ## 2026-10-03
 
 - **The engine bus is the engine hub** — `bus.rs` is `hub.rs`, `BusClient` is

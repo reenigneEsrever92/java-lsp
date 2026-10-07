@@ -982,7 +982,10 @@ fn collect_errors(node: &Node, text: &str, out: &mut Vec<Diagnostic>) {
 /// [`DriverMessage::AnalysisUpdated`], which the analysis module sends after it
 /// has applied the same event and sent the index its updates — so the sweep
 /// reads an index that already holds the edit.
-pub fn spawn(hub: &crate::hub::HubClient) {
+///
+/// `semantic` gates the unresolved-symbol pass: when it is false only parse
+/// errors are published.
+pub fn spawn(hub: &crate::hub::HubClient, semantic: bool) {
     let client = hub.labeled("diagnostics");
     let mut rx = client.serve(crate::hub::Module::Diagnostics);
     thread::Builder::new()
@@ -993,7 +996,7 @@ pub fn spawn(hub: &crate::hub::HubClient) {
                 parser: java_parser(),
                 docs: HashMap::new(),
                 results: HashMap::new(),
-                semantic: semantic_diagnostics_enabled(),
+                semantic,
             };
             while let Some(message) = rx.blocking_recv() {
                 match message {

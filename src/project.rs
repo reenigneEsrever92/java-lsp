@@ -3,12 +3,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
-use tower_lsp::lsp_types::Url;
-
-use crate::hub::{next_notification, HubClient};
-use crate::messages::{DriverMessage, ProgressUpdate, Stage};
 use crate::resolve::{local_repository, EffectivePom, Resolver};
 
 /// One Maven module (or the whole workspace in fallback mode).
@@ -141,7 +136,8 @@ fn find_poms_recursive(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
 }
 
 /// Walks the workspace: discovers the Maven model and collects the `.java` files
-/// under its source roots. The project driver runs this off the request path.
+/// under its source roots. The warm-up coordinator runs this off the request
+/// path.
 pub(crate) fn walk_project(root: &Path) -> (ProjectModel, Vec<PathBuf>) {
     let mut resolver = Resolver::new(local_repository());
     let model = discover(root, &mut resolver);
@@ -172,95 +168,6 @@ fn collect_java_files(dir: &Path, out: &mut Vec<PathBuf>) {
             out.push(path);
         }
     }
-}
-
-// -- the project driver -----------------------------------------------------
-
-/// Starts the project driver on the hub: on an added folder it walks for the
-/// Maven model and the source inventory, and once the core stages and the
-/// downloader have reported it flips `ready` and closes the progress item.
-pub fn spawn(hub: &HubClient) {
-    let client = hub.labeled("project");
-    let mut rx = client.subscribe();
-    tokio::spawn(async move {
-        let mut root: Option<Url> = None;
-        let mut started: Option<std::time::Instant> = None;
-        let mut maven = false;
-        let mut counts: HashMap<Stage, usize> = HashMap::new();
-        let mut ready_sent = false;
-        let mut summary_sent = false;
-        while let Some(message) = next_notification(&mut rx).await {
-            match message {
-                DriverMessage::FolderAdded { uri } if root.is_none() => {
-                    root = Some(uri.clone());
-                    started = Some(std::time::Instant::now());
-                    let _ = client.notify(DriverMessage::Progress(ProgressUpdate::Begin {
-                        title: "java-lsp".to_string(),
-                        message: "Indexing workspace".to_string(),
-                    }));
-                    let client = client.clone();
-                    let _ = tokio::task::spawn_blocking(move || match uri.to_file_path() {
-                        Ok(path) => {
-                            let (model, files) = walk_project(&path);
-                            let _ = client.notify(DriverMessage::ProjectModel {
-                                model: Arc::new(model),
-                            });
-                            let _ = client.notify(DriverMessage::SourceInventory {
-                                files: Arc::new(files),
-                            });
-                        }
-                        Err(_) => {
-                            let _ = client.notify(DriverMessage::ProjectModel {
-                                model: Arc::new(ProjectModel::default()),
-                            });
-                            let _ = client.notify(DriverMessage::SourceInventory {
-                                files: Arc::new(Vec::new()),
-                            });
-                        }
-                    })
-                    .await;
-                }
-                DriverMessage::ProjectModel { model } => {
-                    maven = model.maven;
-                }
-                DriverMessage::StageDone { stage, count } => {
-                    counts.insert(stage, count);
-                    if !ready_sent
-                        && counts.contains_key(&Stage::Sources)
-                        && counts.contains_key(&Stage::Jars)
-                        && counts.contains_key(&Stage::Jdk)
-                    {
-                        ready_sent = true;
-                        let _ = client.notify(DriverMessage::Ready);
-                    }
-                    if ready_sent && !summary_sent && counts.contains_key(&Stage::Downloads) {
-                        summary_sent = true;
-                        let files = counts.get(&Stage::Sources).copied().unwrap_or(0);
-                        let jars = counts.get(&Stage::Jars).copied().unwrap_or(0);
-                        let jdk_classes = counts.get(&Stage::Jdk).copied().unwrap_or(0);
-                        let elapsed_ms = started
-                            .map(|at| at.elapsed().as_millis() as u64)
-                            .unwrap_or(0);
-                        let root = root.as_ref().map(Url::to_string).unwrap_or_default();
-                        let _ = client.notify(DriverMessage::Summary {
-                            root,
-                            files,
-                            jars,
-                            jdk_classes,
-                            maven,
-                            elapsed_ms,
-                        });
-                        let _ = client.notify(DriverMessage::Progress(ProgressUpdate::End {
-                            message: Some(format!(
-                                "Indexed {files} files, {jars} dependency jars, {jdk_classes} JDK classes"
-                            )),
-                        }));
-                    }
-                }
-                _ => {}
-            }
-        }
-    });
 }
 
 #[cfg(test)]
