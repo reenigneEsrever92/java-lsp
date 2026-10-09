@@ -33,7 +33,7 @@ use tokio::sync::mpsc::{
     self as tokio_mpsc, unbounded_channel, UnboundedReceiver, UnboundedSender,
 };
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, info};
 
 use crate::messages::{Envelope, Message, Response};
 
@@ -97,7 +97,7 @@ impl Hub {
     }
 
     async fn forward(&self, msg: Envelope) {
-        debug!(?msg, "Hub message");
+        info!(?msg, "Hub message");
 
         match &*msg.message {
             Message::Request(_request) => todo!(),
