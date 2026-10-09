@@ -1,114 +1,32 @@
-//! The LSP shell: editor-facing handlers. The shell is just another client on
-//! the engine hub ([`crate::hub`]): it notifies the editor's input, requests the
-//! editor's queries, and renders the editor-facing notifications (diagnostics,
-//! progress, notices) it receives on its own subscription. It is built by
-//! [`crate::engine::start`], with every other participant.
+//! The LSP shell: the editor-facing [`LanguageServer`] and the hub's first
+//! client.
+//!
+//! The shell is a hub client like any other ([`crate::hub`]): it notifies the
+//! editor's input and renders the editor-facing notifications it receives on its
+//! own subscription. The engine modules it talks to — the document module, the
+//! index, the analysis core, the diagnostics and quick-fix subsystems, and the
+//! warm-up drivers — are being reintroduced one at a time, so this is the
+//! skeleton: the lifecycle handshake, the workspace root published on the hub,
+//! and a drain task ready to render what the modules publish next.
 
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
+use tokio::sync::mpsc::UnboundedReceiver;
 use tower_lsp::jsonrpc::Result;
-use tower_lsp::lsp_types::request::{
-    GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
-    GotoImplementationResponse,
-};
-use tower_lsp::lsp_types::{
-    notification::Progress, request::WorkDoneProgressCreate, CodeActionKind, CodeActionOptions,
-    CodeActionOrCommand, CodeActionParams, CodeActionProviderCapability, CodeActionResponse,
-    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
-    DidChangeTextDocumentParams, DidChangeWatchedFilesParams,
-    DidChangeWatchedFilesRegistrationOptions, DidCloseTextDocumentParams,
-    DidOpenTextDocumentParams, DocumentSymbolParams, DocumentSymbolResponse, FileChangeType,
-    FileSystemWatcher, FoldingRange, FoldingRangeParams, FoldingRangeProviderCapability,
-    GlobPattern, GotoDefinitionParams, GotoDefinitionResponse, Hover, HoverParams,
-    HoverProviderCapability, ImplementationProviderCapability, InitializeParams, InitializeResult,
-    InitializedParams, InlayHint, InlayHintParams, Location, MessageType, NumberOrString, OneOf,
-    ProgressParams, ProgressParamsValue, ReferenceParams, Registration, RenameParams,
-    ResourceOperationKind, SemanticTokenModifier, SemanticTokensFullOptions, SemanticTokensLegend,
-    SemanticTokensOptions, SemanticTokensParams, SemanticTokensResult,
-    SemanticTokensServerCapabilities, ServerCapabilities, SignatureHelp, SignatureHelpOptions,
-    SignatureHelpParams, SymbolInformation, TextDocumentSyncCapability, TextDocumentSyncKind, Url,
-    WorkDoneProgress, WorkDoneProgressBegin, WorkDoneProgressCreateParams, WorkDoneProgressEnd,
-    WorkDoneProgressOptions, WorkDoneProgressReport, WorkspaceEdit, WorkspaceSymbolParams,
-};
-use tower_lsp::{Client, LanguageServer};
+use tower_lsp::lsp_types::{InitializeParams, InitializeResult, InitializedParams, Url};
+use tower_lsp::LanguageServer;
 
 use crate::hub::HubClient;
-use crate::messages::{DriverMessage, Hub, MessageLevel, ProgressUpdate, WatchedChange};
+use crate::messages::{Message, Notification};
 
-/// The single background job's progress token.
-const PROGRESS_TOKEN: &str = "java-lsp/warm-up";
-
-/// The dynamic registration id for the watched-file capability.
-const WATCHER_REGISTRATION_ID: &str = "java-lsp/watched-files";
-
-/// The legend for the semantic tokens the engine emits; keep in sync with
-/// `analysis::SEMANTIC_TOKEN_TYPES`.
-fn semantic_token_legend() -> SemanticTokensLegend {
-    SemanticTokensLegend {
-        token_types: crate::analysis::SEMANTIC_TOKEN_TYPES.to_vec(),
-        token_modifiers: Vec::<SemanticTokenModifier>::new(),
-    }
-}
-
-/// Asks the client to create the progress item, once. Fire-and-forget: the
-/// response is ignored so a client that never replies cannot block the drain
-/// task, and the request still precedes the first `$/progress` on the same
-/// ordered transport.
-fn create_progress(client: &Client, token: NumberOrString) {
-    let client = client.clone();
-    tokio::spawn(async move {
-        let _ = client
-            .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams { token })
-            .await;
-    });
-}
-
-/// Sends one `$/progress` notification for the background job.
-async fn send_progress(client: &Client, token: NumberOrString, update: ProgressUpdate) {
-    let value = match update {
-        ProgressUpdate::Begin { title, message } => {
-            WorkDoneProgress::Begin(WorkDoneProgressBegin {
-                title,
-                cancellable: Some(false),
-                message: Some(message),
-                percentage: None,
-            })
-        }
-        ProgressUpdate::Update {
-            message,
-            percentage,
-        } => WorkDoneProgress::Report(WorkDoneProgressReport {
-            cancellable: Some(false),
-            message: Some(message),
-            percentage,
-        }),
-        ProgressUpdate::End { message } => WorkDoneProgress::End(WorkDoneProgressEnd { message }),
-    };
-    let _ = client
-        .send_notification::<Progress>(ProgressParams {
-            token,
-            value: ProgressParamsValue::WorkDone(value),
-        })
-        .await;
-}
-
+/// The LSP shell: the hub's first client.
 pub struct JavaLanguageServer {
-    /// The shell's client on the engine hub (logged as `server`).
+    /// The shell's client on the engine hub.
     hub: HubClient,
-    /// The client, so `initialized` can register the watched-file capability.
-    client: Client,
+    /// The workspace root learned in `initialize`, published on the hub in
+    /// `initialized` as [`Notification::FolderAdded`].
     workspace_root: Mutex<Option<Url>>,
-    /// Whether the client advertised `window.workDoneProgress`, read in
-    /// `initialize`; progress and notices are dropped when it is false.
-    progress: Arc<AtomicBool>,
-    /// Whether the client supports dynamic registration of
-    /// `workspace/didChangeWatchedFiles`, read in `initialize` (D6).
-    watched_files: Arc<AtomicBool>,
-    /// Whether the quick-fix module is enabled; when it is, `initialize`
-    /// advertises `codeActionProvider`.
-    quickfix: bool,
 }
 
 impl std::fmt::Debug for JavaLanguageServer {
@@ -118,97 +36,23 @@ impl std::fmt::Debug for JavaLanguageServer {
 }
 
 impl JavaLanguageServer {
-    /// Builds the shell on `hub`, the client [`engine::start`] gives it.
+    /// Builds the shell on `hub` — the client `main` registered first — with the
+    /// notification subscription `incoming` it took from that client.
     ///
-    /// `quickfix` mirrors the launch configuration so `initialize` only
-    /// advertises `codeActionProvider` when the quick-fix module is running.
-    ///
-    /// [`engine::start`]: crate::engine::start
-    pub fn new(client: Client, hub: &HubClient, quickfix: bool) -> Self {
-        // The shell is a participant on the hub like any other: it labels
-        // itself, subscribes for every notification, and this task renders the
-        // editor-facing ones as client notifications. Unbounded, so a slow
-        // client can never stall the hub.
-        let hub = hub.labeled("server");
-        let progress = Arc::new(AtomicBool::new(false));
-        let mut incoming = hub.subscribe();
-        let publishing = client.clone();
-        let supported = progress.clone();
+    /// The shell drains `incoming` on its own task, so the hub never blocks on a
+    /// slow client; the editor-facing notifications (diagnostics, progress,
+    /// notices) are rendered here as the modules that publish them return.
+    pub fn new(hub: HubClient, mut incoming: UnboundedReceiver<Arc<Message>>) -> Self {
         tokio::spawn(async move {
-            // One background job at a time, so one progress token.
-            let token = NumberOrString::String(PROGRESS_TOKEN.to_string());
-            let mut created = false;
-            while let Some(message) = incoming.recv().await {
-                let Hub::Notify(message) = message else {
-                    continue;
-                };
-                match message {
-                    DriverMessage::Diagnostics {
-                        uri,
-                        version,
-                        diagnostics,
-                    } => {
-                        publishing
-                            .publish_diagnostics(uri, diagnostics, version)
-                            .await
-                    }
-                    DriverMessage::Progress(update) => {
-                        if !supported.load(Ordering::Relaxed) {
-                            continue;
-                        }
-                        if !created {
-                            created = true;
-                            create_progress(&publishing, token.clone());
-                        }
-                        send_progress(&publishing, token.clone(), update).await;
-                    }
-                    DriverMessage::Notice { level, text } => {
-                        let kind = match level {
-                            MessageLevel::Info => MessageType::INFO,
-                            MessageLevel::Warning => MessageType::WARNING,
-                        };
-                        publishing.show_message(kind, text).await;
-                    }
-                    _ => {}
-                }
+            while incoming.recv().await.is_some() {
+                // Nothing to render yet: the modules that publish the
+                // editor-facing notifications are reintroduced one at a time.
             }
         });
         Self {
             hub,
-            client,
             workspace_root: Mutex::new(None),
-            progress,
-            watched_files: Arc::new(AtomicBool::new(false)),
-            quickfix,
         }
-    }
-
-    /// The shell's hub client, shared with tests.
-    pub fn hub(&self) -> HubClient {
-        self.hub.clone()
-    }
-
-    /// Registers `workspace/didChangeWatchedFiles` for `**/*.java` (D1).
-    /// Fire-and-forget, like the progress item: the handshake must never block
-    /// on a client that does not answer the registration request.
-    fn register_watcher(&self) {
-        let options = DidChangeWatchedFilesRegistrationOptions {
-            watchers: vec![FileSystemWatcher {
-                glob_pattern: GlobPattern::String("**/*.java".to_string()),
-                kind: None,
-            }],
-        };
-        let client = self.client.clone();
-        tokio::spawn(async move {
-            let registration = Registration {
-                id: WATCHER_REGISTRATION_ID.to_string(),
-                method: "workspace/didChangeWatchedFiles".to_string(),
-                register_options: serde_json::to_value(options).ok(),
-            };
-            if let Err(error) = client.register_capability(vec![registration]).await {
-                tracing::warn!(%error, "watched-file registration failed");
-            }
-        });
     }
 }
 
@@ -216,30 +60,6 @@ impl JavaLanguageServer {
 impl LanguageServer for JavaLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("initializing java-lsp");
-        let progress_supported = params
-            .capabilities
-            .window
-            .as_ref()
-            .and_then(|window| window.work_done_progress)
-            .unwrap_or(false);
-        self.progress.store(progress_supported, Ordering::Relaxed);
-        // The create-type quick fix needs the client to accept a `CreateFile`
-        // resource operation; without it, those actions are withheld.
-        let workspace = params.capabilities.workspace.as_ref();
-        let resource_operations = workspace
-            .and_then(|workspace| workspace.workspace_edit.as_ref())
-            .and_then(|edit| edit.resource_operations.as_ref())
-            .is_some_and(|operations| operations.contains(&ResourceOperationKind::Create));
-        self.hub.notify(DriverMessage::ClientCapabilities {
-            resource_operations,
-        });
-        // The watched-file fix is only registered with a client that supports
-        // dynamic registration (D6); without it the rest of the fix stands.
-        let watched_files = workspace
-            .and_then(|workspace| workspace.did_change_watched_files.as_ref())
-            .and_then(|capabilities| capabilities.dynamic_registration)
-            .unwrap_or(false);
-        self.watched_files.store(watched_files, Ordering::Relaxed);
         let root = params.root_uri.or_else(|| {
             params
                 .workspace_folders
@@ -248,7 +68,7 @@ impl LanguageServer for JavaLanguageServer {
         });
         match root {
             Some(root) => {
-                tracing::info!(root = %root, "workspace root");
+                tracing::info!(%root, "workspace root");
                 if let Ok(mut slot) = self.workspace_root.lock() {
                     *slot = Some(root);
                 }
@@ -257,280 +77,26 @@ impl LanguageServer for JavaLanguageServer {
             // attributable to the handshake instead of a silent failure.
             None => tracing::warn!("no workspace root; workspace indexing is disabled"),
         }
-        Ok(InitializeResult {
-            capabilities: ServerCapabilities {
-                text_document_sync: Some(TextDocumentSyncCapability::Kind(
-                    TextDocumentSyncKind::INCREMENTAL,
-                )),
-                hover_provider: Some(HoverProviderCapability::Simple(true)),
-                definition_provider: Some(OneOf::Left(true)),
-                declaration_provider: Some(DeclarationCapability::Simple(true)),
-                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
-                completion_provider: Some(CompletionOptions {
-                    trigger_characters: Some(vec![".".to_string()]),
-                    ..CompletionOptions::default()
-                }),
-                signature_help_provider: Some(SignatureHelpOptions {
-                    trigger_characters: Some(vec!["(".to_string(), ",".to_string()]),
-                    retrigger_characters: None,
-                    work_done_progress_options: WorkDoneProgressOptions::default(),
-                }),
-                document_symbol_provider: Some(OneOf::Left(true)),
-                workspace_symbol_provider: Some(OneOf::Left(true)),
-                references_provider: Some(OneOf::Left(true)),
-                rename_provider: Some(OneOf::Left(true)),
-                code_action_provider: self.quickfix.then(|| {
-                    CodeActionProviderCapability::Options(CodeActionOptions {
-                        code_action_kinds: Some(vec![CodeActionKind::QUICKFIX]),
-                        ..CodeActionOptions::default()
-                    })
-                }),
-                inlay_hint_provider: Some(OneOf::Left(true)),
-                folding_range_provider: Some(FoldingRangeProviderCapability::Simple(true)),
-                semantic_tokens_provider: Some(SemanticTokensServerCapabilities::from(
-                    SemanticTokensOptions {
-                        work_done_progress_options: WorkDoneProgressOptions::default(),
-                        legend: semantic_token_legend(),
-                        range: Some(false),
-                        full: Some(SemanticTokensFullOptions::Bool(true)),
-                    },
-                )),
-                ..ServerCapabilities::default()
-            },
-            ..InitializeResult::default()
-        })
+        Ok(InitializeResult::default())
     }
 
     async fn initialized(&self, _: InitializedParams) {
         tracing::info!("java-lsp initialized");
-        // One dynamic registration, when the client supports it: without a
-        // watcher the server never learns about files the editor did not open.
-        let watched = self.watched_files.load(Ordering::Relaxed);
-        tracing::debug!(
-            watched_files = watched,
-            "client capability: workspace.didChangeWatchedFiles.dynamicRegistration"
-        );
-        if watched {
-            tracing::debug!("registering workspace/didChangeWatchedFiles for **/*.java");
-            self.register_watcher();
-        }
-        // The background workspace scan starts once the handshake completes;
-        // it never blocks text sync or request handling (R6).
+        // The warm-up starts once the handshake completes: the shell publishes
+        // the workspace root and the drivers take it from there.
         let root = self
             .workspace_root
             .lock()
             .ok()
             .and_then(|slot| slot.clone());
-        if let Some(root) = root {
-            self.hub.notify(DriverMessage::FolderAdded { uri: root });
-        }
-    }
-
-    async fn did_change_watched_files(&self, params: DidChangeWatchedFilesParams) {
-        tracing::debug!(changes = params.changes.len(), "didChangeWatchedFiles");
-        for event in params.changes {
-            let change = if event.typ == FileChangeType::CREATED {
-                WatchedChange::Created
-            } else if event.typ == FileChangeType::DELETED {
-                WatchedChange::Deleted
-            } else {
-                WatchedChange::Changed
-            };
-            self.hub.notify(DriverMessage::FileEvent {
-                uri: event.uri,
-                change,
-            });
+        if let Some(uri) = root {
+            self.hub
+                .notify(Message::Notification(Notification::FolderAdded { uri }));
         }
     }
 
     async fn shutdown(&self) -> Result<()> {
         tracing::info!("shutdown requested");
         Ok(())
-    }
-
-    async fn code_action(&self, params: CodeActionParams) -> Result<Option<CodeActionResponse>> {
-        let uri = params.text_document.uri;
-        let actions = self
-            .hub
-            .code_actions(&uri, params.context.diagnostics)
-            .await;
-        if actions.is_empty() {
-            return Ok(None);
-        }
-        Ok(Some(
-            actions
-                .into_iter()
-                .map(CodeActionOrCommand::CodeAction)
-                .collect(),
-        ))
-    }
-
-    async fn did_open(&self, params: DidOpenTextDocumentParams) {
-        let uri = params.text_document.uri;
-        let version = params.text_document.version;
-        let text = params.text_document.text;
-        tracing::info!(uri = %uri, version, "didOpen");
-        // The document module stores the text; diagnostics follow as a hub
-        // notification, so the shell need not ask.
-        self.hub.notify(DriverMessage::DocumentOpened {
-            uri,
-            text: Arc::new(text),
-            version,
-        });
-    }
-
-    async fn did_change(&self, params: DidChangeTextDocumentParams) {
-        let uri = params.text_document.uri;
-        let version = params.text_document.version;
-        tracing::debug!(uri = %uri, version, changes = params.content_changes.len(), "didChange");
-        // The document module owns the store: it applies the changes and returns
-        // the new text, and the shell awaits it before notifying, so an edit still
-        // lands before the query the client sends at the new cursor.
-        let Some(text) = self
-            .hub
-            .document_change(uri.clone(), version, params.content_changes)
-            .await
-        else {
-            tracing::warn!(uri = %uri, "didChange for unopened document");
-            return;
-        };
-        self.hub
-            .notify(DriverMessage::DocumentChanged { uri, text, version });
-    }
-
-    async fn did_close(&self, params: DidCloseTextDocumentParams) {
-        let uri = params.text_document.uri;
-        tracing::info!(uri = %uri, "didClose");
-        // The document module drops the text; the diagnostics module clears the
-        // closed document's diagnostics.
-        self.hub.notify(DriverMessage::DocumentClosed { uri });
-    }
-
-    async fn hover(&self, params: HoverParams) -> Result<Option<Hover>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        Ok(self.hub.hover(uri, position).await)
-    }
-
-    async fn goto_definition(
-        &self,
-        params: GotoDefinitionParams,
-    ) -> Result<Option<GotoDefinitionResponse>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        Ok(self
-            .hub
-            .definition(uri, position)
-            .await
-            .map(GotoDefinitionResponse::Scalar))
-    }
-
-    // Java has no separate declaration/definition split (no headers or
-    // forward declarations), so a declaration request lands where a
-    // definition request does.
-    async fn goto_declaration(
-        &self,
-        params: GotoDeclarationParams,
-    ) -> Result<Option<GotoDeclarationResponse>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        Ok(self
-            .hub
-            .definition(uri, position)
-            .await
-            .map(GotoDeclarationResponse::Scalar))
-    }
-
-    async fn goto_implementation(
-        &self,
-        params: GotoImplementationParams,
-    ) -> Result<Option<GotoImplementationResponse>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        let locations = self.hub.implementation(uri, position).await;
-        // An empty result is a refusal as much as a "none found": report null
-        // rather than claiming the contract has no implementations.
-        if locations.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(GotoImplementationResponse::Array(locations)))
-        }
-    }
-
-    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        Ok(self.hub.completions(uri, position).await)
-    }
-
-    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        let include_declaration = params.context.include_declaration;
-        let references = self
-            .hub
-            .references(uri, position, include_declaration)
-            .await;
-        // An empty result is a refusal as much as a "none found": report null
-        // rather than claiming the symbol has no occurrences.
-        if references.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(references))
-        }
-    }
-
-    async fn rename(&self, params: RenameParams) -> Result<Option<WorkspaceEdit>> {
-        let uri = params.text_document_position.text_document.uri;
-        let position = params.text_document_position.position;
-        Ok(self.hub.rename(uri, position, params.new_name).await)
-    }
-
-    async fn document_symbol(
-        &self,
-        params: DocumentSymbolParams,
-    ) -> Result<Option<DocumentSymbolResponse>> {
-        let uri = params.text_document.uri;
-        Ok(self
-            .hub
-            .document_symbols(uri)
-            .await
-            .map(DocumentSymbolResponse::Nested))
-    }
-
-    async fn symbol(
-        &self,
-        params: WorkspaceSymbolParams,
-    ) -> Result<Option<Vec<SymbolInformation>>> {
-        Ok(Some(self.hub.workspace_symbols(params.query).await))
-    }
-
-    async fn folding_range(&self, params: FoldingRangeParams) -> Result<Option<Vec<FoldingRange>>> {
-        let uri = params.text_document.uri;
-        Ok(self.hub.folding_ranges(uri).await)
-    }
-
-    async fn semantic_tokens_full(
-        &self,
-        params: SemanticTokensParams,
-    ) -> Result<Option<SemanticTokensResult>> {
-        let uri = params.text_document.uri;
-        Ok(self
-            .hub
-            .semantic_tokens(uri)
-            .await
-            .map(SemanticTokensResult::Tokens))
-    }
-
-    async fn inlay_hint(&self, params: InlayHintParams) -> Result<Option<Vec<InlayHint>>> {
-        let uri = params.text_document.uri;
-        let range = params.range;
-        Ok(Some(self.hub.inlay_hints(uri, range).await))
-    }
-
-    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
-        let uri = params.text_document_position_params.text_document.uri;
-        let position = params.text_document_position_params.position;
-        Ok(self.hub.signature_help(uri, position).await)
     }
 }

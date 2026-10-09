@@ -1,29 +1,34 @@
 //! Library for the java-lsp language server; the binary in `main.rs` is a
-//! thin stdio entry point around [`server::JavaLanguageServer`].
+//! thin stdio entry point around the LSP server.
+//!
+//! The engine modules are commented out while the hub mechanics are reworked;
+//! they are reintroduced one at a time, re-evaluating each module's interface
+//! and overall design. Live for now: `hub` (the mechanics), `messages` (its
+//! vocabulary), `cli` (the launch configuration), and `server` (the LSP shell
+//! skeleton, the hub's first client).
 
-pub mod analysis;
-pub mod base_cache;
-
-pub mod classfile;
+// pub mod analysis;
+// pub mod base_cache;
+// pub mod classfile;
 pub mod cli;
-pub mod diagnostics;
-pub mod document;
-pub mod engine;
+// pub mod diagnostics;
+// pub mod document;
+// pub mod engine;
 pub mod hub;
-pub mod index;
-pub mod jars;
-pub mod jdk;
+// pub mod index;
+// pub mod jars;
+// pub mod jdk;
 pub mod messages;
-pub mod project;
-pub mod quickfix;
-pub mod resolve;
-pub mod scan;
+// pub mod project;
+// pub mod quickfix;
+// pub mod resolve;
+// pub mod scan;
 pub mod server;
-pub mod sources;
-pub mod startup;
-pub mod types;
+// pub mod sources;
+// pub mod startup;
+// pub mod types;
 
-pub use engine::start;
+// pub use engine::start;
 
 /// Thread stack size for every thread that runs analysis: the runtime's worker
 /// and blocking-pool threads (`main.rs`) and the analysis module's thread.

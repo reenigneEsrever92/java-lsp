@@ -1,3 +1,8 @@
+#![cfg(any())]
+// This end-to-end test drives the real binary and its engine modules, which are
+// commented out in `lib.rs` while the hub is reworked. Remove the `#![cfg(any())]`
+// above as the modules return.
+
 //! End-to-end feature check over stdio against the `example/` Maven workspace:
 //! `greeting-lib` (`Greeter`, `Data`, `DataType`, `SumType`) and `greeting-app`
 //! (`Main`) with a sibling-module dependency. Drives the real binary with raw
