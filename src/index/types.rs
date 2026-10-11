@@ -1,18 +1,182 @@
-//! The declared-type model: types, members, hierarchies, and the layered views
-//! the index reads over them.
+//! The index's data types: the symbol table, the declared-type store, the
+//! declared-type model, and the shared identity types.
 //!
-//! This was `crate::types`'s data half; it lives with the index now, which owns
-//! the declared-type store. `crate::types` keeps the binding/resolution engine
-//! and reads the model through [`TypeLookup`].
+//! Pure data with its derives; every operation on it lives in [`crate::index`]
+//! as a free function. `crate::types` keeps the binding/resolution engine and
+//! reads the model through those functions.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
-use tower_lsp::lsp_types::Url;
+use tower_lsp::lsp_types::{Range, Url};
 
-use crate::index::is_type_kind;
-use crate::index::{IndexKind, SymbolEntry};
+use super::is_type_kind;
+
+// ---------------------------------------------------------------------------
+// Identity
+// ---------------------------------------------------------------------------
+
+/// What kind of declaration a symbol is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SymbolKind {
+    Class,
+    Interface,
+    Enum,
+    Record,
+    Method,
+    Field,
+    /// One `enum` constant — completes as an enum member and is offered by a
+    /// receiver like a field, but is not a type and not a plain field.
+    EnumConstant,
+    Import,
+}
+
+/// Transitional alias for the modules that still say `IndexKind`; new code
+/// should say [`SymbolKind`].
+pub use SymbolKind as IndexKind;
+
+/// Where a file's symbols came from. Replaces a `dependency` + `library_source`
+/// pair of flags: one byte, and the predicates the consumer reads name the
+/// policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum FileOrigin {
+    /// A workspace `.java` file: navigable, searchable, renameable.
+    Workspace,
+    /// A class-file entry from a dependency jar or the JDK: completable, but its
+    /// location is not openable, so navigation skips it.
+    Dependency,
+    /// Extracted library sources in the java-lsp cache: completable and openable,
+    /// but never rewritten — rename refuses.
+    LibrarySource,
+}
+
+/// One indexed declaration or import.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SymbolEntry {
+    /// The declaring file — shared across the file's entries.
+    pub uri: Arc<Url>,
+    /// The simple declared name; the `Arc<str>` is shared with the `by_name` key.
+    pub name: Arc<str>,
+    pub kind: SymbolKind,
+    /// The declaring package (`None` for the default package); shared across the
+    /// file's entries.
+    pub package: Option<Arc<str>>,
+    /// Enclosing type names, outermost first.
+    pub container: Arc<[String]>,
+    pub full_range: Range,
+    pub selection_range: Range,
+    pub origin: FileOrigin,
+    /// A Lombok-generated member: a real member of the source type that has no
+    /// declaration of its own, anchored at the field it derives from.
+    pub synthetic: bool,
+}
+
+/// A flat declaration/import table: name → entries, with the per-file view that
+/// keeps incremental updates and the references candidate set cheap.
+#[derive(Default)]
+pub struct SymbolIndex {
+    /// The per-file view, for incremental replace/remove and the candidate set.
+    pub(crate) by_file: HashMap<Url, FileRecord>,
+    /// Name-ordered, so an exact lookup and a prefix range-scan share one
+    /// structure. Keyed by `Arc<str>`, shared with `SymbolEntry::name`.
+    pub(crate) by_name: BTreeMap<Arc<str>, Vec<Arc<SymbolEntry>>>,
+    /// How many entries belong to each package, so a wildcard import can be
+    /// checked in O(1) and a package forgotten exactly when its last entry goes.
+    pub(crate) packages: HashMap<Arc<str>, usize>,
+}
+
+/// One file's entries and file-level origin. Each entry is shared with
+/// `by_name`, so an entry is stored once.
+pub(crate) struct FileRecord {
+    /// The file's entries, in position order.
+    pub(crate) entries: Vec<Arc<SymbolEntry>>,
+    /// File-level origin, kept even when `entries` is empty, so a
+    /// declaration-free workspace file still counts as a references candidate.
+    pub(crate) origin: FileOrigin,
+}
+
+// ---------------------------------------------------------------------------
+// The declared-type store
+// ---------------------------------------------------------------------------
+
+/// One ordered set of artifact layers with a generation-keyed, name-indexed view.
+///
+/// A single type serves both halves of [`TypeStore`]; they differ only in what a
+/// key means and in whether a layer is ever superseded.
+#[derive(Default)]
+pub(crate) struct LayerSet {
+    /// Layers in increasing precedence (a later layer wins), parallel to `keys`.
+    pub(crate) layers: Vec<Arc<TypeModel>>,
+    pub(crate) keys: Vec<Url>,
+    /// `keys[i] -> i`.
+    pub(crate) positions: HashMap<Url, usize>,
+    /// Bumped on every mutation; keys `view`.
+    pub(crate) generation: u64,
+    /// The cached name-indexed view, rebuilt only when `generation` moves.
+    pub(crate) view: Option<(u64, Arc<SourceLayerIndex>)>,
+    /// Keys superseded by a richer layer: a later put for one is refused, so a
+    /// class-file jar and its extracted sources never coexist regardless of the
+    /// producers' arrival order. Only the base uses this.
+    pub(crate) superseded: HashSet<Url>,
+}
+
+/// The declared-type store: a non-source base, the per-source-file models, and a
+/// small overlay for the files whose current model differs from warm-up.
+#[derive(Default)]
+pub(crate) struct TypeStore {
+    /// Jars, the JDK, and extracted library sources, appended per artifact.
+    pub(crate) base: LayerSet,
+    /// The warm-up model of every workspace source file.
+    pub(crate) source: LayerSet,
+    /// Files whose current model differs from warm-up: open buffers, watcher
+    /// re-reads, and close re-reads. This *overrides* a file's source layer
+    /// rather than ranking as one more layer, and it lives outside `source` so a
+    /// keystroke never invalidates the O(workspace) source view.
+    pub(crate) dirty: Arc<HashMap<Url, Arc<TypeModel>>>,
+}
+
+/// The two halves of the declared-type model a query reads: the non-source
+/// `base` and the workspace `overlay` (source layers + dirty).
+#[derive(Clone, Default)]
+pub struct TypeContext {
+    pub base: Arc<SourceLayerIndex>,
+    pub overlay: ModelLayers,
+}
+
+/// What the index needs from the project scan. Kept distilled instead of the
+/// whole project model.
+#[derive(Default)]
+pub(crate) struct WorkspaceLayout {
+    pub(crate) source_roots: Vec<PathBuf>,
+}
+
+/// The workspace index: the symbol table, the declared-type store, the source
+/// roots, the declared-type context a query reads, and the readiness flag.
+/// Owned by the subsystem thread.
+#[derive(Default)]
+pub struct WorkspaceIndex {
+    pub(crate) symbols: SymbolIndex,
+    pub(crate) types: TypeStore,
+    pub(crate) layout: WorkspaceLayout,
+    /// The effective declared-type view, built from `types` when the index is
+    /// made ready.
+    pub(crate) context: TypeContext,
+    pub(crate) ready: bool,
+}
+
+/// A file's line-start byte offsets, built once so many byte offsets convert to
+/// LSP positions in `O(log n)` each instead of rescanning the text from the top
+/// per position — quadratic, and the whole cost of indexing a large file.
+#[derive(Clone)]
+pub(crate) struct LineIndex {
+    pub(crate) starts: Vec<usize>,
+}
+
+// ---------------------------------------------------------------------------
+// The declared-type model
+// ---------------------------------------------------------------------------
 
 /// A Java primitive type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -586,170 +750,6 @@ impl TypeModel {
     }
 }
 
-/// Read-only access to declared types: the workspace model, optionally with a
-/// single open document's types layered over it.
-pub trait TypeLookup {
-    /// The single type named `name`, preferring `package`; `None` when absent
-    /// or ambiguous.
-    fn find_unique(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo>;
-
-    /// The single type declared with this simple name in exactly `package`.
-    /// Unlike [`TypeLookup::find_unique`], a name that only matches a type in
-    /// another package yields `None` rather than a unique-match fallback.
-    fn find_in_package(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo>;
-
-    /// True when any type is declared with this simple name.
-    fn contains(&self, name: &str) -> bool;
-
-    /// Every declared type this lookup holds. The name-keyed queries cannot
-    /// express "all types nested in `X`", so callers that need such a scan use
-    /// this (and [`TypeLookup::nested_types`], built on it).
-    fn all_types(&self) -> Vec<&TypeInfo>;
-
-    /// The types directly nested in the type `owner` declared in `package`, in
-    /// no particular order. A nested type records its enclosing chain in
-    /// `TypeInfo::nested`, so a direct child's innermost `$`-segment names it.
-    fn nested_types(&self, owner: &str, package: Option<&str>) -> Vec<&TypeInfo> {
-        self.all_types()
-            .into_iter()
-            .filter(|info| {
-                info.package.as_deref() == package
-                    && info
-                        .nested
-                        .as_deref()
-                        .and_then(|chain| chain.rsplit('$').next())
-                        == Some(owner)
-            })
-            .collect()
-    }
-
-    /// The top-level types declared directly in `package`. Like
-    /// [`TypeLookup::nested_types`], this is a scan over
-    /// [`TypeLookup::all_types`] for a query the name index cannot express (a
-    /// package's members); nested types are excluded, since a package-qualified
-    /// reference to one names its owner chain, not the package alone.
-    fn types_in_package(&self, package: &str) -> Vec<&TypeInfo> {
-        self.all_types()
-            .into_iter()
-            .filter(|info| info.nested.is_none() && info.package.as_deref() == Some(package))
-            .collect()
-    }
-
-    /// The type a reference points at. A dotted name with no `$` is resolved
-    /// nested-first — its prefix as a type, then the last segment among that
-    /// type's nested types — falling back to reading the prefix as a package; a
-    /// name with no `.` resolves with `package` breaking ties.
-    fn lookup(&self, ty: &Ty, package: Option<&str>) -> Option<&TypeInfo> {
-        match ty {
-            Ty::Array(element) => self.lookup(element, package),
-            Ty::Ref { name, .. } | Ty::Var(name) => {
-                // A dotted name with no `$` may name a nested type
-                // (`Outer.Inner`) or a package-qualified one (`java.util.List`);
-                // Java gives no syntactic signal, so the in-scope type reading is
-                // tried first and the package reading is the fallback.
-                if !name.contains('$') {
-                    if let Some((owner_path, simple)) = name.rsplit_once('.') {
-                        if let Some(owner) = self.lookup(&Ty::reference(owner_path), package) {
-                            if let Some(nested) = self
-                                .nested_types(&owner.name, owner.package.as_deref())
-                                .into_iter()
-                                .find(|info| info.name == simple)
-                            {
-                                return Some(nested);
-                            }
-                        }
-                        return self.find_in_package(simple, Some(owner_path));
-                    }
-                }
-                let simple = name.rsplit(['.', '$']).next().unwrap_or(name);
-                match ty.qualified_package() {
-                    Some(qualifier) => self.find_in_package(simple, Some(qualifier)),
-                    None => self.find_unique(simple, package),
-                }
-            }
-            _ => None,
-        }
-    }
-
-    /// The type's own constructors. Constructors are not inherited, so unlike
-    /// [`TypeLookup::members`] this does not walk the hierarchy.
-    fn constructors(&self, ty: &Ty, package: Option<&str>) -> Vec<Member> {
-        self.lookup(ty, package)
-            .map(|info| info.constructors.clone())
-            .unwrap_or_default()
-    }
-
-    /// The members of `ty`, including inherited ones. Supertype names resolve
-    /// with the subtype's own package as context; cycles are guarded and the
-    /// first declaration of a name wins. Same-named overloads collapse to the
-    /// first — see [`TypeLookup::members_with_overloads`] to keep them apart.
-    fn members(&self, ty: &Ty, package: Option<&str>) -> Vec<Member> {
-        let mut out = Vec::new();
-        let mut seen: HashSet<(String, bool)> = HashSet::new();
-        for member in self.members_with_overloads(ty, package) {
-            let is_method = member.kind == IndexKind::Method;
-            if seen.insert((member.name.clone(), is_method)) {
-                out.push(member);
-            }
-        }
-        out
-    }
-
-    /// The members of `ty`, including inherited ones, with same-named overloads
-    /// kept separate. Unlike [`TypeLookup::members`] — which collapses a name to
-    /// a single member for typing — this deduplicates by name, kind, and
-    /// parameter types, so an override still collapses but genuinely distinct
-    /// overloads remain. Supertype resolution and the cycle guard match
-    /// `members`.
-    fn members_with_overloads(&self, ty: &Ty, package: Option<&str>) -> Vec<Member> {
-        if matches!(ty, Ty::Array(_)) {
-            return Vec::new();
-        }
-        // The root resolves exactly when its name is qualified, and with
-        // `package` breaking ties otherwise.
-        let Some(root) = self.lookup(ty, package) else {
-            return Vec::new();
-        };
-        let root_name = root.name.clone();
-        let root_context = root.package.clone();
-        let mut out = Vec::new();
-        let mut seen: HashSet<(String, bool, String)> = HashSet::new();
-        let mut visited: HashSet<String> = HashSet::new();
-        let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
-        queue.push_back((root_name, root_context));
-        while let Some((name, context)) = queue.pop_front() {
-            if !visited.insert(name.clone()) {
-                continue;
-            }
-            let Some(info) = self.find_unique(&name, context.as_deref()) else {
-                continue;
-            };
-            for member in info.members() {
-                let is_method = member.kind == IndexKind::Method;
-                let key = (member.name.clone(), is_method, params_key(&member.params));
-                if seen.insert(key) {
-                    out.push(member.clone());
-                }
-            }
-            let super_context = info.package.clone().or(context);
-            for supertype in &info.supertypes {
-                // A qualified supertype (every class-file edge) resolves in its
-                // own package, so a base whose simple name is shared across
-                // packages still finds the right type; a source-written simple
-                // name falls back to the subtype's own context as before.
-                if supertype.qualified_package().is_some() {
-                    if let Some(resolved) = self.lookup(supertype, None) {
-                        queue.push_back((resolved.name.clone(), resolved.package.clone()));
-                    }
-                } else if let Some(super_name) = supertype.simple_name() {
-                    queue.push_back((super_name.to_string(), super_context.clone()));
-                }
-            }
-        }
-        out
-    }
-}
-
 /// A stable key for a member's parameter types, for overload deduplication.
 pub(crate) fn params_key(params: &[Param]) -> String {
     params
@@ -759,7 +759,7 @@ pub(crate) fn params_key(params: &[Param]) -> String {
         .join(",")
 }
 
-impl TypeLookup for TypeModel {
+impl TypeModel {
     fn find_unique(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
         let candidates = self.find(name);
         match candidates.len() {
@@ -899,8 +899,8 @@ fn layer_candidates<'a>(declaring: &[&'a TypeModel], name: &str) -> Vec<&'a Type
     out
 }
 
-impl TypeLookup for SourceLayerIndex {
-    fn find_unique(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
+impl SourceLayerIndex {
+    pub(crate) fn find_unique(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
         let declaring = self.declaring(name);
         let first = *declaring.first()?;
         if declaring.len() == 1 {
@@ -924,7 +924,7 @@ impl TypeLookup for SourceLayerIndex {
         }
     }
 
-    fn find_in_package(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
+    pub(crate) fn find_in_package(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
         let declaring = self.declaring(name);
         let first = *declaring.first()?;
         if declaring.len() == 1 {
@@ -937,11 +937,11 @@ impl TypeLookup for SourceLayerIndex {
         matches.next().is_none().then_some(first)
     }
 
-    fn contains(&self, name: &str) -> bool {
+    pub(crate) fn contains(&self, name: &str) -> bool {
         self.by_name.contains_key(name)
     }
 
-    fn all_types(&self) -> Vec<&TypeInfo> {
+    pub(crate) fn all_types(&self) -> Vec<&TypeInfo> {
         let mut seen: HashSet<(&str, Option<&str>, IndexKind, Option<&str>)> = HashSet::new();
         let mut out: Vec<&TypeInfo> = Vec::new();
         // Highest precedence first (layers are in increasing precedence), each
@@ -1131,8 +1131,8 @@ impl ModelLayers {
     }
 }
 
-impl TypeLookup for ModelLayers {
-    fn find_unique(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
+impl ModelLayers {
+    pub(crate) fn find_unique(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
         // The common case is one declaring layer, whose own answer is the merged
         // answer — then nothing is allocated at all.
         let declaring = self.declaring_layers(name);
@@ -1160,7 +1160,7 @@ impl TypeLookup for ModelLayers {
         }
     }
 
-    fn find_in_package(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
+    pub(crate) fn find_in_package(&self, name: &str, package: Option<&str>) -> Option<&TypeInfo> {
         let declaring = self.declaring_layers(name);
         let first = *declaring.first()?;
         if declaring.len() == 1 {
@@ -1173,7 +1173,7 @@ impl TypeLookup for ModelLayers {
         matches.next().is_none().then_some(first)
     }
 
-    fn contains(&self, name: &str) -> bool {
+    pub(crate) fn contains(&self, name: &str) -> bool {
         if let Some(positions) = self.base.by_name.get(name) {
             for &i in positions {
                 match self.dirty.get(self.base.uri_of(i)) {
@@ -1191,7 +1191,7 @@ impl TypeLookup for ModelLayers {
             .any(|(uri, model)| !self.base.contains_uri(uri) && model.contains(name))
     }
 
-    fn all_types(&self) -> Vec<&TypeInfo> {
+    pub(crate) fn all_types(&self) -> Vec<&TypeInfo> {
         self.types().collect()
     }
 }

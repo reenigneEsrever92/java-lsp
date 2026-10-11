@@ -7,51 +7,38 @@
 //! watched file events — plus the read requests it answers; that vocabulary lives
 //! in `messages.rs`.
 //!
-//! This is the declaration pass: the two stores ([`SymbolIndex`] for flat
-//! declarations and imports, [`TypeStore`] for the layered declared-type model),
-//! the shared identity types, and the workspace source scan. The scan is the
-//! index's own: [`spawn`] subscribes for the workspace root, walks it, and parses
-//! each `.java` file into a file's entries ([`extract_entries`]) and its
-//! declared-type model ([`crate::types::collect_type_infos`]), driven by
-//! [`scan_sources`]. The read operations, and the jar and JDK passes, arrive as
-//! the surrounding modules are reintroduced.
+//! This module is behaviour only: every operation is a free function over the
+//! index data in [`types`]. The index's own actions ([`index_source`],
+//! [`scan_sources`], [`set_ready`], [`upsert_file`]) and the declared-type
+//! queries the engine reads ([`find_unique`], [`lookup`], [`members`], …) all
+//! take the index they operate on — [`WorkspaceIndex`] — as their first
+//! parameter. The read operations are the declaration pass's counterpart to the
+//! jar and JDK passes, which arrive as the surrounding modules are reintroduced.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::{Position, Range, Url};
 use tree_sitter::{Node, Parser, Tree};
 
-use self::types::{ModelLayers, SourceLayerIndex, TypeModel};
+use self::types::{
+    params_key, FileRecord, LayerSet, LineIndex, Member, ModelLayers, SourceLayerIndex, TypeInfo,
+    TypeModel,
+};
 use crate::hub::HubClient;
-use crate::messages::{Message, Notification};
+use crate::messages::Notification;
 
+pub mod extract;
 pub mod types;
+
+pub use self::types::{
+    FileOrigin, IndexKind, SymbolEntry, SymbolKind, TypeContext, WorkspaceIndex,
+};
 
 // ---------------------------------------------------------------------------
 // Identity
 // ---------------------------------------------------------------------------
-
-/// What kind of declaration a symbol is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SymbolKind {
-    Class,
-    Interface,
-    Enum,
-    Record,
-    Method,
-    Field,
-    /// One `enum` constant — completes as an enum member and is offered by a
-    /// receiver like a field, but is not a type and not a plain field.
-    EnumConstant,
-    Import,
-}
-
-/// Transitional alias for the modules that still say `IndexKind`; new code
-/// should say [`SymbolKind`].
-pub use SymbolKind as IndexKind;
 
 /// Whether a [`SymbolKind`] names a type declaration (as opposed to a member,
 /// an import, or an enum constant).
@@ -60,262 +47,6 @@ pub fn is_type_kind(kind: SymbolKind) -> bool {
         kind,
         SymbolKind::Class | SymbolKind::Interface | SymbolKind::Enum | SymbolKind::Record
     )
-}
-
-/// Where a file's symbols came from. Replaces a `dependency` + `library_source`
-/// pair of flags: one byte, and the predicates the consumer reads name the policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum FileOrigin {
-    /// A workspace `.java` file: navigable, searchable, renameable.
-    Workspace,
-    /// A class-file entry from a dependency jar or the JDK: completable, but its
-    /// location is not openable, so navigation skips it.
-    Dependency,
-    /// Extracted library sources in the java-lsp cache: completable and openable,
-    /// but never rewritten — rename refuses.
-    LibrarySource,
-}
-
-/// One indexed declaration or import.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct SymbolEntry {
-    /// The declaring file — shared across the file's entries.
-    pub uri: Arc<Url>,
-    /// The simple declared name; the `Arc<str>` is shared with the `by_name` key.
-    pub name: Arc<str>,
-    pub kind: SymbolKind,
-    /// The declaring package (`None` for the default package); shared across the
-    /// file's entries.
-    pub package: Option<Arc<str>>,
-    /// Enclosing type names, outermost first.
-    pub container: Arc<[String]>,
-    pub full_range: Range,
-    pub selection_range: Range,
-    pub origin: FileOrigin,
-    /// A Lombok-generated member: a real member of the source type that has no
-    /// declaration of its own, anchored at the field it derives from.
-    pub synthetic: bool,
-}
-
-// ---------------------------------------------------------------------------
-// Store 1 — the symbol index
-// ---------------------------------------------------------------------------
-
-/// A flat declaration/import table: name → entries, with the per-file view that
-/// keeps incremental updates and the references candidate set cheap.
-#[derive(Default)]
-pub struct SymbolIndex {
-    /// The per-file view, for incremental replace/remove and the candidate set.
-    by_file: HashMap<Url, FileRecord>,
-    /// Name-ordered, so an exact lookup and a prefix range-scan share one
-    /// structure. Keyed by `Arc<str>`, shared with `SymbolEntry::name`.
-    by_name: BTreeMap<Arc<str>, Vec<Arc<SymbolEntry>>>,
-    /// How many entries belong to each package, so a wildcard import can be
-    /// checked in O(1) and a package forgotten exactly when its last entry goes.
-    packages: HashMap<Arc<str>, usize>,
-}
-
-/// One file's entries and file-level origin. Each entry is shared with
-/// `by_name`, so an entry is stored once.
-struct FileRecord {
-    /// The file's entries, in position order.
-    entries: Vec<Arc<SymbolEntry>>,
-    /// File-level origin, kept even when `entries` is empty, so a
-    /// declaration-free workspace file still counts as a references candidate.
-    origin: FileOrigin,
-}
-
-impl SymbolIndex {
-    /// Replaces `uri`'s entries, keeping the name and package views consistent.
-    /// Each entry is allocated once and shared between the per-file and per-name
-    /// views, so an entry is stored a single time.
-    pub fn upsert_file(&mut self, uri: &Url, origin: FileOrigin, entries: Vec<SymbolEntry>) {
-        let entries: Vec<Arc<SymbolEntry>> = entries.into_iter().map(Arc::new).collect();
-        if let Some(old) = self.by_file.insert(
-            uri.clone(),
-            FileRecord {
-                entries: entries.clone(),
-                origin,
-            },
-        ) {
-            for entry in &old.entries {
-                self.remove_from_name(entry);
-                self.remove_from_package(entry);
-            }
-        }
-        for entry in entries {
-            if let Some(package) = &entry.package {
-                *self.packages.entry(Arc::clone(package)).or_default() += 1;
-            }
-            self.by_name
-                .entry(Arc::clone(&entry.name))
-                .or_default()
-                .push(entry);
-        }
-    }
-
-    /// Drops `entry` from the name view, forgetting the name when its last entry
-    /// goes.
-    fn remove_from_name(&mut self, entry: &SymbolEntry) {
-        let name = Arc::clone(&entry.name);
-        let empty = match self.by_name.get_mut(&name) {
-            Some(entries) => {
-                entries.retain(|candidate| candidate.as_ref() != entry);
-                entries.is_empty()
-            }
-            None => false,
-        };
-        if empty {
-            self.by_name.remove(&name);
-        }
-    }
-
-    /// Drops `entry` from the package counts, forgetting the package when its
-    /// last entry goes.
-    fn remove_from_package(&mut self, entry: &SymbolEntry) {
-        let Some(package) = entry.package.clone() else {
-            return;
-        };
-        let gone = match self.packages.get_mut(&package) {
-            Some(count) => {
-                *count -= 1;
-                *count == 0
-            }
-            None => false,
-        };
-        if gone {
-            self.packages.remove(&package);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Store 2 — the layered declared-type store
-// ---------------------------------------------------------------------------
-
-/// One ordered set of artifact layers with a generation-keyed, name-indexed view.
-///
-/// A single type serves both halves of [`TypeStore`]; they differ only in what a
-/// key means and in whether a layer is ever superseded.
-#[derive(Default)]
-struct LayerSet {
-    /// Layers in increasing precedence (a later layer wins), parallel to `keys`.
-    layers: Vec<Arc<TypeModel>>,
-    keys: Vec<Url>,
-    /// `keys[i] -> i`.
-    positions: HashMap<Url, usize>,
-    /// Bumped on every mutation; keys `view`.
-    generation: u64,
-    /// The cached name-indexed view, rebuilt only when `generation` moves.
-    view: Option<(u64, Arc<SourceLayerIndex>)>,
-    /// Keys superseded by a richer layer: a later put for one is refused, so a
-    /// class-file jar and its extracted sources never coexist regardless of the
-    /// producers' arrival order. Only the base uses this.
-    superseded: HashSet<Url>,
-}
-
-impl LayerSet {
-    /// Inserts or replaces the layer for `uri`, in place, and invalidates the
-    /// cached name-indexed view.
-    fn put(&mut self, uri: &Url, model: Arc<TypeModel>) {
-        match self.positions.get(uri).copied() {
-            Some(i) => self.layers[i] = model,
-            None => {
-                self.positions.insert(uri.clone(), self.keys.len());
-                self.keys.push(uri.clone());
-                self.layers.push(model);
-            }
-        }
-        self.generation = self.generation.wrapping_add(1);
-    }
-}
-
-/// The declared-type store: a non-source base, the per-source-file models, and a
-/// small overlay for the files whose current model differs from warm-up.
-#[derive(Default)]
-struct TypeStore {
-    /// Jars, the JDK, and extracted library sources, appended per artifact.
-    base: LayerSet,
-    /// The warm-up model of every workspace source file.
-    source: LayerSet,
-    /// Files whose current model differs from warm-up: open buffers, watcher
-    /// re-reads, and close re-reads. This *overrides* a file's source layer
-    /// rather than ranking as one more layer, and it lives outside `source` so a
-    /// keystroke never invalidates the O(workspace) source view.
-    dirty: Arc<HashMap<Url, Arc<TypeModel>>>,
-}
-
-impl TypeStore {
-    /// Records the warm-up declared-type model of one workspace source file.
-    fn set_source(&mut self, uri: &Url, model: Arc<TypeModel>) {
-        self.source.put(uri, model);
-    }
-}
-
-/// The two halves of the declared-type model a query reads: the non-source
-/// `base` and the workspace `overlay` (source layers + dirty).
-#[derive(Clone, Default)]
-pub struct TypeContext {
-    pub base: Arc<SourceLayerIndex>,
-    pub overlay: ModelLayers,
-}
-
-/// What the index needs from the project scan. Kept distilled instead of the
-/// whole project model.
-#[derive(Default)]
-struct WorkspaceLayout {
-    source_roots: Vec<PathBuf>,
-}
-
-// ---------------------------------------------------------------------------
-// The index
-// ---------------------------------------------------------------------------
-
-/// The workspace index: the symbol table, the declared-type store, the source
-/// roots, and the readiness flag. Owned by the subsystem thread.
-#[derive(Default)]
-pub struct WorkspaceIndex {
-    symbols: SymbolIndex,
-    types: TypeStore,
-    layout: WorkspaceLayout,
-    ready: bool,
-}
-
-impl WorkspaceIndex {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Parses one `.java` file and records its index entries and its
-    /// declared-type model. `false` when the file cannot be read or parsed.
-    fn index_source(&mut self, path: &Path, parser: &mut Parser) -> bool {
-        let Ok(text) = std::fs::read_to_string(path) else {
-            return false;
-        };
-        let Some(tree) = parser.parse(text.as_bytes(), None) else {
-            return false;
-        };
-        let Ok(uri) = Url::from_file_path(path) else {
-            return false;
-        };
-        let package = crate::types::file_package(&tree, &text);
-        let mut model = TypeModel::new();
-        model.extend(crate::types::collect_type_infos(
-            package.as_deref(),
-            &tree,
-            &text,
-        ));
-        let entries = extract_entries(&uri, &tree, &text);
-        self.symbols
-            .upsert_file(&uri, FileOrigin::Workspace, entries);
-        self.types.set_source(&uri, Arc::new(model));
-        true
-    }
-
-    /// Marks the warm-up complete.
-    fn set_ready(&mut self) {
-        self.ready = true;
-    }
 }
 
 /// A tree-sitter parser for the Java grammar.
@@ -330,14 +61,6 @@ pub(crate) fn java_parser() -> Parser {
 // ---------------------------------------------------------------------------
 // Byte offsets to LSP positions
 // ---------------------------------------------------------------------------
-
-/// A file's line-start byte offsets, built once so many byte offsets convert to
-/// LSP positions in `O(log n)` each instead of rescanning the text from the top
-/// per position — quadratic, and the whole cost of indexing a large file.
-#[derive(Clone)]
-pub(crate) struct LineIndex {
-    starts: Vec<usize>,
-}
 
 impl LineIndex {
     pub(crate) fn new(text: &str) -> Self {
@@ -385,7 +108,7 @@ impl LineIndex {
 /// Extracts the indexable declarations and imports from a parsed Java file,
 /// attributing every entry to `uri` and to the file's package.
 pub fn extract_entries(uri: &Url, tree: &Tree, text: &str) -> Vec<SymbolEntry> {
-    let package: Option<Arc<str>> = crate::types::file_package(tree, text).map(Arc::from);
+    let package: Option<Arc<str>> = self::extract::file_package(tree, text).map(Arc::from);
     let uri = Arc::new(uri.clone());
     let lines = LineIndex::new(text);
     let container: Arc<[String]> = Arc::from(Vec::new());
@@ -561,7 +284,7 @@ fn collect_lombok_entries(
     container: &Arc<[String]>,
     out: &mut Vec<SymbolEntry>,
 ) {
-    for generated in crate::types::lombok_generated(node, text, type_name) {
+    for generated in self::extract::lombok_generated(node, text, type_name) {
         // A builder member is nested in the builder type, itself nested in the
         // declared type (already the last container segment).
         let container = match &generated.container {
@@ -619,6 +342,357 @@ fn import_name(node: &Node, text: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
+// The symbol index
+// ---------------------------------------------------------------------------
+
+/// Replaces `uri`'s entries, keeping the name and package views consistent.
+/// Each entry is allocated once and shared between the per-file and per-name
+/// views, so an entry is stored a single time.
+pub fn upsert_file(index: &mut WorkspaceIndex, uri: &Url, origin: FileOrigin, entries: Vec<SymbolEntry>) {
+    let entries: Vec<Arc<SymbolEntry>> = entries.into_iter().map(Arc::new).collect();
+    if let Some(old) = index.symbols.by_file.insert(
+        uri.clone(),
+        FileRecord {
+            entries: entries.clone(),
+            origin,
+        },
+    ) {
+        for entry in &old.entries {
+            remove_from_name(&mut index.symbols, entry);
+            remove_from_package(&mut index.symbols, entry);
+        }
+    }
+    for entry in entries {
+        if let Some(package) = &entry.package {
+            *index.symbols.packages.entry(Arc::clone(package)).or_default() += 1;
+        }
+        index
+            .symbols
+            .by_name
+            .entry(Arc::clone(&entry.name))
+            .or_default()
+            .push(entry);
+    }
+}
+
+/// Drops `entry` from the name view, forgetting the name when its last entry
+/// goes.
+fn remove_from_name(symbols: &mut types::SymbolIndex, entry: &SymbolEntry) {
+    let name = Arc::clone(&entry.name);
+    let empty = match symbols.by_name.get_mut(&name) {
+        Some(entries) => {
+            entries.retain(|candidate| candidate.as_ref() != entry);
+            entries.is_empty()
+        }
+        None => false,
+    };
+    if empty {
+        symbols.by_name.remove(&name);
+    }
+}
+
+/// Drops `entry` from the package counts, forgetting the package when its last
+/// entry goes.
+fn remove_from_package(symbols: &mut types::SymbolIndex, entry: &SymbolEntry) {
+    let Some(package) = entry.package.clone() else {
+        return;
+    };
+    let gone = match symbols.packages.get_mut(&package) {
+        Some(count) => {
+            *count -= 1;
+            *count == 0
+        }
+        None => false,
+    };
+    if gone {
+        symbols.packages.remove(&package);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The declared-type store
+// ---------------------------------------------------------------------------
+
+/// Inserts or replaces the layer for `uri`, in place, and invalidates the
+/// cached name-indexed view.
+fn put(set: &mut LayerSet, uri: &Url, model: Arc<TypeModel>) {
+    match set.positions.get(uri).copied() {
+        Some(i) => set.layers[i] = model,
+        None => {
+            set.positions.insert(uri.clone(), set.keys.len());
+            set.keys.push(uri.clone());
+            set.layers.push(model);
+        }
+    }
+    set.generation = set.generation.wrapping_add(1);
+}
+
+/// Records the warm-up declared-type model of one workspace source file.
+pub fn set_source(index: &mut WorkspaceIndex, uri: &Url, model: Arc<TypeModel>) {
+    put(&mut index.types.source, uri, model);
+}
+
+/// Builds one artifact set's name-indexed [`SourceLayerIndex`] view.
+fn source_layer_index(set: &LayerSet) -> Arc<SourceLayerIndex> {
+    let layers: Vec<(Url, Arc<TypeModel>)> = set
+        .keys
+        .iter()
+        .cloned()
+        .zip(set.layers.iter().cloned())
+        .collect();
+    Arc::new(SourceLayerIndex::ordered(layers))
+}
+
+/// Rebuilds the effective declared-type view a query reads from the store's
+/// layers: the non-source `base` and the workspace `overlay` (source layers over
+/// the dirty edit overlay).
+pub fn rebuild_context(index: &mut WorkspaceIndex) {
+    let base = source_layer_index(&index.types.base);
+    let source = source_layer_index(&index.types.source);
+    let overlay = ModelLayers::layered(source, Arc::clone(&index.types.dirty));
+    index.context = TypeContext { base, overlay };
+}
+
+// ---------------------------------------------------------------------------
+// The declared-type queries
+// ---------------------------------------------------------------------------
+
+/// The single type named `name`, preferring `package`; `None` when absent or
+/// ambiguous. The workspace overlay wins over the non-source base.
+pub fn find_unique<'a>(index: &'a WorkspaceIndex, name: &str, package: Option<&str>) -> Option<&'a TypeInfo> {
+    index
+        .context
+        .overlay
+        .find_unique(name, package)
+        .or_else(|| index.context.base.find_unique(name, package))
+}
+
+/// The single type declared with this simple name in exactly `package`. Unlike
+/// [`find_unique`], a name that only matches a type in another package yields
+/// `None` rather than a unique-match fallback.
+pub fn find_in_package<'a>(
+    index: &'a WorkspaceIndex,
+    name: &str,
+    package: Option<&str>,
+) -> Option<&'a TypeInfo> {
+    index
+        .context
+        .overlay
+        .find_in_package(name, package)
+        .or_else(|| index.context.base.find_in_package(name, package))
+}
+
+/// True when any type is declared with this simple name.
+pub fn contains(index: &WorkspaceIndex, name: &str) -> bool {
+    index.context.overlay.contains(name) || index.context.base.contains(name)
+}
+
+/// Every declared type the index holds, overlay first, with same-slot duplicates
+/// collapsed. The name-keyed queries cannot express "all types nested in `X`", so
+/// callers that need such a scan use this (and [`nested_types`], built on it).
+pub fn all_types(index: &WorkspaceIndex) -> Vec<&TypeInfo> {
+    let mut seen: HashSet<(&str, Option<&str>, IndexKind, Option<&str>)> = HashSet::new();
+    let mut out: Vec<&TypeInfo> = Vec::new();
+    for info in index
+        .context
+        .overlay
+        .all_types()
+        .into_iter()
+        .chain(index.context.base.all_types())
+    {
+        let slot = (
+            info.name.as_str(),
+            info.package.as_deref(),
+            info.kind,
+            info.nested.as_deref(),
+        );
+        if seen.insert(slot) {
+            out.push(info);
+        }
+    }
+    out
+}
+
+/// The types directly nested in the type `owner` declared in `package`, in no
+/// particular order. A nested type records its enclosing chain in
+/// `TypeInfo::nested`, so a direct child's innermost `$`-segment names it.
+pub fn nested_types<'a>(index: &'a WorkspaceIndex, owner: &str, package: Option<&str>) -> Vec<&'a TypeInfo> {
+    all_types(index)
+        .into_iter()
+        .filter(|info| {
+            info.package.as_deref() == package
+                && info
+                    .nested
+                    .as_deref()
+                    .and_then(|chain| chain.rsplit('$').next())
+                    == Some(owner)
+        })
+        .collect()
+}
+
+/// The top-level types declared directly in `package`. Like [`nested_types`],
+/// this is a scan over [`all_types`] for a query the name index cannot express
+/// (a package's members); nested types are excluded, since a package-qualified
+/// reference to one names its owner chain, not the package alone.
+pub fn types_in_package<'a>(index: &'a WorkspaceIndex, package: &str) -> Vec<&'a TypeInfo> {
+    all_types(index)
+        .into_iter()
+        .filter(|info| info.nested.is_none() && info.package.as_deref() == Some(package))
+        .collect()
+}
+
+/// The type a reference points at. A dotted name with no `$` is resolved
+/// nested-first — its prefix as a type, then the last segment among that type's
+/// nested types — falling back to reading the prefix as a package; a name with
+/// no `.` resolves with `package` breaking ties.
+pub fn lookup<'a>(index: &'a WorkspaceIndex, ty: &types::Ty, package: Option<&str>) -> Option<&'a TypeInfo> {
+    match ty {
+        types::Ty::Array(element) => lookup(index, element, package),
+        types::Ty::Ref { name, .. } | types::Ty::Var(name) => {
+            // A dotted name with no `$` may name a nested type (`Outer.Inner`)
+            // or a package-qualified one (`java.util.List`); Java gives no
+            // syntactic signal, so the in-scope type reading is tried first and
+            // the package reading is the fallback.
+            if !name.contains('$') {
+                if let Some((owner_path, simple)) = name.rsplit_once('.') {
+                    if let Some(owner) = lookup(index, &types::Ty::reference(owner_path), package) {
+                        if let Some(nested) = nested_types(index, &owner.name, owner.package.as_deref())
+                            .into_iter()
+                            .find(|info| info.name == simple)
+                        {
+                            return Some(nested);
+                        }
+                    }
+                    return find_in_package(index, simple, Some(owner_path));
+                }
+            }
+            let simple = name.rsplit(['.', '$']).next().unwrap_or(name);
+            match ty.qualified_package() {
+                Some(qualifier) => find_in_package(index, simple, Some(qualifier)),
+                None => find_unique(index, simple, package),
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The type's own constructors. Constructors are not inherited, so unlike
+/// [`members`] this does not walk the hierarchy.
+pub fn constructors(index: &WorkspaceIndex, ty: &types::Ty, package: Option<&str>) -> Vec<Member> {
+    lookup(index, ty, package)
+        .map(|info| info.constructors.clone())
+        .unwrap_or_default()
+}
+
+/// The members of `ty`, including inherited ones. Supertype names resolve with
+/// the subtype's own package as context; cycles are guarded and the first
+/// declaration of a name wins. Same-named overloads collapse to the first — see
+/// [`members_with_overloads`] to keep them apart.
+pub fn members(index: &WorkspaceIndex, ty: &types::Ty, package: Option<&str>) -> Vec<Member> {
+    let mut out = Vec::new();
+    let mut seen: HashSet<(String, bool)> = HashSet::new();
+    for member in members_with_overloads(index, ty, package) {
+        let is_method = member.kind == IndexKind::Method;
+        if seen.insert((member.name.clone(), is_method)) {
+            out.push(member);
+        }
+    }
+    out
+}
+
+/// The members of `ty`, including inherited ones, with same-named overloads kept
+/// separate. Unlike [`members`] — which collapses a name to a single member for
+/// typing — this deduplicates by name, kind, and parameter types, so an override
+/// still collapses but genuinely distinct overloads remain. Supertype resolution
+/// and the cycle guard match `members`.
+pub fn members_with_overloads(
+    index: &WorkspaceIndex,
+    ty: &types::Ty,
+    package: Option<&str>,
+) -> Vec<Member> {
+    if matches!(ty, types::Ty::Array(_)) {
+        return Vec::new();
+    }
+    // The root resolves exactly when its name is qualified, and with `package`
+    // breaking ties otherwise.
+    let Some(root) = lookup(index, ty, package) else {
+        return Vec::new();
+    };
+    let root_name = root.name.clone();
+    let root_context = root.package.clone();
+    let mut out = Vec::new();
+    let mut seen: HashSet<(String, bool, String)> = HashSet::new();
+    let mut visited: HashSet<String> = HashSet::new();
+    let mut queue: VecDeque<(String, Option<String>)> = VecDeque::new();
+    queue.push_back((root_name, root_context));
+    while let Some((name, context)) = queue.pop_front() {
+        if !visited.insert(name.clone()) {
+            continue;
+        }
+        let Some(info) = find_unique(index, &name, context.as_deref()) else {
+            continue;
+        };
+        for member in info.members() {
+            let is_method = member.kind == IndexKind::Method;
+            let key = (member.name.clone(), is_method, params_key(&member.params));
+            if seen.insert(key) {
+                out.push(member.clone());
+            }
+        }
+        let super_context = info.package.clone().or(context);
+        for supertype in &info.supertypes {
+            // A qualified supertype (every class-file edge) resolves in its own
+            // package, so a base whose simple name is shared across packages
+            // still finds the right type; a source-written simple name falls
+            // back to the subtype's own context as before.
+            if supertype.qualified_package().is_some() {
+                if let Some(resolved) = lookup(index, supertype, None) {
+                    queue.push_back((resolved.name.clone(), resolved.package.clone()));
+                }
+            } else if let Some(super_name) = supertype.simple_name() {
+                queue.push_back((super_name.to_string(), super_context.clone()));
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// The index
+// ---------------------------------------------------------------------------
+
+/// Parses one `.java` file and records its index entries and its declared-type
+/// model. `false` when the file cannot be read or parsed.
+pub(crate) fn index_source(index: &mut WorkspaceIndex, path: &Path, parser: &mut Parser) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(tree) = parser.parse(text.as_bytes(), None) else {
+        return false;
+    };
+    let Ok(uri) = Url::from_file_path(path) else {
+        return false;
+    };
+    let package = self::extract::file_package(&tree, &text);
+    let mut model = TypeModel::new();
+    model.extend(self::extract::collect_type_infos(
+        package.as_deref(),
+        &tree,
+        &text,
+    ));
+    let entries = extract_entries(&uri, &tree, &text);
+    upsert_file(index, &uri, FileOrigin::Workspace, entries);
+    set_source(index, &uri, Arc::new(model));
+    true
+}
+
+/// Marks the warm-up complete and builds the declared-type view a query reads.
+pub fn set_ready(index: &mut WorkspaceIndex) {
+    index.ready = true;
+    rebuild_context(index);
+}
+
+// ---------------------------------------------------------------------------
 // The workspace source scan
 // ---------------------------------------------------------------------------
 
@@ -628,7 +702,7 @@ pub(crate) fn scan_sources(files: &[PathBuf], index: &mut WorkspaceIndex) -> usi
     let mut parser = java_parser();
     let mut indexed = 0usize;
     for path in files {
-        if index.index_source(path, &mut parser) {
+        if index_source(index, path, &mut parser) {
             indexed += 1;
         }
     }
@@ -673,7 +747,7 @@ pub fn spawn(hub: &HubClient) {
     let hub = hub.clone();
     tokio::spawn(async move {
         let mut rx = hub.subscribe().await;
-        let mut index = WorkspaceIndex::new();
+        let mut index = WorkspaceIndex::default();
         while let Some(message) = rx.recv().await {
             let Notification::FolderAdded { uri } = &*message else {
                 continue;
@@ -684,7 +758,7 @@ pub fn spawn(hub: &HubClient) {
             index = tokio::task::spawn_blocking(move || {
                 let files = workspace_java_files(&root);
                 scan_sources(&files, &mut index);
-                index.set_ready();
+                set_ready(&mut index);
                 index
             })
             .await
@@ -777,7 +851,7 @@ mod tests {
         )
         .unwrap();
 
-        let mut index = WorkspaceIndex::new();
+        let mut index = WorkspaceIndex::default();
         let count = scan_sources(std::slice::from_ref(&file), &mut index);
 
         assert_eq!(count, 1);
