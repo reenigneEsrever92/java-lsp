@@ -22,7 +22,7 @@ use tower_lsp::lsp_types::{
 use tower_lsp::LanguageServer;
 
 use crate::hub::HubClient;
-use crate::messages::{Message, Notification};
+use crate::messages::Notification;
 
 /// The LSP shell: the hub's first client.
 pub struct JavaLanguageServer {
@@ -46,7 +46,7 @@ impl JavaLanguageServer {
     /// The shell drains `incoming` on its own task, so the hub never blocks on a
     /// slow client; the editor-facing notifications (diagnostics, progress,
     /// notices) are rendered here as the modules that publish them return.
-    pub fn new(hub: HubClient, mut incoming: UnboundedReceiver<Arc<Message>>) -> Self {
+    pub fn new(hub: HubClient, mut incoming: UnboundedReceiver<Arc<Notification>>) -> Self {
         tokio::spawn(async move {
             while incoming.recv().await.is_some() {
                 // Nothing to render yet: the modules that publish the
@@ -106,8 +106,7 @@ impl LanguageServer for JavaLanguageServer {
             .and_then(|slot| slot.clone());
 
         if let Some(uri) = root {
-            self.hub
-                .notify(Message::Notification(Notification::FolderAdded { uri }));
+            self.hub.notify(Notification::FolderAdded { uri });
         }
     }
 

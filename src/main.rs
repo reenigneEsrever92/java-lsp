@@ -34,7 +34,7 @@ fn main() {
         // take its subscription before anything else can publish, so it renders
         // every notification the modules and drivers send.
         let hub = Hub::new();
-        let shell = hub.register("server".to_string());
+        let shell = hub.register("server");
         let incoming = shell.subscribe().await;
 
         let stdin = tokio::io::stdin();
@@ -64,3 +64,5 @@ fn parse_command_line() {
         }
     }
 }
+
+fn setup() {}

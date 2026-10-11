@@ -12,6 +12,14 @@ description: Implement a planned change request from the backlog — follow its 
 Pick the highest `priority`. Read the request and its `# Implementation plan`
 before writing any code.
 
+Some `planned` requests are **umbrellas**: their `# Implementation plan` has a
+`## Sub-tasks` list and their sub-tasks carry `parent: <slug>`. Do not implement
+an umbrella directly — work through its sub-tasks instead. A sub-task is ready
+once it is itself `state: planned` (plan it first with `fawi-plan` if it is still
+`proposed`); pick them up in any order, honouring an order only where the
+umbrella states a dependency. The umbrella closes itself once every sub-task is
+done.
+
 ## 2. Implement
 
 Follow `docs/architecture.md` for the crate layout and consult the relevant docs
@@ -30,6 +38,11 @@ acceptance criteria, and add or update tests.
 - Set `state: done`.
 - Add `verified: { by: <actor>, at: <ISO-8601 timestamp> }`.
 - Link the commit in the body.
+
+When the request carries `parent: <slug>`, tick its box in the umbrella's
+`## Sub-tasks` list. Once every sub-task of an umbrella is `done`, close the
+umbrella too — set its `state: done` with the same `verified` stamp — so the two
+never drift apart.
 
 ## 5. Update the docs
 

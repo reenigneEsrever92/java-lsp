@@ -1,5 +1,34 @@
 # Directory log
 
+## 2026-10-11
+
+- **Architecture doc reconciled with the hub rework**: The hub's request/response
+  mechanics now live in `hub.rs` — a request is routed to the module that owns it
+  (`owner_of`), the reply rides the hub back to its one requester
+  (`HubClient::{request, respond}` around an awaitable `Reply`), each client sorts
+  what it receives through a per-client dispatcher (`subscribe`/`serve`), and the
+  hub logs every message it forwards (`info`). Updated `architecture.md` to
+  match: the Layout (`hub.rs` and `messages.rs`), the **Hub and spoke**
+  paragraph, the Hub and Engine-wiring table rows, the shell-on-the-hub bullet
+  (register/subscribe/serve, `respond`, and the empty reply for a request with no
+  owner), and the "one hub" and "index is its own subsystem" decisions
+  (registration is `Hub::register`, logging is `info`, replies are logged without
+  timing). The rework note now records both landed passes and marks the fuller
+  vocabulary the reintroduced modules will bring (`DriverMessage`,
+  `AnalysisRequest`, `IndexHandle`) as intended design.
+
+## 2026-10-10
+
+- **Architecture doc reconciled with the source-scan fold**: The workspace
+  source scanner is no longer a separate `scan.rs` driver — the index owns its
+  own scan (`index.rs` walks the workspace root and parses each `.java` file into
+  the index). Updated `architecture.md`: the Layout (dropped `scan.rs`; recast
+  `index.rs` as owning the source scan; split the declared-type model in
+  `index/types.rs` from the binding engine in `types.rs`), the components diagram
+  and module table, the implementation notes, and the "index is its own
+  subsystem"/warm-up-driver decisions to match, plus a note that the hub rework
+  leaves several modules commented out of `lib.rs`.
+
 ## 2026-10-03
 
 - **Architecture doc restructured**: Rewrote the `## Components and data flow`

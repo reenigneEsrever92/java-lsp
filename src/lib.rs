@@ -1,32 +1,37 @@
 //! Library for the java-lsp language server; the binary in `main.rs` is a
 //! thin stdio entry point around the LSP server.
 //!
-//! The engine modules are commented out while the hub mechanics are reworked;
-//! they are reintroduced one at a time, re-evaluating each module's interface
-//! and overall design. Live for now: `hub` (the mechanics), `messages` (its
-//! vocabulary), `cli` (the launch configuration), and `server` (the LSP shell
-//! skeleton, the hub's first client).
+//! The engine modules are deprecated while the hub mechanics are reworked; they
+//! are reintroduced one at a time, re-evaluating each module's interface and
+//! overall design. Their sources are kept out of the build under
+//! `src/deprecated/`, so reintroducing one means moving its file back under
+//! `src/` before uncommenting its declaration below. Live for now: `hub` (the
+//! mechanics), `messages` (its vocabulary), `cli` (the launch configuration),
+//! `server` (the LSP shell skeleton, the hub's first client), `index`, and
+//! `types`.
 
+pub mod cli;
+pub mod hub;
+pub mod index;
+pub mod messages;
+pub mod server;
+// pub mod types;
+
+// Deprecated: sources under `src/deprecated/`. Move a file back under `src/`
+// before uncommenting its declaration.
 // pub mod analysis;
 // pub mod base_cache;
 // pub mod classfile;
-pub mod cli;
 // pub mod diagnostics;
 // pub mod document;
 // pub mod engine;
-pub mod hub;
-// pub mod index;
 // pub mod jars;
 // pub mod jdk;
-pub mod messages;
 // pub mod project;
 // pub mod quickfix;
 // pub mod resolve;
-// pub mod scan;
-pub mod server;
 // pub mod sources;
 // pub mod startup;
-// pub mod types;
 
 // pub use engine::start;
 

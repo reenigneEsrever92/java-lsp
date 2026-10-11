@@ -24,6 +24,10 @@ Eligible requests are **finished** — a terminal `state`: `done`, `rejected`, o
 `superseded` — and **older than the window**, 10 days by default. Never touch
 `proposed`, `planned`, or `in-progress` work, or the reserved `index.md`.
 
+A sub-task — a request carrying `parent: <slug>` — is never retired on its own:
+it is condensed with its umbrella. An umbrella is eligible only once every
+sub-task it lists is finished, and the whole group retires together.
+
 Age is measured from when the request reached its terminal state:
 
 - `done` — `verified.at` in the front matter.
@@ -49,6 +53,9 @@ Drop the rest: restated background, feasibility prose, examples that carry no
 decision, implementation minutiae, and filler. Keep concrete facts — crate and
 type names, endpoints, flags — but only where they are the point.
 
+Condense an umbrella together with its sub-tasks: keep the umbrella's overall
+approach and one condensed entry per sub-task, so the group survives intact.
+
 ## 3. Write the summary document
 
 Keep one accumulating document, `docs/dev/backlog/summary.md`, a concept with
@@ -66,6 +73,9 @@ Create the document if it does not exist and link it from
 `docs/dev/backlog/index.md` so nothing dangles; if it already exists, append
 rather than rewrite.
 
+For an umbrella, follow its section with its sub-tasks' condensed entries, so
+the group reads as one.
+
 ## 4. Delete the originals and repoint links
 
 List every reference to the files you are about to remove *before* deleting them.
@@ -78,8 +88,10 @@ Narrow the hits to the removed slugs and repoint each to `backlog/summary.md`
 (or its `#<title-anchor>`). `docs/dev/changelog.md` links every shipped request
 as `backlog/<slug>.md`, and the skill examples often link a past request too.
 Check the archived requests' own cross-links — a superseded request often links
-the one that superseded it — and repoint or drop them so no link dangles. Then
-delete each replaced `<slug>.md`.
+the one that superseded it — and repoint or drop them so no link dangles. A
+sub-task is retired with its umbrella, so the sub-task's `parent:` reference and
+the umbrella's `## Sub-tasks` links disappear together; repoint any inbound link
+to the umbrella's section. Then delete each replaced `<slug>.md`.
 
 Update `docs/dev/backlog/index.md` and `docs/dev/index.md` to say the backlog
 holds open requests and that finished ones are condensed into `summary.md`.

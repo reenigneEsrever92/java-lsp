@@ -34,4 +34,10 @@ For each request:
 - Not viable as planned → `state: rejected`, and either correct the plan or
   hand it back to `fawi-plan`.
 
+Check an umbrella and its sub-tasks together. A request that carries
+`parent: <slug>` belongs to the umbrella it names, and an umbrella's
+`## Sub-tasks` list names its children. If the umbrella no longer applies,
+revisit its sub-tasks and supersede the ones that fall with it; if a single
+sub-task no longer applies, supersede just that one and note it on the umbrella.
+
 Do not implement anything — only confirm or invalidate.

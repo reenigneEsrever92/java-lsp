@@ -2,13 +2,13 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::{TextDocumentContentChangeEvent, Url};
 
-// The `index` module is out while the engine modules are reintroduced one by
-// one; restore this with it.
-// use crate::index::SymbolEntry;
+use crate::index::SymbolEntry;
 
 #[derive(Debug, Clone)]
 pub struct Envelope {
     pub id: u64,
+    pub request_id: Option<u64>,
+    pub sender: &'static str,
     pub message: Arc<Message>,
 }
 
@@ -16,20 +16,49 @@ pub struct Envelope {
 pub enum Message {
     Request(Request),
     Response(Response),
-    Notification(Notification),
+    Notification(Arc<Notification>),
 }
 
 /// A request routed by the hub to the one module that answers it. The owner
-/// answers with the [`ReplyHandle`] it carries; the hub sees that reply, logs and
-/// times it, and delivers the value to the requester waiting on its own channel.
+/// answers by calling [`crate::hub::HubClient::respond`] with the request's id;
+/// the hub sees that reply, logs it, and routes it back to the requester waiting
+/// on its own [`crate::hub::Reply`].
 #[derive(Debug)]
 pub enum Request {
-    IndexQuery { name: String },
+    Index(IndexRequest),
 }
 
+/// A read from the index.
 #[derive(Debug)]
+pub enum IndexRequest {
+    /// All entries declared with exactly `name`.
+    Name { name: String },
+}
+
+#[derive(Debug, Clone)]
 pub enum Response {
-    // `IndexResponse { symbols: SymbolEntry }` — restored with the `index` module.
+    Index(IndexResponse),
+}
+
+/// The empty reply, so a request whose owner is gone resolves to it rather than
+/// leaving the requester waiting.
+impl Default for Response {
+    fn default() -> Self {
+        Response::Index(IndexResponse::default())
+    }
+}
+
+/// The index's reply.
+#[derive(Debug, Clone)]
+pub enum IndexResponse {
+    /// The entries for an [`IndexRequest::Name`].
+    Symbols(Vec<Arc<SymbolEntry>>),
+}
+
+impl Default for IndexResponse {
+    fn default() -> Self {
+        IndexResponse::Symbols(Vec::new())
+    }
 }
 
 /// A notification the hub broadcasts to every subscriber; each consumes the
