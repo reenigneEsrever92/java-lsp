@@ -15,7 +15,6 @@ pub mod hub;
 pub mod index;
 pub mod messages;
 pub mod server;
-// pub mod types;
 
 // Deprecated: sources under `src/deprecated/`. Move a file back under `src/`
 // before uncommenting its declaration.
@@ -32,6 +31,7 @@ pub mod server;
 // pub mod resolve;
 // pub mod sources;
 // pub mod startup;
+// pub mod types;
 
 // pub use engine::start;
 
