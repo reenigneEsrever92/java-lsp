@@ -1,5 +1,20 @@
 # Directory log
 
+## 2026-10-12
+
+- **Architecture doc reconciled with the navigation extraction**: Navigation is
+  no longer the index's own — `src/index/navigate.rs` moved to a top-level
+  `src/navigate.rs`, a hub module (`navigate`) that serves definition,
+  declaration, and references by reading source files itself and the index only
+  over the hub, and the index answers a coarse, batched read API
+  (`IndexRequest`/`IndexBatchRequest`) while the shared Java-reading helpers live
+  in `src/parser.rs`. Updated `architecture.md` to match: the Layout
+  (`index/navigate.rs` gone; `navigate.rs`, `parser.rs`, and `index/read.rs` added;
+  the shell routes navigation to the navigate module), the module table (shell
+  and index rows, plus a new navigate row), the data-flow diagram (a navigate
+  node reading the index), the `WorkspaceIndex` and navigation implementation
+  notes, and the "index is its own subsystem" decision.
+
 ## 2026-10-11
 
 - **Architecture doc reconciled with the hub rework**: The hub's request/response

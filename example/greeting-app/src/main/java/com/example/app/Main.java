@@ -5,8 +5,11 @@ import com.google.gson.Gson;
 import com.example.greeting.Data;
 import org.apache.commons.lang3.StringUtils;
 import com.example.greeting.DataType;
+import com.example.greeting.DataType;
 import one.example.com.SumType;
 import one.example.com.SumType.Type1;
+import one.example.com.TestInterface;
+import one.example.com.TestImpl;
 
 import java.util.List;
 
@@ -15,10 +18,20 @@ import java.util.List;
  * If it would not be main it would be minor
  */
 public class Main {
+
+    TestInterface ti = new TestImpl();
+
     public static void main(String[] args) {
+        ti.doSomething();
+        ti.doSomething();
+
         Greeter greeter = new Greeter("world");
         Gson gson = new Gson();
         var data = new Data(5);
+
+        var ti2 = data.getInterface();
+
+        ti2.doSomething();
 
         var instance = DataType.TYPE_1;
 

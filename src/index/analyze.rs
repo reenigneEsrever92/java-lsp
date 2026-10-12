@@ -1,16 +1,28 @@
-//! Extraction of the declared-type model from a parsed source file: the
-//! `TypeInfo`s for the declarations in one compilation unit, the `Ty`s their
-//! signatures mention, and the members Lombok synthesizes from annotations.
+//! Java analysis and extraction — everything that reads Java source and builds
+//! the index.
 //!
-//! This is the source-reading half of the model in [`super::types`] — it turns a
-//! tree-sitter tree into the model's vocabulary and carries no lookups of its
-//! own. `index.rs` runs it per file during the workspace scan.
+//! This module owns the whole source-reading path: the declared-type model
+//! extracted from a parsed tree (including the members Lombok synthesizes), the
+//! flat index entries extracted from that same tree, the byte-offset-to-position
+//! conversion those entries are anchored with, and the workspace `.java` walk and
+//! scan that drive it all. It turns a parsed tree, or a path on disk, into the
+//! index's vocabulary and stores it: the symbol table's upsert and removal, the
+//! declared-type store's layer updates, and the context rebuild live here too, so
+//! [`super::query`] is left with reads alone.
 
-use tree_sitter::{Node, Tree};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
-use super::types::{params_key, Member, Param, Prim, Ty, TypeInfo};
-use super::IndexKind;
+use tower_lsp::lsp_types::Url;
+use tree_sitter::{Node, Parser, Tree};
 
+use super::types::{
+    FileOrigin, FileRecord, IndexKind, LayerSet, Member, ModelLayers, Param, Prim,
+    SourceLayerIndex, SymbolEntry, SymbolIndex, SymbolKind, Ty, TypeContext, TypeInfo, TypeModel,
+    WorkspaceIndex,
+};
+use super::util::params_key;
+use crate::parser::{file_package, java_parser, type_from_node, LineIndex};
 /// Builds `TypeInfo`s for every class/interface/enum/record declared in a
 /// parsed document, including nested ones.
 pub fn collect_type_infos(package: Option<&str>, tree: &Tree, text: &str) -> Vec<TypeInfo> {
@@ -841,59 +853,6 @@ fn has_modifier(node: &Node, text: &str, modifier: &str) -> bool {
     false
 }
 
-/// Converts a type node into a [`Ty`]. Unknown shapes degrade to
-/// [`Ty::Unknown`] rather than guessing.
-pub fn type_from_node(node: &Node, text: &str) -> Ty {
-    match node.kind() {
-        "integral_type" | "floating_point_type" | "boolean_type" => {
-            Prim::from_keyword(&text[node.byte_range()])
-                .map(Ty::Prim)
-                .unwrap_or(Ty::Unknown)
-        }
-        "void_type" => Ty::Void,
-        "type_identifier" | "scoped_type_identifier" => {
-            Ty::reference(text[node.byte_range()].to_string())
-        }
-        "generic_type" => {
-            // No fields: the base name and `type_arguments` are both children.
-            let mut base = String::new();
-            let mut args = Vec::new();
-            let mut cursor = node.walk();
-            for child in node.named_children(&mut cursor) {
-                match child.kind() {
-                    "type_identifier" | "scoped_type_identifier" if base.is_empty() => {
-                        base = text[child.byte_range()].to_string();
-                    }
-                    "type_arguments" => {
-                        let mut inner = child.walk();
-                        for argument in child.named_children(&mut inner) {
-                            args.push(type_from_node(&argument, text));
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            Ty::Ref { name: base, args }
-        }
-        "array_type" => {
-            let element = node
-                .child_by_field_name("element")
-                .or_else(|| node.named_child(0));
-            match element {
-                Some(element) => Ty::Array(Box::new(type_from_node(&element, text))),
-                None => Ty::Unknown,
-            }
-        }
-        "annotated_type" => node
-            .child_by_field_name("type")
-            .or_else(|| node.named_child(0))
-            .map(|inner| type_from_node(&inner, text))
-            .unwrap_or(Ty::Unknown),
-        "wildcard" => Ty::Unknown,
-        _ => Ty::Unknown,
-    }
-}
-
 fn collect_parameter_names(params: &Node, text: &str, out: &mut Vec<String>) {
     let mut cursor = params.walk();
     for parameter in params.named_children(&mut cursor) {
@@ -911,23 +870,519 @@ fn collect_parameter_names(params: &Node, text: &str, out: &mut Vec<String>) {
     }
 }
 
-/// The dotted name of the file's package, or `None` for the default package.
-pub fn file_package(tree: &Tree, text: &str) -> Option<String> {
-    let root = tree.root_node();
-    let mut cursor = root.walk();
-    for child in root.children(&mut cursor) {
-        if child.kind() == "package_declaration" {
-            let mut inner = child.walk();
-            return child
-                .children(&mut inner)
-                .find(|part| part.kind() == "scoped_identifier" || part.kind() == "identifier")
-                .map(|part| text[part.byte_range()].to_string());
-        }
-    }
-    None
-}
-
 /// A type name's simple (last) segment.
 fn simple(name: &str) -> &str {
     name.rsplit(['.', '$']).next().unwrap_or(name)
+}
+
+/// Extracts the indexable declarations and imports from a parsed Java file,
+/// attributing every entry to `uri` and to the file's package.
+pub fn extract_entries(uri: &Url, tree: &Tree, text: &str) -> Vec<SymbolEntry> {
+    let package: Option<Arc<str>> = file_package(tree, text).map(Arc::from);
+    let uri = Arc::new(uri.clone());
+    let lines = LineIndex::new(text);
+    let container: Arc<[String]> = Arc::from(Vec::new());
+    let mut out = Vec::new();
+    collect_entries(&uri, &tree.root_node(), text, &lines, &container, &mut out);
+    for entry in &mut out {
+        entry.package = package.clone();
+    }
+    out
+}
+
+/// Classes, interfaces, enums, records, methods (constructors included),
+/// fields, enum constants, and imports; other nodes are descended into looking
+/// for nested declarations (including local and anonymous classes).
+fn collect_entries(
+    uri: &Arc<Url>,
+    node: &Node,
+    text: &str,
+    lines: &LineIndex,
+    container: &Arc<[String]>,
+    out: &mut Vec<SymbolEntry>,
+) {
+    match node.kind() {
+        "class_declaration"
+        | "interface_declaration"
+        | "enum_declaration"
+        | "record_declaration" => {
+            let kind = match node.kind() {
+                "class_declaration" => SymbolKind::Class,
+                "interface_declaration" => SymbolKind::Interface,
+                "enum_declaration" => SymbolKind::Enum,
+                _ => SymbolKind::Record,
+            };
+            if let Some(name) = node.child_by_field_name("name") {
+                let type_name = text[name.byte_range()].to_string();
+                out.push(entry(uri, node, &name, kind, container, text, lines));
+                // One container chain per type, shared by every entry in it.
+                let inner: Arc<[String]> = {
+                    let mut chain = container.to_vec();
+                    chain.push(type_name.clone());
+                    Arc::from(chain)
+                };
+                // A record's components are declared in its header, not its body.
+                if node.kind() == "record_declaration" {
+                    collect_record_components(uri, node, text, lines, &inner, out);
+                }
+                // Lombok-generated members have no declaration of their own, so
+                // they are anchored at the field (or the type's name) they derive
+                // from, and flagged synthetic.
+                collect_lombok_entries(uri, node, text, &type_name, lines, &inner, out);
+                if let Some(body) = node.child_by_field_name("body") {
+                    collect_entries(uri, &body, text, lines, &inner, out);
+                }
+                return;
+            }
+        }
+        "method_declaration" | "constructor_declaration" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(entry(
+                    uri,
+                    node,
+                    &name,
+                    SymbolKind::Method,
+                    container,
+                    text,
+                    lines,
+                ));
+            }
+        }
+        "field_declaration" => {
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.kind() == "variable_declarator" {
+                    if let Some(name) = child.child_by_field_name("name") {
+                        out.push(entry(
+                            uri,
+                            &child,
+                            &name,
+                            SymbolKind::Field,
+                            container,
+                            text,
+                            lines,
+                        ));
+                    }
+                }
+            }
+        }
+        "enum_constant" => {
+            if let Some(name) = node.child_by_field_name("name") {
+                out.push(entry(
+                    uri,
+                    node,
+                    &name,
+                    SymbolKind::EnumConstant,
+                    container,
+                    text,
+                    lines,
+                ));
+            }
+        }
+        "import_declaration" => {
+            let mut cursor = node.walk();
+            let target = node
+                .children(&mut cursor)
+                .find(|child| child.kind() == "scoped_identifier")
+                .unwrap_or(*node);
+            out.push(SymbolEntry {
+                uri: Arc::clone(uri),
+                name: import_name(node, text).into(),
+                kind: SymbolKind::Import,
+                package: None,
+                container: Arc::clone(container),
+                full_range: lines.range(text, node),
+                selection_range: lines.range(text, &target),
+                origin: FileOrigin::Workspace,
+                synthetic: false,
+            });
+        }
+        _ => {}
+    }
+
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        if child.is_named() {
+            collect_entries(uri, &child, text, lines, container, out);
+        }
+    }
+}
+
+/// A record's header components, indexed as accessor methods at their declared
+/// positions so go-to-definition, references, rename, and `workspace/symbol`
+/// can target them.
+fn collect_record_components(
+    uri: &Arc<Url>,
+    node: &Node,
+    text: &str,
+    lines: &LineIndex,
+    container: &Arc<[String]>,
+    out: &mut Vec<SymbolEntry>,
+) {
+    let Some(parameters) = node.child_by_field_name("parameters") else {
+        return;
+    };
+    let mut cursor = parameters.walk();
+    for parameter in parameters.named_children(&mut cursor) {
+        if parameter.kind() != "formal_parameter" {
+            continue;
+        }
+        if let Some(name) = parameter.child_by_field_name("name") {
+            out.push(entry(
+                uri,
+                &parameter,
+                &name,
+                SymbolKind::Method,
+                container,
+                text,
+                lines,
+            ));
+        }
+    }
+}
+
+/// The Lombok-generated members of a type declaration, as synthetic entries
+/// anchored at the field (or the type's name) each derives from. A generated
+/// constructor is a `Method` entry named after the type, exactly like a
+/// declared one.
+fn collect_lombok_entries(
+    uri: &Arc<Url>,
+    node: &Node,
+    text: &str,
+    type_name: &str,
+    lines: &LineIndex,
+    container: &Arc<[String]>,
+    out: &mut Vec<SymbolEntry>,
+) {
+    for generated in lombok_generated(node, text, type_name) {
+        // A builder member is nested in the builder type, itself nested in the
+        // declared type (already the last container segment).
+        let container = match &generated.container {
+            Some(builder) => {
+                let mut chain = container.to_vec();
+                chain.push(builder.clone());
+                Arc::from(chain)
+            }
+            None => Arc::clone(container),
+        };
+        out.push(SymbolEntry {
+            uri: Arc::clone(uri),
+            name: generated.name.into(),
+            kind: generated.kind,
+            package: None,
+            container,
+            full_range: lines.range(text, &generated.anchor),
+            selection_range: lines.range(text, &generated.anchor_name),
+            origin: FileOrigin::Workspace,
+            synthetic: true,
+        });
+    }
+}
+
+fn entry(
+    uri: &Arc<Url>,
+    node: &Node,
+    name: &Node,
+    kind: SymbolKind,
+    container: &Arc<[String]>,
+    text: &str,
+    lines: &LineIndex,
+) -> SymbolEntry {
+    SymbolEntry {
+        uri: Arc::clone(uri),
+        name: text[name.byte_range()].into(),
+        kind,
+        package: None,
+        container: Arc::clone(container),
+        full_range: lines.range(text, node),
+        selection_range: lines.range(text, name),
+        origin: FileOrigin::Workspace,
+        synthetic: false,
+    }
+}
+
+/// The dotted path of an import (including a trailing `.*` wildcard and any
+/// `static` member), taken from the statement text so grammar details do not
+/// matter.
+fn import_name(node: &Node, text: &str) -> String {
+    let mut raw = text[node.byte_range()].trim();
+    raw = raw.strip_prefix("import").map_or(raw, str::trim);
+    raw = raw.strip_prefix("static").map_or(raw, str::trim);
+    raw.trim_end_matches(';').trim().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// The index's build side
+// ---------------------------------------------------------------------------
+
+/// Replaces `uri`'s entries, keeping the name and package views consistent.
+/// Each entry is allocated once and shared between the per-file and per-name
+/// views, so an entry is stored a single time.
+pub fn upsert_file(
+    index: &mut WorkspaceIndex,
+    uri: &Url,
+    origin: FileOrigin,
+    entries: Vec<SymbolEntry>,
+) {
+    let entries: Vec<Arc<SymbolEntry>> = entries.into_iter().map(Arc::new).collect();
+    if let Some(old) = index.symbols.by_file.insert(
+        uri.clone(),
+        FileRecord {
+            entries: entries.clone(),
+            origin,
+        },
+    ) {
+        for entry in &old.entries {
+            remove_from_name(&mut index.symbols, entry);
+            remove_from_package(&mut index.symbols, entry);
+        }
+    }
+    for entry in entries {
+        if let Some(package) = &entry.package {
+            *index
+                .symbols
+                .packages
+                .entry(Arc::clone(package))
+                .or_default() += 1;
+        }
+        index
+            .symbols
+            .by_name
+            .entry(Arc::clone(&entry.name))
+            .or_default()
+            .push(entry);
+    }
+}
+
+/// Drops `entry` from the name view, forgetting the name when its last entry
+/// goes.
+fn remove_from_name(symbols: &mut SymbolIndex, entry: &SymbolEntry) {
+    let name = Arc::clone(&entry.name);
+    let empty = match symbols.by_name.get_mut(&name) {
+        Some(entries) => {
+            entries.retain(|candidate| candidate.as_ref() != entry);
+            entries.is_empty()
+        }
+        None => false,
+    };
+    if empty {
+        symbols.by_name.remove(&name);
+    }
+}
+
+/// Drops `entry` from the package counts, forgetting the package when its last
+/// entry goes.
+fn remove_from_package(symbols: &mut SymbolIndex, entry: &SymbolEntry) {
+    let Some(package) = entry.package.clone() else {
+        return;
+    };
+    let gone = match symbols.packages.get_mut(&package) {
+        Some(count) => {
+            *count -= 1;
+            *count == 0
+        }
+        None => false,
+    };
+    if gone {
+        symbols.packages.remove(&package);
+    }
+}
+
+/// Inserts or replaces the layer for `uri`, in place, and invalidates the
+/// cached name-indexed view.
+fn put(set: &mut LayerSet, uri: &Url, model: Arc<TypeModel>) {
+    match set.positions.get(uri).copied() {
+        Some(i) => set.layers[i] = model,
+        None => {
+            set.positions.insert(uri.clone(), set.keys.len());
+            set.keys.push(uri.clone());
+            set.layers.push(model);
+        }
+    }
+    set.generation = set.generation.wrapping_add(1);
+}
+
+/// Records the warm-up declared-type model of one workspace source file.
+pub fn set_source(index: &mut WorkspaceIndex, uri: &Url, model: Arc<TypeModel>) {
+    put(&mut index.types.source, uri, model);
+}
+
+/// Builds one artifact set's name-indexed [`SourceLayerIndex`] view.
+fn source_layer_index(set: &LayerSet) -> Arc<SourceLayerIndex> {
+    let layers: Vec<(Url, Arc<TypeModel>)> = set
+        .keys
+        .iter()
+        .cloned()
+        .zip(set.layers.iter().cloned())
+        .collect();
+    Arc::new(SourceLayerIndex::ordered(layers))
+}
+
+/// Rebuilds the effective declared-type view a query reads from the store's
+/// layers: the non-source `base` and the workspace `overlay` (source layers over
+/// the dirty edit overlay).
+pub fn rebuild_context(index: &mut WorkspaceIndex) {
+    let base = source_layer_index(&index.types.base);
+    let source = source_layer_index(&index.types.source);
+    let overlay = ModelLayers::layered(source, Arc::clone(&index.types.dirty));
+    index.context = TypeContext { base, overlay };
+}
+
+/// Marks the warm-up complete and builds the declared-type view a query reads.
+pub fn set_ready(index: &mut WorkspaceIndex) {
+    index.ready = true;
+    rebuild_context(index);
+}
+
+/// Parses one `.java` file and records its index entries and its declared-type
+/// model. `false` when the file cannot be read or parsed.
+pub(crate) fn index_source(index: &mut WorkspaceIndex, path: &Path, parser: &mut Parser) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Some(tree) = parser.parse(text.as_bytes(), None) else {
+        return false;
+    };
+    let Ok(uri) = Url::from_file_path(path) else {
+        return false;
+    };
+    let package = file_package(&tree, &text);
+    let mut model = TypeModel::new();
+    model.extend(collect_type_infos(package.as_deref(), &tree, &text));
+    let entries = extract_entries(&uri, &tree, &text);
+    upsert_file(index, &uri, FileOrigin::Workspace, entries);
+    set_source(index, &uri, Arc::new(model));
+    true
+}
+
+/// Parses each workspace `.java` file, recording its index entries and its
+/// declared-type model. Returns the number of files indexed.
+pub(crate) fn scan_sources(files: &[PathBuf], index: &mut WorkspaceIndex) -> usize {
+    let mut parser = java_parser();
+    let mut indexed = 0usize;
+    for path in files {
+        if index_source(index, path, &mut parser) {
+            indexed += 1;
+        }
+    }
+    indexed
+}
+
+/// Every `.java` file under `root`, hidden and build-output directories skipped,
+/// sorted. The Maven source-root walk folds in with the project module.
+pub(crate) fn workspace_java_files(root: &Path) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_java_files(root, &mut files);
+    files.sort();
+    files
+}
+
+fn collect_java_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            if is_skipped_dir(&path) {
+                continue;
+            }
+            collect_java_files(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "java") {
+            out.push(path);
+        }
+    }
+}
+
+fn is_skipped_dir(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with('.') || name == "target" || name == "build")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn parse(text: &str) -> Tree {
+        java_parser()
+            .parse(text.as_bytes(), None)
+            .expect("a parseable tree")
+    }
+
+    fn entry_named(entries: &[SymbolEntry], name: &str) -> SymbolEntry {
+        entries
+            .iter()
+            .find(|entry| &*entry.name == name)
+            .unwrap_or_else(|| panic!("no entry named {name}"))
+            .clone()
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "java-lsp-index-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn extraction_covers_kinds_and_container_chains() {
+        let text = "package a.b;\n\nimport java.util.List;\n\npublic class Outer {\n    int field;\n    void run() {}\n    static class Inner {}\n}\n\nenum E { A, B }\n";
+        let uri = Url::parse("file:///workspace/Outer.java").unwrap();
+        let entries = extract_entries(&uri, &parse(text), text);
+
+        let outer = entry_named(&entries, "Outer");
+        assert_eq!(outer.kind, SymbolKind::Class);
+        assert_eq!(outer.package.as_deref(), Some("a.b"));
+        assert_eq!(outer.origin, FileOrigin::Workspace);
+        assert!(outer.container.is_empty());
+
+        let inner = entry_named(&entries, "Inner");
+        assert_eq!(inner.container.to_vec(), vec!["Outer".to_string()]);
+
+        let field = entry_named(&entries, "field");
+        assert_eq!(field.kind, SymbolKind::Field);
+        assert_eq!(field.container.to_vec(), vec!["Outer".to_string()]);
+
+        assert_eq!(entry_named(&entries, "run").kind, SymbolKind::Method);
+        assert_eq!(
+            entry_named(&entries, "java.util.List").kind,
+            SymbolKind::Import
+        );
+
+        let variant = entry_named(&entries, "A");
+        assert_eq!(variant.kind, SymbolKind::EnumConstant);
+        assert_eq!(variant.container.to_vec(), vec!["E".to_string()]);
+    }
+
+    #[test]
+    fn lombok_annotations_are_indexed_as_synthetic_entries() {
+        let text = "package a;\n\nimport lombok.Getter;\n\n@Getter\nclass Widget {\n    private int size;\n}\n";
+        let uri = Url::parse("file:///workspace/Widget.java").unwrap();
+        let entries = extract_entries(&uri, &parse(text), text);
+
+        let getter = entry_named(&entries, "getSize");
+        assert!(getter.synthetic);
+        assert_eq!(getter.kind, SymbolKind::Method);
+        assert_eq!(getter.container.to_vec(), vec!["Widget".to_string()]);
+    }
+
+    #[test]
+    fn the_walk_skips_hidden_and_build_trees() {
+        let dir = temp_dir("walk");
+        for relative in ["Keep.java", ".hidden/Hidden.java", "target/Built.java"] {
+            let path = dir.join(relative);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(&path, "class X {}\n").unwrap();
+        }
+
+        assert_eq!(workspace_java_files(&dir), vec![dir.join("Keep.java")]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

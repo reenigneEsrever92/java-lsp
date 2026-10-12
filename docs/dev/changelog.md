@@ -10,6 +10,85 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-10-12
+
+- **Go-to-implementation is restored** — the shell advertises
+  `implementationProvider` and answers `textDocument/implementation` through the
+  `navigate` module over a new coarse `ImplementationsOf` index read: a type
+  contract lists every workspace type whose supertype closure reaches it, and a
+  member contract lists the workspace subtypes that declare an override, matched
+  by name and parameter types. Verified by 50 library tests and 7 bench tests.
+  See
+  [Reintroduce go-to-implementation in the navigate module](backlog/go-to-implementation.md).
+
+- **An override's declaration resolves to its contract** — `find_declaration`
+  (`src/navigate.rs`) resolves a cursor on an overriding member declaration to
+  the nearest same-named declaration in the enclosing type's supertype closure,
+  so `TestImpl.doSomething` lands on `TestInterface.doSomething`, while a type, a
+  non-overriding member, and an override of an unindexed supertype keep
+  self-resolution. Verified by 50 library tests and 7 bench tests. See
+  [An override's declaration resolves to the overridden contract](backlog/override-declaration-to-contract.md).
+
+- **Navigation is its own hub module reading the index over the hub** —
+  `src/index/navigate.rs` becomes a top-level `src/navigate.rs` that serves
+  `NavigateRequest` (definition, declaration, references), reads source files
+  itself, and reads the index only through hub requests, while the index drops
+  navigation for a coarse, batched read API (`IndexRequest`/`IndexBatchRequest`)
+  and the shared Java-reading helpers move to `src/parser.rs`. See
+  [Make navigation its own module that reads the index over the hub](backlog/navigate-module.md).
+
+- **Member navigation resolves through the receiver's declared type** —
+  `find_declaration`/`find_references` (`src/index/navigate.rs`) resolve a member
+  `recv.name`/`recv.name()` through `recv`'s declared type — `this`/implicit, a
+  field, a parameter or local, `new T(…)`, or a `Type.staticMember` qualifier —
+  narrowing the name to what that type or a supertype declares, so
+  `ti.doSomething()` lands on `TestInterface.doSomething`; a name with no
+  receiver-resolvable relationship keeps the ambiguity policy. See
+  [Resolve member navigation through the receiver's declared type](backlog/receiver-typed-member-navigation.md).
+
+- **A cursor on a declaration resolves to that declaration** — `find_declaration`
+  (`src/index/navigate.rs`) now resolves a cursor on a declaration's own name —
+  an interface method also implemented elsewhere, an override, or a duplicate
+  simple name — to that declaration instead of no location, while uses keep the
+  cross-file ambiguity policy. See
+  [A cursor on a declaration resolves to that declaration](backlog/declaration-cursor-self-resolution.md).
+
+- **Go-to-declaration is advertised and answered** — the shell adds
+  `declaration_provider` and implements `textDocument/declaration`, routing it
+  through the same `FindDeclaration` index request as `textDocument/definition`:
+  Java draws no declaration/definition split, so both land on the same place.
+  The shared lookup lives in one `declaration_at` helper the two handlers call.
+  Verified by `cargo build`, `cargo fmt --check`, the 18 library tests, and an
+  end-to-end stdio check (declaration and definition resolve both a type use and
+  a `new T()` to the declared type's location).
+
+- **The index's writers move from `query.rs` to `analyze.rs`** — the functions
+  that build the index (the symbol-table `upsert_file` and its removals, the
+  declared-type store's `set_source`, the cached-view `rebuild_context`, and
+  `set_ready`) now live with the Java reading that produces what they store, so
+  `index/query.rs` is left with reads alone. The public `crate::index::<fn>`
+  paths are unchanged. Verified by `cargo build`, `cargo fmt --check`, and the
+  library tests.
+
+- **Go-to-definition and find-references are hooked up** — `IndexRequest` gains
+  the intent-shaped `FindDeclaration`/`FindReferences` queries (replacing the
+  mechanical `Name`), the shell advertises `definition`/`references` and routes
+  both to the index, and the index (`index/navigate.rs`) answers them from the
+  state its one task owns. Resolution is name-based over the symbol table and
+  the workspace sources, with the ambiguity policy that a name spread across
+  files is no answer; type references are found soundly, member references only
+  where the receiver cannot be in question (`this.member`, `Owner.member`) — a
+  receiver-typed `x.foo()` awaits the type layer. Verified by 18 library tests
+  (4 new navigation tests) and an end-to-end stdio check.
+
+- **The index subsystem is split into `analyze`, `query`, and `util`** —
+  `src/index/` holds `types.rs` (data only), `analyze.rs` (Java reading and
+  extraction), `query.rs` (index insert and query), and `util.rs` (value
+  behaviour and shared helpers), with `mod.rs` reduced to the module root,
+  re-exports, and the `spawn` driver. Verified by 9 library tests and 7 bench
+  tests. See
+  [Split the index subsystem into analyze, query, and util modules](backlog/index-query-analyze-split.md).
+
 ## 2026-10-06
 
 - **Modules can be switched off from the command line** — `main.rs` parses

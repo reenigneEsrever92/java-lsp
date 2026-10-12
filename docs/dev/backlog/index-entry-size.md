@@ -3,7 +3,7 @@ type: ChangeRequest
 kind: refactor
 title: Shrink the indexed entry and type model
 description: Each declaration is stored twice (a SymbolEntry and a Member), the container chain is re-allocated per entry, and names/types are String-heavy; share what repeats and stop storing the same declaration twice, cutting both the in-memory index and the on-disk cache.
-state: in-progress
+state: rejected
 priority: medium
 tags: [dev, refactor, memory, indexing]
 owner: felix
@@ -108,3 +108,6 @@ Vec<String>` is gone from the collectors. Verified: `cargo build`/`cargo fmt
   `example/` workspace, so each remaining slice can be checked end to end.
 - **Next:** the unification itself — one declaration record + by-name/by-type
   indexes over it — in slices, keeping the above green.
+- **Rejected (2026-10-12).** Slice (1) shipped; the remaining slices — name/type
+  interning and the single-representation unification — are not being pursued, so
+  this request is closed as rejected.

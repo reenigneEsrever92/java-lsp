@@ -16,14 +16,19 @@ transport change rather than a redesign.
 > **Rework in progress.** The engine modules are reintroduced one at a time, so
 > several modules listed below are deprecated: commented out of `lib.rs` and kept
 > out of the build under `src/deprecated/` (only `cli`, `hub`, `index`,
-> `messages`, `server`, and `types` are built). This section describes the
-> intended design; where a pass has already landed, the text below reflects it.
-> Two have landed. The **hub mechanics** are rebuilt — a request is routed to the
-> one module that owns it and the reply rides the hub back to the one requester
-> (`HubClient::{request, respond}` around an awaitable `Reply`) — with
+> `messages`, `navigate`, `parser`, `project`, and `server` are built). This section
+> describes the intended design; where a pass has already landed, the text below
+> reflects it.
+> Three have landed. The **hub mechanics** are rebuilt — a request is routed to
+> the one module that owns it and the reply rides the hub back to the one
+> requester (`HubClient::{request, respond}` around an awaitable `Reply`) — with
 > `messages.rs` holding the current vocabulary (`Envelope`, `Message`, the
-> `Request`/`Response` pairs, and `Notification`). And the workspace source scan
-> is now the index's own in `index.rs` rather than a separate `scan.rs` driver.
+> `Request`/`Response` pairs, and `Notification`). The workspace source scan
+> is now the index's own in `index/` rather than a separate `scan.rs` driver. And
+> **navigation** is now its own hub module (`navigate.rs`): it serves the shell's
+> navigation and reads the index over the hub through a coarse, batched read
+> vocabulary (`IndexRequest`/`IndexBatchRequest`), so the index neither contains
+> nor serves navigation and the shared Java-reading helpers live in `parser.rs`.
 > The fuller vocabulary the reintroduced modules bring — the `DriverMessage`
 > notification set, `AnalysisRequest`, the index's `IndexHandle` — appears below
 > only as intended design.
@@ -41,17 +46,32 @@ src/
   cli.rs      — the launch configuration: the `clap` flags (`Cli`) and the
                 resolved module toggles (`Modules`) the engine consumes
   server.rs   — JavaLanguageServer: the LSP shell (all editor-facing handlers),
-                a hub client that renders diagnostics, progress, and notices
+                a hub client that routes the navigation queries to the navigate
+                module and renders diagnostics, progress, and notices
   hub.rs      — the engine hub: Hub (the inbound loop — it broadcasts
                 notifications, routes each request to the module that owns it,
                 routes the reply back to its one requester, and logs every
                 message) and HubClient (register, notify, subscribe, serve,
                 request → Reply, respond)
-  index.rs    — the index subsystem: WorkspaceIndex (workspace symbol entries,
-                the append-only declared-type base, and the per-source models)
-                and the workspace source scan — it walks the root, parses each
-                `.java` file (`extract_entries`, `collect_type_infos`), and
-                fills the index; `index/types.rs` holds the declared-type model
+  index/      — the index subsystem, split by role: `mod.rs` declares the
+                submodules, re-exports their operations, and owns `spawn` (the
+                workspace source scan and the coarse read server);
+                `types.rs` holds the data (WorkspaceIndex
+                — the workspace symbol entries, the append-only declared-type
+                base, and the per-source models — plus the symbol table and the
+                declared-type model); `analyze.rs` reads Java (`extract_entries`,
+                `collect_type_infos`) and writes the index (the symbol-table
+                upsert, the declared-type store's layer updates, and the context
+                rebuild); `query.rs` reads the index; `read.rs` answers the coarse
+                reads a consumer makes over the hub; `util.rs` holds the value
+                behaviour and small helpers
+  parser.rs   — the shared, stateless Java reading the index and `navigate`
+                both use: the tree-sitter parser, a file's line index, a type
+                node as a `Ty`, and the file's package
+  navigate.rs — the navigation hub module (`navigate`): serves the shell's
+                definition, declaration, implementation, and references
+                requests, reading the cursor's file and each candidate source
+                from disk itself and the index only over the hub
   messages.rs — the hub vocabulary: the Envelope wrapper and Message
                 (Request/Response/Notification), the Request/Response pairs, and
                 the broadcast Notification variants
@@ -122,10 +142,15 @@ graph TD
 
     HUB -- "documents, code actions" --> QF{{quick-fix subsystem}}
 
-    HUB -- "index messages, index queries" --> IDX{{index subsystem}}
+    HUB -- "index messages, coarse reads" --> IDX{{index subsystem}}
     IDX -- owns --> WI[(WorkspaceIndex)]
     IDX -- "base + source types" --> TL[(type base + source models)]
     IDX -- "walks + parses .java" --> WS[workspace .java files]
+
+    HUB -- "navigation queries" --> NAV{{navigate module}}
+    NAV -- "coarse index reads" --> IDX
+    NAV -- "reads .java" --> WS
+    NAV -- "locations" --> HUB
 
     HUB -- "every DriverMessage" --> DR{{startup + drivers: startup, dependency, jar, JDK, download}}
     DR -- DriverMessage --> HUB
@@ -141,19 +166,20 @@ graph TD
 | Module                                                                                       | Description                                                                                                          | Responsibilities                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Hub** (`hub.rs`)                                                                           | The engine's central mediator — the hub of the hub-and-spoke.                                                        | Owns the FIFO inbound channel; registers clients and sorts what each receives through a per-client dispatcher; broadcasts notifications to every subscriber; routes each request to the module that owns it (`owner_of`) and the reply back to its one requester; resolves an unowned request to the empty reply; logs every message it forwards. Carries no editor knowledge.                                                                     |
-| **LSP shell** (`server.rs`)                                                                  | The `tower_lsp::LanguageServer` implementation — a hub client like any other, never touching the core directly.      | Serves every editor-facing method; advertises capabilities in `initialize`; notifies input (`FolderAdded`, `ClientCapabilities`, `DocumentOpened`/`DocumentChanged`/`DocumentClosed`, `FileEvent`); requests queries; renders `Diagnostics`, `Progress` (as `$/progress`), and `Notice` (as `window/showMessage`) on its own drain task. Its hub channel is unbounded, so a slow client never stalls the hub.                                      |
+| **LSP shell** (`server.rs`)                                                                  | The `tower_lsp::LanguageServer` implementation — a hub client like any other, never touching the core directly.      | Serves every editor-facing method; advertises capabilities in `initialize` (incremental text sync, definition, declaration, implementation, references); routes the navigation queries — `textDocument/definition`, `textDocument/declaration`, `textDocument/implementation`, and `textDocument/references` — to the navigate module as `NavigateRequest::FindDeclaration`/`FindReferences`/`FindImplementation` hub requests and renders the reply; notifies input (`DocumentOpened`/`DocumentChanged`/`DocumentClosed`, once the document module returns); renders `Diagnostics`, `Progress` (as `$/progress`), and `Notice` (as `window/showMessage`) on its own drain task. Its hub channel is unbounded, so a slow client never stalls the hub.                                      |
 | **Document module / DocumentStore** (`document.rs`)                                          | The canonical document store — a hub client, not owned by the shell.                                                 | Subscribes to `DocumentOpened`/`DocumentClosed`; applies the editor's incremental changes on a `DocumentChange` request and returns the new text (`None` when not open); answers `DocumentText`; converts LSP positions (line + UTF-16 code units) to byte offsets — the only place position semantics are handled on the way in.                                                                                                                  |
 | **Engine wiring** (`engine.rs`, `cli.rs`)                                                    | The single `start_with` path that builds the hub and boots every participant the launch configuration enables.       | Calls each enabled participant's `spawn` — shell first, then modules, then the startup coordinator and drivers — each of which registers under its own name (`Hub::register`), subscribes for the notifications it renders, serves the requests it owns (`serve()`), and starts its own thread or task. `start` runs everything the environment enables. Pure wiring: no channel, name, or receive loop.                                           |
 | **Analysis module / engine core** (`analysis.rs`, `TreeSitterEngine`)                        | Owns the open documents' parse trees and answers the shell's queries.                                                | Parses each open document with `tree-sitter-java`; serves document symbols, folding ranges, semantic tokens, completions, hover, definition/declaration, implementation, references, rename, and inlay hints; applies editor input inline in arrival order and runs each query on the blocking pool, so a slow search never delays typing; notifies `AnalysisUpdated` after each applied document or file event (it does not compute diagnostics). |
 | **Type layer** (`types.rs`, `index/types.rs`)                                                | The declared-type model (`index/types.rs`) and the binding/resolution engine (`types.rs`).                           | Models types, members, hierarchies, generics, records, enums, and syntactically-read Lombok members; infers receiver types; resolves names in Java precedence order; selects overloads by argument types. Backs completion, hover, signature help, inlay hints, and semantic diagnostics through a cached, layered, dirty-overlay view of the base and per-source models.                                                                          |
 | **Diagnostics subsystem** (`diagnostics.rs`)                                                 | A self-contained parser and open-document state, separate from the core.                                             | Sweeps on `AnalysisUpdated` (the just-edited file first, then every open document) for syntax errors and unresolved symbols; reads the index and type layer through `IndexHandle` with per-sweep caches; publishes one `Diagnostics` per open document and keeps a queryable cache of each document's latest pass.                                                                                                                                 |
 | **Quick-fix subsystem** (`quickfix.rs`)                                                      | A self-contained parser and open-document text.                                                                      | Turns unresolved-symbol diagnostics into `CodeAction`s — add an import, change to a near member, or create a stub type/member; reads the symbol index (`IndexHandle`) and the diagnostics cache (`DiagnosticsForDocument`); answers the shell's `codeAction` request as an awaited hub request.                                                                                                                                                    |
-| **Index subsystem / WorkspaceIndex** (`index.rs`)                                            | A workspace-wide in-memory symbol index owned by a dedicated thread.                                                 | Stores flat `SymbolEntry`s (name, kind, package, container chain, ranges, `origin`/`synthetic`); owns the workspace source scan — it walks the root on `FolderAdded`, parses each `.java` file into entries (`extract_entries`) and its declared-type model (`collect_type_infos`); answers `query_name`/`query_prefix`/`has_package` through the message-based handle; grows the declared-type base append-only, one layer per artifact.          |
+| **Index subsystem / WorkspaceIndex** (`index/`)                                            | A workspace-wide in-memory symbol index owned by a dedicated task.                                                   | Stores flat `SymbolEntry`s (name, kind, package, container chain, ranges, `origin`/`synthetic`); owns the workspace source scan — it walks the reported folders on `FoldersDiscoverred`, parses each `.java` file into entries (`extract_entries`) and its declared-type model (`collect_type_infos`); answers a coarse, navigation-shaped read vocabulary over the hub (`IndexRequest`/`IndexBatchRequest` — entries by name, one file's symbols, the workspace files, a type's supertype closure, a type's members, whether a type resolves, and the workspace types reaching a contract); grows the declared-type base append-only, one layer per artifact.          |
+| **Navigate module** (`navigate.rs`) | Cursor navigation — the declaration a symbol names, every reference to it, and its implementations. | Its own hub client, labelled `navigate`; the shell routes `textDocument/definition`, `textDocument/declaration`, `textDocument/implementation`, and `textDocument/references` to it as `NavigateRequest`s. Reads the cursor's file and each candidate source from disk itself (async, `tokio::fs`) and reaches the index only through the hub's coarse reads (`IndexRequest`/`IndexBatchRequest`); resolves the word under the cursor by node kind and, for a member, through the receiver's declared type. |
 | **Warm-up coordinator** (`startup.rs`)                                                       | Drives the warm-up sequence and shapes its events to the launch configuration.                                       | On `FolderAdded` it walks the project model and drives the warm-up stages — the index's own source scan included; tracks `StageDone` for the enabled stages only; emits `Ready`, the summary, and the progress end; and warns when dependency sources are disabled. The warm-up drivers stay configuration-free.                                                                                                                                   |
 | **Maven project model & dependency resolution** (`project.rs`, `resolve.rs`, `classfile.rs`) | The workspace model and its strictly offline dependency resolver.                                                    | The coordinator walks the root and discovers `pom.xml` modules and source roots (falling back to scanning the whole root); resolves the jar closure from the local repository with Maven mediation, never invoking `mvn` or the network; parses jars and class files into `dependency` index entries.                                                                                                                                              |
 | **JDK indexer** (`jdk.rs`)                                                                   | Indexes the installed JDK's standard library.                                                                        | Discovers the JDK (`$JAVA_LSP_JDK`, `$JAVA_HOME`, common locations incl. SDKMAN) and indexes `jmods/*.jmod`, `lib/src.zip`, or `rt.jar` with streaming per-entry reads; keeps only `java.*`/`javax.*`; a missing JDK is a graceful no-op.                                                                                                                                                                                                          |
 | **Dependency sources** (`sources.rs`)                                                        | Fetches and indexes `-sources.jar` for resolved artifacts.                                                           | Reuses local sources or downloads from Maven Central with bounded concurrency and `.sha1` verification; extracts under the sources cache; republishes source-backed dependency entries (real signatures and ranges), dropping the class-derived ones; disabled by `$JAVA_LSP_OFFLINE`.                                                                                                                                                             |
-| **Jar indexer** (`jars.rs`)                                                                  | Warm-up driver that fills the index. The source scan that used to sit beside it is now the index's own (`index.rs`). | Parses resolved jars into the index (the `Jars` stage); speaks only `DriverMessage`s.                                                                                                                                                                                                                                                                                                                                                              |
+| **Jar indexer** (`jars.rs`)                                                                  | Warm-up driver that fills the index. The source scan that used to sit beside it is now the index's own (`index/`). | Parses resolved jars into the index (the `Jars` stage); speaks only `DriverMessage`s.                                                                                                                                                                                                                                                                                                                                                              |
 
 ## Implementation notes
 
@@ -338,13 +364,16 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   targets); otherwise an exact-name lookup over declaration entries is
   narrowed by the node kind at the cursor — a `type_identifier` restricts to
   type declarations, a method-invocation or field-access name to methods and
-  fields. A member call is resolved further: the receiver's declaring type and
-  the call's argument types select the overload (types first, then arity),
-  landing `x.add(1)` on `add(int)` rather than the first same-named
-  declaration, and falling back to the name-only answer when the receiver or an
-  argument cannot be pinned down. A `new T(...)` resolves the same way to its
-  selected constructor's declaration, falling back to the type itself when the
-  constructor is implicit or lives in a jar.
+  fields. A member call is resolved further through the receiver's declared type
+  — the expression before the `.` (`this` or an implicit `this`, a field of the
+  enclosing type, a parameter or local of the enclosing method, `new T(…)`, or a
+  `Type.staticMember` qualifier) turned into a type through the declared-type
+  model, the name narrowed to the most-derived declaration the receiver's
+  supertype closure provides, a name with no such receiver keeping the name-only
+  answer. The index reports the first candidate by position among what remains;
+  argument-type overload selection (landing `x.add(1)` on `add(int)` rather than
+  the first same-named declaration) and `new T(...)` constructor selection are the
+  type layer's, not this name-and-receiver lookup's (see the `types.rs` bullet).
   `textDocument/declaration` is answered by the same resolution: Java has no
   declaration/definition split, so both requests land on the same place.
   Workspace declarations and source-backed library declarations (see
@@ -352,13 +381,18 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   not, since its location is not openable. A single candidate — or several sharing one file (method overloads,
   same-file repeats), resolved to the first by position — is an answer;
   anything spread across multiple files returns no location rather than a
-  wrong one (no result beats a wrong result). `workspace_symbols` maps
+  wrong one (no result beats a wrong result) — the exception is a cursor on a
+  declaration's own name, which resolves to that declaration, or, when the
+  declaration overrides a supertype member, to the nearest declaration it
+  overrides in the type's supertype closure; only a use keeps the cross-file
+  ambiguity policy. `workspace_symbols` maps
   `query_prefix` matches to `SymbolInformation` — import entries excluded,
   the innermost container as `container_name`, the selection range as the
   location — with an empty query returning everything indexed for the client
   to filter. Like completions, both serve partial results during warm-up and
-  never block (R6). **Go to implementation** answers
-  `textDocument/implementation` from the same binding and the declared-type
+  never block (R6). **Go to implementation** — the `navigate` module's
+  `ImplementationsOf` read — answers `textDocument/implementation` from the same
+  binding and the declared-type
   hierarchy: a cursor on a type lists every workspace source type whose
   supertype closure reaches it — sub-interfaces and abstract intermediates
   included, the contract itself excluded — and a cursor on a method lists every
@@ -387,8 +421,9 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   a search never blocks typing or another search) for
   occurrences that can be attributed with confidence: a type only in files that
   can see it (its own file, its package, an import, or a fully-qualified use), a
-  member access only where the receiver's type resolves the name back to the
-  same declaring type, an unqualified member name only inside the declaring
+  member access only where the receiver's declared type — or a supertype of it —
+  resolves the name back to the same declaring type, an unqualified member name
+  only inside the declaring
   type's own span, and a local only inside its method and only when that method
   declares the name once. An overloaded method is narrowed to the selected
   overload: an occurrence counts only when its call's argument types accept that
@@ -566,9 +601,14 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   server-push refresh; a hint
   computed while the model is still warming simply appears on the client's next
   request (R6).
-- **WorkspaceIndex** (`index.rs`): a workspace-wide, in-memory index of Java
+- **WorkspaceIndex** (`index/`): a workspace-wide, in-memory index of Java
   declarations and imports, owned by the index subsystem thread and reached only
-  through its `IndexHandle`. Entries are flat
+  through its `IndexHandle`. The subsystem is split by role: `types.rs` holds the
+  data, `analyze.rs` reads Java and writes the index, `query.rs` reads it,
+  `read.rs` answers the coarse, navigation-shaped reads a consumer makes over the
+  hub, and `util.rs` holds the value behaviour and small helpers; the shared,
+  stateless Java reading both the index and the `navigate` module use lives in
+  `parser.rs`. Entries are flat
   `SymbolEntry`s (name, kind, package, enclosing-type container chain,
   ranges, `dependency` flag) — no trees, no text — so memory stays
   proportional to workspace size. Each entry is allocated once and shared
@@ -591,11 +631,11 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   subsystem is a **driver** spawned at start — the project walker, the dependency
   resolver, the jar indexer, the JDK indexer, and the source
   downloader — and each speaks only the hub's `DriverMessage`s. The workspace
-  source scan is no longer a driver of its own: the index (`index.rs`) owns it,
+  source scan is no longer a driver of its own: the index (`index/`) owns it,
   walking the root on `FolderAdded` and parsing each `.java` file into the index.
   The index is
-  itself a subsystem (`index.rs`): the hub broadcasts it the
-  index-affecting messages and routes it the index queries, broadcasts every
+  itself a subsystem (`index/`): the hub broadcasts it the
+  index-affecting messages and routes it the coarse index reads, broadcasts every
   message to every driver, and renders the warm-up's log lines; the shell renders
   its progress and notices — the request path is never
   involved (R6).
@@ -622,11 +662,11 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   shell-on-the-hub and type-layer bullets). `index_ready()` flips when warm-up
   completes so index-backed features can report themselves briefly
   unavailable during warm-up instead of blocking; completions consume the
-  index via `query_prefix` (see the engine-core bullet above), and
-  go-to-definition and `workspace/symbol` are backed by the same two lookups
-  — `query_name` for exact-name definition targets, `query_prefix` for
-  workspace symbols — with dependency-jar entries filtered out of both (see
-  the project-model bullet). Known v1 limitation: a watched file's indexed
+  index via `query_prefix` (see the engine-core bullet above); the `navigate`
+  module reads exact names through the index's `EntriesByName` read for
+  go-to-definition, and `workspace/symbol` is backed by `query_prefix` — with
+  dependency-jar entries filtered out of both (see the project-model bullet).
+  Known v1 limitation: a watched file's indexed
   ranges reflect its last re-read rather than a live document (the index
   changes only when the client reports an event). A file deleted on disk is
   forgotten from both the index and the model: the watcher drops its entries
@@ -636,6 +676,33 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   files under the cache, but their entries carry `library_source`;
   `source_files()` — the candidate set for references and rename — excludes
   them, so a search never reads the cache and a rename never edits it.
+- **Navigation is its own hub module** (`navigate.rs`) — the shell routes
+  `textDocument/definition`, `textDocument/declaration`,
+  `textDocument/implementation`, and `textDocument/references` to the `navigate`
+  module as `NavigateRequest::FindDeclaration`/`FindReferences`/
+  `FindImplementation` hub requests (declaration reuses the definition request —
+  Java has no declaration/definition split).
+  Navigation reads the cursor's file and each candidate source from disk itself
+  (async, with `tokio::fs`) and reaches the index only through the hub, over a
+  coarse read vocabulary (`IndexRequest`/`IndexBatchRequest` — entries by name,
+  one file's symbols, the workspace files, a type's supertype closure, a type's
+  members, whether a type resolves, and the workspace types reaching a contract).
+  Resolution is name-based, matching the
+  extraction: the cursor resolves
+  to the declarations of the word it sits on, narrowed by the node kind (a
+  `type_identifier` names a type, a method/field-access name a member), and a name
+  spread across files is no answer (no result beats a wrong result) — the one
+  exception is a cursor on a declaration's own name, which resolves to that
+  declaration; only a use keeps the cross-file ambiguity policy. Type
+  references are found soundly — every `Type` occurrence of a type the file can
+  see (its own file, its package, or an import). Member references are found where
+  the receiver's declared type (or a supertype) resolves the name to the same
+  declaring type — `this.member`, a field, a parameter or local, `new T(…)`, or a
+  `Type.staticMember` qualifier — or, for a bare name, inside the declaring type's
+  own span. **Documented v1 limitation:** a receiver that cannot be typed from its
+  file — a chained call (`a.b().c()`), a generic type argument, a lambda or
+  anonymous-class scope, `super` — is not resolved through, and receiver-typed
+  overload selection in definition still awaits the full type layer.
 - **Maven project model** (`project.rs` + `resolve.rs` + `classfile.rs`):
   the project driver builds a model of the workspace — it reacts to the added
   folder, walks the root (hidden dirs, `target/`, `build/` skipped), and every
@@ -753,28 +820,30 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   for the model on `FolderAdded` and owns `ready` and the summary;
   the dependency driver resolves the jars; the jar indexer, JDK
   indexer, and source downloader produce the index data, and the workspace source
-  scan is the index's own (`index.rs`) rather than a driver. The hub starts empty:
+  scan is the index's own (`index/`) rather than a driver. The hub starts empty:
   every participant registers its client (`Hub::register`) before its thread or
   task starts, and the registration is in place before any later message — the
   client's inbound channel is installed as `register` returns — so a later
   notification, request, or reply can never miss it. The hub broadcasts every
-  notification and routes every request to its owner (the index, analysis,
-  diagnostics, or quick-fix module), carrying no editor knowledge; the shell
-  renders the editor-facing notifications. A request with no registered owner
-  resolves to the empty reply rather than waiting. The hub logs every message it
-  forwards (`RUST_LOG=java_lsp::hub=info`), so the whole flow is attributable from
-  one place.
+  notification and routes every request to its owner (the navigate, index,
+  analysis, diagnostics, or quick-fix module), carrying no editor knowledge; the
+  shell renders the editor-facing notifications. A request with no registered
+  owner resolves to the empty reply rather than waiting. The hub logs every
+  message it forwards (`RUST_LOG=java_lsp::hub=info`), so the whole flow is
+  attributable from one place.
   This supersedes the earlier "one driver that discovers, then spawns producers"
   shape and the `Reporter` indirection it threaded through the producers
   (`incremental-indexing-pipeline`).
-- **The index is its own subsystem** (`index.rs`) — the symbol index is
+- **The index is its own subsystem** (`index/`) — the symbol index is
   owned by a dedicated subsystem thread and reached only through `IndexHandle`, a
   cheap, message-based handle: each call is one message to the subsystem (and a
   reply for a query), so no component holds the index state directly and the
   subsystem is its single reader and writer. It also owns its own workspace
   source scan — it walks the root on `FolderAdded` and parses each `.java` file
-  into the index, so the scan is not a separate driver. The hub hands it the
-  index-affecting
+  into the index, so the scan is not a separate driver. It no longer serves
+  navigation: the `navigate` module reads it over the hub through a coarse,
+  batched read vocabulary (`IndexRequest`/`IndexBatchRequest`). The hub hands it
+  the index-affecting
   `DriverMessage`s; the analysis core uses the handle for its symbol lookups and
   edits. A query is an ordinary hub request: the hub routes it to the index
   subsystem and that subsystem's reply is routed back through the hub (which logs

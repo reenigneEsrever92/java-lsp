@@ -21,7 +21,7 @@ fn main() {
     tracing::subscriber::set_global_default(subscriber)
         .expect("failed to install tracing subscriber");
 
-    parse_command_line();
+    let cli = parse_command_line();
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -30,10 +30,7 @@ fn main() {
         .expect("failed to start tokio runtime");
 
     runtime.block_on(async {
-        // The hub, and the shell as its first client: register the shell and
-        // take its subscription before anything else can publish, so it renders
-        // every notification the modules and drivers send.
-        let hub = Hub::new();
+        let hub = setup(cli);
         let shell = hub.register("server");
         let incoming = shell.subscribe().await;
 
@@ -48,9 +45,9 @@ fn main() {
 /// Parses the command line. `--help`/`--version` print and exit; any other parse
 /// error is logged and the defaults are used, so an editor passing an unknown
 /// flag cannot stop the server from starting.
-fn parse_command_line() {
+fn parse_command_line() -> Cli {
     match Cli::try_parse() {
-        Ok(_) => {}
+        Ok(cli) => cli,
         Err(error) => {
             use clap::error::ErrorKind;
             if matches!(
@@ -60,9 +57,17 @@ fn parse_command_line() {
                 let _ = error.print();
                 std::process::exit(0);
             }
-            eprintln!("java-lsp: ignoring command line: {error}");
+            Cli::default()
         }
     }
 }
 
-fn setup() {}
+fn setup(_cli: Cli) -> Hub {
+    let hub = Hub::new();
+
+    java_lsp::project::spawn(&hub);
+    java_lsp::index::spawn(&hub);
+    java_lsp::navigate::spawn(&hub);
+
+    hub
+}

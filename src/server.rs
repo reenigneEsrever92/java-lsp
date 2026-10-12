@@ -8,28 +8,35 @@
 //! warm-up drivers — are being reintroduced one at a time, so this is the
 //! skeleton: the lifecycle handshake, incremental document sync advertised so
 //! editors open and change documents, the workspace root published on the hub,
-//! and a drain task ready to render what the modules publish next.
+//! the navigation queries routed to the `navigate` module, and a drain task ready
+//! to render what the modules publish next.
 
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 use tower_lsp::jsonrpc::Result;
+use tower_lsp::lsp_types::request::{
+    GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
+    GotoImplementationResponse,
+};
 use tower_lsp::lsp_types::{
-    InitializeParams, InitializeResult, InitializedParams, ServerCapabilities,
+    DeclarationCapability, GotoDefinitionParams, GotoDefinitionResponse,
+    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
+    Location, OneOf, ReferenceParams, ServerCapabilities, TextDocumentPositionParams,
     TextDocumentSyncCapability, TextDocumentSyncKind, Url,
 };
 use tower_lsp::LanguageServer;
 
 use crate::hub::HubClient;
-use crate::messages::Notification;
+use crate::messages::{NavigateRequest, NavigateResponse, Notification, Request, Response};
 
 /// The LSP shell: the hub's first client.
 pub struct JavaLanguageServer {
     /// The shell's client on the engine hub.
     hub: HubClient,
     /// The workspace root learned in `initialize`, published on the hub in
-    /// `initialized` as [`Notification::FolderAdded`].
+    /// `initialized` as [`Notification::ServerStarted`].
     workspace_root: Mutex<Option<Url>>,
 }
 
@@ -58,6 +65,28 @@ impl JavaLanguageServer {
             workspace_root: Mutex::new(None),
         }
     }
+
+    /// Resolves the symbol at `position` in the requested document to its
+    /// declaration by asking the `navigate` module; `None` when the cursor names
+    /// nothing or is ambiguous. Shared by `goto_definition` and
+    /// `goto_declaration`, which land on the same place because Java draws no
+    /// declaration/definition split.
+    async fn declaration_at(
+        &self,
+        position: TextDocumentPositionParams,
+    ) -> Result<Option<Location>> {
+        let response = self
+            .hub
+            .request(Request::Navigate(NavigateRequest::FindDeclaration {
+                uri: position.text_document.uri,
+                position: position.position,
+            }))
+            .await;
+        match response {
+            Response::Navigate(NavigateResponse::Declaration(location)) => Ok(location),
+            _ => Ok(None),
+        }
+    }
 }
 
 #[tower_lsp::async_trait]
@@ -84,11 +113,17 @@ impl LanguageServer for JavaLanguageServer {
         Ok(InitializeResult {
             // Incremental document sync, so editors open, change, and close
             // documents; the shell forwards those events onto the hub once the
-            // document module that consumes them returns.
+            // document module that consumes them returns. Definition, declaration,
+            // implementation, and references are advertised now: the `navigate`
+            // module answers all four.
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
+                definition_provider: Some(OneOf::Left(true)),
+                declaration_provider: Some(DeclarationCapability::Simple(true)),
+                implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
+                references_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             ..InitializeResult::default()
@@ -106,12 +141,90 @@ impl LanguageServer for JavaLanguageServer {
             .and_then(|slot| slot.clone());
 
         if let Some(uri) = root {
-            self.hub.notify(Notification::FolderAdded { uri });
+            self.hub.notify(Notification::ServerStarted {
+                workspace_root: uri,
+            });
         }
     }
 
     async fn shutdown(&self) -> Result<()> {
         tracing::info!("shutdown requested");
         Ok(())
+    }
+
+    /// Answers `textDocument/definition` by asking the `navigate` module where
+    /// the symbol under the cursor is declared; `None` when the cursor names
+    /// nothing or is ambiguous.
+    async fn goto_definition(
+        &self,
+        params: GotoDefinitionParams,
+    ) -> Result<Option<GotoDefinitionResponse>> {
+        Ok(self
+            .declaration_at(params.text_document_position_params)
+            .await?
+            .map(GotoDefinitionResponse::Scalar))
+    }
+
+    /// Answers `textDocument/declaration` with the same resolution as
+    /// `textDocument/definition`: Java draws no declaration/definition split, so
+    /// both requests land on the declaration the cursor names.
+    async fn goto_declaration(
+        &self,
+        params: GotoDeclarationParams,
+    ) -> Result<Option<GotoDeclarationResponse>> {
+        Ok(self
+            .declaration_at(params.text_document_position_params)
+            .await?
+            .map(GotoDeclarationResponse::Scalar))
+    }
+
+    /// Answers `textDocument/references` by asking the `navigate` module for
+    /// every occurrence of the symbol under the cursor across the workspace
+    /// sources.
+    async fn references(&self, params: ReferenceParams) -> Result<Option<Vec<Location>>> {
+        let TextDocumentPositionParams {
+            text_document,
+            position,
+        } = params.text_document_position;
+        let response = self
+            .hub
+            .request(Request::Navigate(NavigateRequest::FindReferences {
+                uri: text_document.uri,
+                position,
+                include_declaration: params.context.include_declaration,
+            }))
+            .await;
+        match response {
+            Response::Navigate(NavigateResponse::References(locations)) => Ok(Some(locations)),
+            _ => Ok(Some(Vec::new())),
+        }
+    }
+
+    /// Answers `textDocument/implementation` by asking the `navigate` module for
+    /// the workspace declarations implementing the contract under the cursor;
+    /// `None` when the cursor names no contract or nothing implements it.
+    async fn goto_implementation(
+        &self,
+        params: GotoImplementationParams,
+    ) -> Result<Option<GotoImplementationResponse>> {
+        let TextDocumentPositionParams {
+            text_document,
+            position,
+        } = params.text_document_position_params;
+        let response = self
+            .hub
+            .request(Request::Navigate(NavigateRequest::FindImplementation {
+                uri: text_document.uri,
+                position,
+            }))
+            .await;
+        match response {
+            Response::Navigate(NavigateResponse::Implementations(locations))
+                if !locations.is_empty() =>
+            {
+                Ok(Some(GotoImplementationResponse::Array(locations)))
+            }
+            _ => Ok(None),
+        }
     }
 }

@@ -240,7 +240,8 @@ impl Default for Hub {
 /// The module that serves a request — the client the hub routes it to.
 fn owner_of(request: &Request) -> &'static str {
     match request {
-        Request::Index(_) => "index",
+        Request::Navigate(_) => "navigate",
+        Request::Index(_) | Request::IndexBatch(_) => "index",
     }
 }
 
@@ -360,21 +361,22 @@ impl Future for Reply {
 mod tests {
     use std::sync::Arc;
 
-    use tower_lsp::lsp_types::Url;
+    use tower_lsp::lsp_types::{Position, Url};
 
-    use crate::messages::{IndexResponse, Message, Notification};
+    use crate::messages::{Message, NavigateRequest, NavigateResponse, Notification};
 
     use super::*;
 
     fn folder(uri: &str) -> Notification {
-        Notification::FolderAdded {
-            uri: Url::parse(uri).expect("a valid file URI"),
+        Notification::FoldersDiscoverred {
+            uri: vec![Url::parse(uri).expect("a valid file URI")],
         }
     }
 
-    fn name_request(name: &str) -> Request {
-        Request::Index(crate::messages::IndexRequest::Name {
-            name: name.to_string(),
+    fn declaration_request() -> Request {
+        Request::Navigate(NavigateRequest::FindDeclaration {
+            uri: Url::parse("file:///Widget.java").expect("a valid file URI"),
+            position: Position::new(0, 0),
         })
     }
 
@@ -408,17 +410,17 @@ mod tests {
         sender.notify(folder("file:///workspace"));
 
         let message = live.recv().await.expect("the live subscriber stays open");
-        assert!(matches!(&*message, Notification::FolderAdded { .. }));
+        assert!(matches!(&*message, Notification::FoldersDiscoverred { .. }));
     }
 
     #[tokio::test]
     async fn a_request_is_routed_to_its_owner_and_the_reply_rides_back() {
         let hub = Hub::new();
         let requester = hub.register("server");
-        let owner = hub.register("index");
+        let owner = hub.register("navigate");
         let mut requests = owner.serve().await;
 
-        let reply = requester.request(name_request("Widget"));
+        let reply = requester.request(declaration_request());
 
         // The request reaches the owner, which reads its id and answers it.
         let envelope = requests
@@ -428,14 +430,14 @@ mod tests {
         assert!(matches!(&*envelope.message, Message::Request(_)));
         owner.respond(
             envelope.id,
-            Response::Index(IndexResponse::Symbols(Vec::new())),
+            Response::Navigate(NavigateResponse::References(Vec::new())),
         );
 
         // The reply rides the hub back to this one requester.
         let response = reply.await;
         assert!(matches!(
             response,
-            Response::Index(IndexResponse::Symbols(entries)) if entries.is_empty()
+            Response::Navigate(NavigateResponse::References(locations)) if locations.is_empty()
         ));
     }
 
@@ -445,17 +447,17 @@ mod tests {
         let requester = hub.register("server");
         let bystander = hub.register("bystander");
         let mut notifications = bystander.subscribe().await;
-        let owner = hub.register("index");
+        let owner = hub.register("navigate");
         let mut requests = owner.serve().await;
 
-        let reply = requester.request(name_request("Widget"));
+        let reply = requester.request(declaration_request());
         let envelope = requests
             .recv()
             .await
             .expect("the owner receives the request");
         owner.respond(
             envelope.id,
-            Response::Index(IndexResponse::Symbols(Vec::new())),
+            Response::Navigate(NavigateResponse::References(Vec::new())),
         );
         let _ = reply.await;
 
@@ -466,14 +468,11 @@ mod tests {
     #[tokio::test]
     async fn an_unserved_request_resolves_to_the_empty_reply() {
         let hub = Hub::new();
-        // No client serves the index, so the request has no owner and no reply
+        // No client serves navigation, so the request has no owner and no reply
         // ever comes; it must not leave the requester waiting forever.
         let requester = hub.register("server");
-        let reply = requester.request(name_request("Widget"));
+        let reply = requester.request(declaration_request());
         let response = reply.await;
-        assert!(matches!(
-            response,
-            Response::Index(IndexResponse::Symbols(entries)) if entries.is_empty()
-        ));
+        assert!(matches!(response, Response::Empty));
     }
 }

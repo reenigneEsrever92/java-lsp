@@ -7,13 +7,18 @@
 //! `src/deprecated/`, so reintroducing one means moving its file back under
 //! `src/` before uncommenting its declaration below. Live for now: `hub` (the
 //! mechanics), `messages` (its vocabulary), `cli` (the launch configuration),
-//! `server` (the LSP shell skeleton, the hub's first client), `index`, and
-//! `types`.
+//! `server` (the LSP shell skeleton, the hub's first client), `project` (the
+//! workspace source-folder discovery), `index` (the workspace symbol index),
+//! `navigate` (cursor navigation over the index), and `parser` (the shared,
+//! stateless Java-reading helpers).
 
 pub mod cli;
 pub mod hub;
 pub mod index;
 pub mod messages;
+pub mod navigate;
+pub mod parser;
+pub mod project;
 pub mod server;
 
 // Deprecated: sources under `src/deprecated/`. Move a file back under `src/`
@@ -26,7 +31,6 @@ pub mod server;
 // pub mod engine;
 // pub mod jars;
 // pub mod jdk;
-// pub mod project;
 // pub mod quickfix;
 // pub mod resolve;
 // pub mod sources;
