@@ -7,19 +7,29 @@
 //! `src/deprecated/`, so reintroducing one means moving its file back under
 //! `src/` before uncommenting its declaration below. Live for now: `hub` (the
 //! mechanics), `messages` (its vocabulary), `cli` (the launch configuration),
-//! `server` (the LSP shell skeleton, the hub's first client), `project` (the
-//! workspace source-folder discovery), `index` (the workspace symbol index),
-//! `navigate` (cursor navigation over the index), and `parser` (the shared,
-//! stateless Java-reading helpers).
+//! `server` (the LSP shell skeleton, the hub's first client), `maven` (the
+//! Maven project model, dependency resolution and source fetching, published to
+//! the index as `FoldersDiscoverred` batches), `index` (the workspace symbol
+//! index), `navigate` (cursor navigation over the index), `completion` (the
+//! names offerable at a cursor), `buffers` (the editor's unsaved text),
+//! `parser` (the shared, stateless Java-reading helpers), `model` (shared Java
+//! type and declaration vocabulary), `util` (the receiver resolution navigation
+//! and completion share), and `workspace` (workspace symbol search over the
+//! index).
 
+pub mod buffers;
 pub mod cli;
+pub mod completion;
 pub mod hub;
 pub mod index;
+pub mod maven;
 pub mod messages;
+pub mod model;
 pub mod navigate;
 pub mod parser;
-pub mod project;
 pub mod server;
+pub mod util;
+pub mod workspace;
 
 // Deprecated: sources under `src/deprecated/`. Move a file back under `src/`
 // before uncommenting its declaration.

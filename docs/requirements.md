@@ -102,8 +102,11 @@ the javac-daemon option was rejected as reintroducing a Java codebase and
 annotation-processor risk) models types, their members, and their hierarchies —
 a source record's components modelled as the accessors a client calls, and
 indexed at the header — and from it hover renders real declarations, completions
-after `.` offer the receiver's members, one item per overload with its full
-signature and a signature-help request that follows the cursor's argument,
+after `.` offer the receiver's members
+(`member-completion`), one item per overload with its full signature and a
+signature-help request that follows the cursor's argument
+(`signature-help`, the call's overloads and active parameter served from the
+same receiver step),
 library types carry real signatures and
 inherited members
 (`jvm-member-descriptors`), unresolved type names are reported as conservative

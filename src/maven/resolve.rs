@@ -2,17 +2,17 @@
 //! property interpolation, `dependencyManagement` incl. import-scoped BOMs)
 //! and the transitive dependency closure with Maven's conflict mediation.
 //!
-//! Strictly offline: artifacts are read from the local repository only;
-//! nothing is ever fetched. Anything unresolvable is pruned with a warning —
-//! degraded completions, never a broken server.
+//! Reworked from `src/deprecated/resolve.rs` minus the old hub driver
+//! (`resolve_artifacts`, `spawn`) and minus `local_repository()` (moved to
+//! [`settings`](crate::maven::settings)). [`model`](crate::maven::model) and
+//! [`sources`](crate::maven::sources) compile against these signatures.
+//!
+//! Strictly offline: artifacts are read from the local repository only; nothing
+//! is ever fetched. Anything unresolvable is pruned with a warning — degraded
+//! completions, never a broken server.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-
-use crate::hub::{next_notification, HubClient};
-use crate::messages::DriverMessage;
-use crate::project::ProjectModel;
 
 /// One `<dependency>` declaration (also used for `dependencyManagement`
 /// entries). Fields are interpolated by the time they are read.
@@ -505,10 +505,10 @@ fn parse_pom(text: &str) -> Option<RawPom> {
     }
     pom.dependency_management = child(project, "dependencyManagement")
         .and_then(|management| child(management, "dependencies"))
-        .map(|dependencies| parse_dependencies(dependencies))
+        .map(parse_dependencies)
         .unwrap_or_default();
     pom.dependencies = child(project, "dependencies")
-        .map(|dependencies| parse_dependencies(dependencies))
+        .map(parse_dependencies)
         .unwrap_or_default();
     pom.modules = child(project, "modules")
         .map(|modules| {
@@ -565,65 +565,6 @@ fn child_text(node: roxmltree::Node, name: &str) -> Option<String> {
 
 fn trim(text: &str) -> String {
     text.trim().to_string()
-}
-
-/// The local Maven repository: `$MAVEN_REPO` if set, else `~/.m2/repository`.
-pub(crate) fn local_repository() -> PathBuf {
-    if let Ok(override_path) = std::env::var("MAVEN_REPO") {
-        return PathBuf::from(override_path);
-    }
-    std::env::var("HOME")
-        .map(|home| PathBuf::from(home).join(".m2").join("repository"))
-        .unwrap_or_else(|_| PathBuf::from(".m2/repository"))
-}
-
-/// Resolves each module's dependency closure against the local repository,
-/// keeping only coordinates whose jar is on disk, deduplicated. The dependency
-/// driver runs this off the request path.
-pub(crate) fn resolve_artifacts(model: &ProjectModel) -> Vec<Artifact> {
-    let mut resolver = Resolver::new(local_repository());
-    let mut artifacts: Vec<Artifact> = Vec::new();
-    let mut seen: std::collections::HashSet<Artifact> = Default::default();
-    for module in &model.modules {
-        let Some(effective) = &module.effective else {
-            continue;
-        };
-        for (group, artifact_id, version) in resolve_closure(effective, &mut resolver) {
-            // Resolution is pom-level; a jar present in the local repository is
-            // indexed even when its pom went missing mid-flight.
-            let jar_path = resolver.jar_path(&group, &artifact_id, &version);
-            if !jar_path.is_file() {
-                continue;
-            }
-            if seen.insert((group.clone(), artifact_id.clone(), version.clone())) {
-                artifacts.push((group, artifact_id, version));
-            }
-        }
-    }
-    artifacts
-}
-
-// -- the dependency driver --------------------------------------------------
-
-/// Starts the dependency driver on the hub: on the project model it resolves
-/// each module's closure against the local repository and emits the jar list.
-pub fn spawn(hub: &HubClient) {
-    let client = hub.labeled("dependency");
-    let mut rx = client.subscribe();
-    tokio::spawn(async move {
-        while let Some(message) = next_notification(&mut rx).await {
-            if let DriverMessage::ProjectModel { model } = message {
-                let client = client.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    let artifacts = resolve_artifacts(&model);
-                    let _ = client.notify(DriverMessage::Artifacts {
-                        artifacts: Arc::new(artifacts),
-                    });
-                })
-                .await;
-            }
-        }
-    });
 }
 
 #[cfg(test)]

@@ -29,6 +29,8 @@ public class Main {
         Gson gson = new Gson();
         var data = new Data(5);
 
+        greeter.greet();
+
         var ti2 = data.getInterface();
 
         ti2.doSomething();

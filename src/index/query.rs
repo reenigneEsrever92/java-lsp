@@ -11,11 +11,9 @@ use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
-use super::types::{
-    IndexKind, Member, ModelLayers, SourceLayerIndex, SymbolEntry, Ty, TypeInfo, TypeModel,
-    WorkspaceIndex,
-};
+use super::types::{ModelLayers, SourceLayerIndex, SymbolEntry, TypeModel, WorkspaceIndex};
 use super::util::params_key;
+use crate::model::{IndexKind, Member, Ty, TypeInfo};
 /// The single type named `name`, preferring `package`; `None` when absent or
 /// ambiguous. The workspace overlay wins over the non-source base.
 pub fn find_unique<'a>(

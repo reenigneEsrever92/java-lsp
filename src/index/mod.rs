@@ -8,14 +8,15 @@
 //! open-buffer edits and watched file events — plus the coarse reads it answers
 //! complete its vocabulary, which lives in `messages.rs`.
 //!
-//! The subsystem is split by role. [`types`] holds the data — the symbol table,
-//! the declared-type store and model, and the shared identity types; [`analyze`]
+//! The subsystem is split by role. [`types`] holds the index-owned data — the
+//! symbol table and the declared-type store/view; [`crate::model`] holds shared
+//! Java declarations and type vocabulary; [`analyze`]
 //! reads Java, turning a parsed tree or a path on disk into the index's
 //! vocabulary; [`analyze`] also stores it — the symbol-table upsert, the
 //! declared-type store's layer updates, and the context rebuild — while [`query`]
 //! reads those structures; [`read`] answers the coarse, navigation-shaped reads a
-//! consumer makes over the hub; and [`util`] holds the value behaviour and the
-//! small helpers that fit neither. This module is the entry point: it declares the
+//! consumer makes over the hub; and [`util`] holds index-specific helpers shared
+//! by analysis and query. This module is the entry point: it declares the
 //! submodules, re-exports the operations the rest of the crate refers to, and
 //! owns [`spawn`], which scans the folders the project module discovers and
 //! serves the coarse reads.
@@ -53,8 +54,8 @@ use tokio::sync::mpsc::UnboundedReceiver;
 
 use crate::hub::{Hub, HubClient};
 use crate::messages::{
-    Envelope, IndexBatchRequest, IndexBatchResponse, IndexRequest, Message, Notification, Request,
-    Response,
+    Envelope, FolderOrigin, IndexBatchRequest, IndexBatchResponse, IndexRequest, Message,
+    Notification, Request, Response,
 };
 
 // ---------------------------------------------------------------------------
@@ -63,10 +64,12 @@ use crate::messages::{
 
 /// Starts the index on the hub: on each [`Notification::FoldersDiscoverred`]
 /// batch it walks the `.java` files under the reported folders and fills the
-/// index with their entries and declared-type models, then marks it ready; and it
-/// serves the coarse reads a consumer makes of it, each answered from the index
-/// state it owns. Both kinds of work run on the blocking pool, so neither the
-/// runtime nor a slow read is blocked on the other.
+/// index with their entries and declared-type models, tagging each file with
+/// the batch's origin (`FileOrigin::Workspace` / `FileOrigin::LibrarySource`),
+/// then marks it ready; and it serves the coarse reads a consumer makes of it,
+/// each answered from the index state it owns. Both kinds of work run on the
+/// blocking pool, so neither the runtime nor a slow read is blocked on the
+/// other.
 pub fn spawn(hub: &Hub) {
     let hub_client = hub.register("index");
 
@@ -111,13 +114,14 @@ async fn serve(
     loop {
         tokio::select! {
             Some(message) = notifications.recv() => {
-                let Notification::FoldersDiscoverred { uri } = &*message else {
+                let Notification::FoldersDiscoverred { uri, origin } = &*message else {
                     continue;
                 };
                 let folders: Vec<PathBuf> = uri
                     .iter()
                     .filter_map(|folder| folder.to_file_path().ok())
                     .collect();
+                let origin = file_origin(*origin);
                 index = tokio::task::spawn_blocking(move || {
                     let mut index = index;
                     let mut files: Vec<PathBuf> = folders
@@ -126,7 +130,7 @@ async fn serve(
                         .collect();
                     files.sort();
                     files.dedup();
-                    scan_sources(&files, &mut index);
+                    scan_sources(&files, origin, &mut index);
                     set_ready(&mut index);
                     index
                 })
@@ -166,6 +170,14 @@ async fn serve(
 enum ReadRequest {
     One(IndexRequest),
     Batch(IndexBatchRequest),
+}
+
+/// The index origin a `FoldersDiscoverred` batch's folders are scanned with.
+fn file_origin(origin: FolderOrigin) -> FileOrigin {
+    match origin {
+        FolderOrigin::Workspace => FileOrigin::Workspace,
+        FolderOrigin::LibrarySources => FileOrigin::LibrarySource,
+    }
 }
 
 /// The read `envelope` carries, or `None` when it is not an index request.
@@ -210,7 +222,11 @@ mod tests {
         .unwrap();
 
         let mut index = WorkspaceIndex::default();
-        let count = scan_sources(std::slice::from_ref(&file), &mut index);
+        let count = scan_sources(
+            std::slice::from_ref(&file),
+            FileOrigin::Workspace,
+            &mut index,
+        );
 
         assert_eq!(count, 1);
         let uri = Url::from_file_path(&file).unwrap();

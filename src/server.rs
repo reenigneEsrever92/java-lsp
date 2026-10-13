@@ -21,15 +21,21 @@ use tower_lsp::lsp_types::request::{
     GotoImplementationResponse,
 };
 use tower_lsp::lsp_types::{
-    DeclarationCapability, GotoDefinitionParams, GotoDefinitionResponse,
-    ImplementationProviderCapability, InitializeParams, InitializeResult, InitializedParams,
-    Location, OneOf, ReferenceParams, ServerCapabilities, TextDocumentPositionParams,
-    TextDocumentSyncCapability, TextDocumentSyncKind, Url,
+    CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
+    DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
+    GotoDefinitionParams, GotoDefinitionResponse, ImplementationProviderCapability,
+    InitializeParams, InitializeResult, InitializedParams, Location, OneOf, ReferenceParams,
+    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
+    SymbolInformation, TextDocumentPositionParams, TextDocumentSyncCapability,
+    TextDocumentSyncKind, Url, WorkspaceSymbolParams,
 };
 use tower_lsp::LanguageServer;
 
 use crate::hub::HubClient;
-use crate::messages::{NavigateRequest, NavigateResponse, Notification, Request, Response};
+use crate::messages::{
+    CompletionRequest, CompletionResponse as ItemsResponse, NavigateRequest, NavigateResponse,
+    Notification, Request, Response, SymbolRequest, SymbolResponse,
+};
 
 /// The LSP shell: the hub's first client.
 pub struct JavaLanguageServer {
@@ -115,15 +121,22 @@ impl LanguageServer for JavaLanguageServer {
             // documents; the shell forwards those events onto the hub once the
             // document module that consumes them returns. Definition, declaration,
             // implementation, and references are advertised now: the `navigate`
-            // module answers all four.
+            // module answers all four. Completion and signature help are
+            // advertised too: the `completion` module answers both.
             capabilities: ServerCapabilities {
                 text_document_sync: Some(TextDocumentSyncCapability::Kind(
                     TextDocumentSyncKind::INCREMENTAL,
                 )),
+                completion_provider: Some(CompletionOptions::default()),
+                signature_help_provider: Some(SignatureHelpOptions {
+                    trigger_characters: Some(vec!["(".into(), ",".into()]),
+                    ..Default::default()
+                }),
                 definition_provider: Some(OneOf::Left(true)),
                 declaration_provider: Some(DeclarationCapability::Simple(true)),
                 implementation_provider: Some(ImplementationProviderCapability::Simple(true)),
                 references_provider: Some(OneOf::Left(true)),
+                workspace_symbol_provider: Some(OneOf::Left(true)),
                 ..ServerCapabilities::default()
             },
             ..InitializeResult::default()
@@ -145,6 +158,37 @@ impl LanguageServer for JavaLanguageServer {
                 workspace_root: uri,
             });
         }
+    }
+
+    /// Forwards an opened document's full text onto the hub, so the `buffers`
+    /// module owns it and any consumer reads the editor's text rather than disk.
+    async fn did_open(&self, params: DidOpenTextDocumentParams) {
+        let document = params.text_document;
+        tracing::debug!(uri = %document.uri, "document opened");
+        self.hub.notify(Notification::DocumentOpened {
+            uri: document.uri,
+            version: document.version,
+            text: Arc::new(document.text),
+        });
+    }
+
+    /// Forwards a document's incremental changes onto the hub; the `buffers`
+    /// module applies them to the text it owns.
+    async fn did_change(&self, params: DidChangeTextDocumentParams) {
+        let document = params.text_document;
+        self.hub.notify(Notification::DocumentChanged {
+            uri: document.uri,
+            version: document.version,
+            changes: params.content_changes,
+        });
+    }
+
+    /// Forwards a closed document onto the hub, so the `buffers` module drops the
+    /// text it held.
+    async fn did_close(&self, params: DidCloseTextDocumentParams) {
+        self.hub.notify(Notification::DocumentClosed {
+            uri: params.text_document.uri,
+        });
     }
 
     async fn shutdown(&self) -> Result<()> {
@@ -223,6 +267,69 @@ impl LanguageServer for JavaLanguageServer {
                 if !locations.is_empty() =>
             {
                 Ok(Some(GotoImplementationResponse::Array(locations)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Answers `textDocument/completion` by asking the `completion` module for the
+    /// names offerable at the cursor; `None` when there is nothing to offer.
+    async fn completion(&self, params: CompletionParams) -> Result<Option<CompletionResponse>> {
+        let TextDocumentPositionParams {
+            text_document,
+            position,
+        } = params.text_document_position;
+        let response = self
+            .hub
+            .request(Request::Completion(CompletionRequest::Complete {
+                uri: text_document.uri,
+                position,
+            }))
+            .await;
+        match response {
+            Response::Completion(ItemsResponse::Items(items)) if !items.is_empty() => {
+                Ok(Some(CompletionResponse::Array(items)))
+            }
+            _ => Ok(None),
+        }
+    }
+
+    /// Answers `textDocument/signatureHelp` by asking the `completion` module for
+    /// the overloads of the call at the cursor; `None` when there is no
+    /// resolvable call, so the editor shows no wrong signature.
+    async fn signature_help(&self, params: SignatureHelpParams) -> Result<Option<SignatureHelp>> {
+        let TextDocumentPositionParams {
+            text_document,
+            position,
+        } = params.text_document_position_params;
+        let response = self
+            .hub
+            .request(Request::Completion(CompletionRequest::SignatureHelp {
+                uri: text_document.uri,
+                position,
+            }))
+            .await;
+        match response {
+            Response::Completion(ItemsResponse::SignatureHelp(help)) => Ok(help),
+            _ => Ok(None),
+        }
+    }
+
+    /// Answers `workspace/symbol` by asking the `workspace` module for the symbols
+    /// whose simple name starts with the query; `None` when nothing matches.
+    async fn symbol(
+        &self,
+        params: WorkspaceSymbolParams,
+    ) -> Result<Option<Vec<SymbolInformation>>> {
+        let response = self
+            .hub
+            .request(Request::Symbols(SymbolRequest::Search {
+                query: params.query,
+            }))
+            .await;
+        match response {
+            Response::Symbols(SymbolResponse::Symbols(symbols)) if !symbols.is_empty() => {
+                Ok(Some(symbols))
             }
             _ => Ok(None),
         }

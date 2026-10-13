@@ -22,8 +22,10 @@
 //! `HubClient` mirrors the query surface its callers need, so a module that used
 //! to hold a neighbour's handle now holds a client instead.
 //!
-//! The hub **logs every message passing through** ([`Hub::forward`]), so the whole
-//! flow is observable from one place (`RUST_LOG=java_lsp::hub=info`).
+//! The hub **logs a compact summary of every message passing through**
+//! ([`Hub::forward`]) — kind, sender, and payload shapes, with text payloads
+//! elided to their length — so the whole flow is observable from one place
+//! (`RUST_LOG=java_lsp::hub=info`) without the file bodies.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -147,7 +149,7 @@ impl Hub {
     }
 
     async fn forward(&self, msg: Envelope) {
-        info!(?msg, "Hub message");
+        info!(msg = %msg.summary(), "Hub message");
 
         match &*msg.message {
             Message::Request(request) => {
@@ -241,6 +243,9 @@ impl Default for Hub {
 fn owner_of(request: &Request) -> &'static str {
     match request {
         Request::Navigate(_) => "navigate",
+        Request::Completion(_) => "completion",
+        Request::Buffers(_) => "buffers",
+        Request::Symbols(_) => "workspace",
         Request::Index(_) | Request::IndexBatch(_) => "index",
     }
 }
@@ -363,13 +368,16 @@ mod tests {
 
     use tower_lsp::lsp_types::{Position, Url};
 
-    use crate::messages::{Message, NavigateRequest, NavigateResponse, Notification};
+    use crate::messages::{
+        BuffersResponse, FolderOrigin, Message, NavigateRequest, NavigateResponse, Notification,
+    };
 
     use super::*;
 
     fn folder(uri: &str) -> Notification {
         Notification::FoldersDiscoverred {
             uri: vec![Url::parse(uri).expect("a valid file URI")],
+            origin: FolderOrigin::Workspace,
         }
     }
 
@@ -474,5 +482,57 @@ mod tests {
         let reply = requester.request(declaration_request());
         let response = reply.await;
         assert!(matches!(response, Response::Empty));
+    }
+
+    #[test]
+    fn a_text_payload_logs_its_length_not_its_body() {
+        let body = "class Widget {\n    int count;\n}\n";
+        let envelope = Envelope {
+            id: 1,
+            request_id: Some(1),
+            sender: "buffers",
+            message: Arc::new(Message::Response(Response::Buffers(BuffersResponse::Text(
+                Some(Arc::new(body.to_string())),
+            )))),
+        };
+
+        let summary = envelope.summary();
+        assert!(summary.contains("Buffers(Text Some("));
+        assert!(
+            summary.contains(&format!("{} bytes)", body.len())),
+            "the summary carries the byte length: {summary}"
+        );
+        assert!(
+            !summary.contains(body),
+            "the body must not appear: {summary}"
+        );
+    }
+
+    #[test]
+    fn a_document_open_logs_the_text_length_not_the_body() {
+        let body = "class Widget {}\n";
+        let envelope = Envelope {
+            id: 2,
+            request_id: None,
+            sender: "server",
+            message: Arc::new(Message::Notification(Arc::new(
+                Notification::DocumentOpened {
+                    uri: Url::parse("file:///Widget.java").expect("a valid file URI"),
+                    version: 1,
+                    text: Arc::new(body.to_string()),
+                },
+            ))),
+        };
+
+        let summary = envelope.summary();
+        assert!(summary.contains("DocumentOpened uri=file:///Widget.java"));
+        assert!(
+            summary.contains(&format!("text={} bytes", body.len())),
+            "the summary carries the byte length: {summary}"
+        );
+        assert!(
+            !summary.contains(body),
+            "the body must not appear: {summary}"
+        );
     }
 }

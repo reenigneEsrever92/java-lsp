@@ -10,8 +10,11 @@
 //!
 //! Resolution is name-based, matching the index's extraction: the cursor
 //! resolves to the declarations of the name it sits on, narrowed by what the node
-//! kind says (a type position names a type, a member position a member), and a
-//! name spread across files is no answer at all — no result beats a wrong result.
+//! kind says (a type position names a type, a member position a member). A type
+//! name is first narrowed to what the cursor's file can see — its own, its
+//! package's, or an imported type — so a same-named type elsewhere does not make
+//! a visible use ambiguous; what remains must share one file, because a name
+//! spread across files is no answer at all — no result beats a wrong result.
 //! A cursor on a declaration's own name is the exception: it resolves to that
 //! declaration, and only a use keeps the cross-file ambiguity policy.
 //! A member cursor is resolved further through the receiver's declared type: the
@@ -26,11 +29,15 @@
 //! Type references are found soundly: every `Type` occurrence of a type the file
 //! can see (its own file, its package, or an import). Member references are found
 //! where the receiver's resolved type (or a supertype) declares the target, or,
-//! for a bare name, inside the declaring type's own span. Documented limitations:
-//! a chained call (`a.b().c()`), a generic type argument, and a lambda or
-//! anonymous-class scope are not resolved through; a bare field use (a bare
-//! identifier that is not an unqualified call) is not narrowed; and a receiver
-//! whose declared type is a generic type-variable name is not resolved.
+//! for a bare name, inside the declaring type's own span. A member receiver may
+//! itself be a call (`a.foo()`) or a field access (`a.field`), both resolved
+//! recursively through the shared receiver step; a chain resolves left to right
+//! while every link's own receiver can be typed, and breaks at a link that
+//! cannot. Documented limitations: a nested-type or package qualifier, `super`,
+//! a generic type argument, and a lambda or anonymous-class scope are not
+//! resolved through; a bare field use (a bare identifier that is not an
+//! unqualified call) is not narrowed; and a receiver whose declared type is a
+//! generic type-variable name is not resolved.
 //!
 //! Navigation is async: it reads source files with tokio and awaits each index
 //! read over the hub. The deep AST walks stay synchronous — an async-recursive
@@ -45,12 +52,16 @@ use tower_lsp::lsp_types::{Location, Position, Range, Url};
 use tree_sitter::{Node, Tree};
 
 use crate::hub::{Hub, HubClient};
-use crate::index::types::{FileOrigin, Member, Prim, SymbolEntry, SymbolKind, Ty};
+use crate::index::{FileOrigin, SymbolEntry};
 use crate::messages::{
     IndexBatchRequest, IndexBatchResponse, IndexRequest, IndexResponse, MemberSelector, Message,
     NavigateRequest, NavigateResponse, Request, Response,
 };
-use crate::parser::{file_package, java_parser, type_from_node, LineIndex};
+use crate::model::{Prim, SymbolKind, Ty};
+use crate::parser::{
+    byte_offset, file_package, java_parser, type_from_node, word_at, word_prefix, LineIndex,
+};
+use crate::util::{enclosing_type_name, identifier_type, receiver_type_of};
 
 // ---------------------------------------------------------------------------
 // The hub client
@@ -147,37 +158,6 @@ async fn named(client: &HubClient, name: &str) -> Vec<Arc<SymbolEntry>> {
     }
 }
 
-/// A type's members, inherited ones included.
-async fn members(client: &HubClient, ty: &Ty, package: Option<&str>) -> Vec<Member> {
-    match read(
-        client,
-        IndexRequest::MembersOf {
-            ty: ty.clone(),
-            package: package.map(str::to_string),
-        },
-    )
-    .await
-    {
-        Some(IndexResponse::Members(members)) => members,
-        _ => Vec::new(),
-    }
-}
-
-/// Whether a type name resolves.
-async fn resolves_type(client: &HubClient, ty: &Ty, package: Option<&str>) -> bool {
-    matches!(
-        read(
-            client,
-            IndexRequest::ResolvesType {
-                ty: ty.clone(),
-                package: package.map(str::to_string),
-            },
-        )
-        .await,
-        Some(IndexResponse::Resolves(true))
-    )
-}
-
 /// The `(simple name, package)` identities of a type and its supertype closure.
 async fn type_closure(
     client: &HubClient,
@@ -216,14 +196,14 @@ async fn source_files(client: &HubClient) -> Vec<Url> {
 /// member, which resolves to the nearest declaration it overrides in its type's
 /// supertype closure — not to the cross-file ambiguity policy that governs a use.
 async fn find_declaration(client: &HubClient, uri: &Url, position: Position) -> Option<Location> {
-    let (text, tree) = read_and_parse(uri).await?;
+    let (text, tree) = read_and_parse(client, uri).await?;
     let offset = byte_offset(&text, position);
     if let Some(location) = own_declaration(client, uri, &text, &tree, offset).await {
         return overridden_declaration(client, uri, &text, &tree, offset)
             .await
             .or(Some(location));
     }
-    unique_location(declaration_candidates(client, &text, &tree, offset).await)
+    unique_location(declaration_candidates(client, uri, &text, &tree, offset).await)
 }
 
 /// The declaration the cursor at `offset` sits on, when it is the `name` field of
@@ -357,7 +337,7 @@ async fn overridden_declaration(
             Some(params) => {
                 let mut best = None;
                 for entry in &declaring {
-                    let matches = declaration_parameter_types(uri, text, tree, entry)
+                    let matches = declaration_parameter_types(client, uri, text, tree, entry)
                         .await
                         .as_ref()
                         == Some(params);
@@ -382,6 +362,7 @@ async fn overridden_declaration(
 /// tree when the entry is in the cursor's own file, otherwise by re-reading the
 /// entry's source. `None` when that source cannot be read or declares no method.
 async fn declaration_parameter_types(
+    client: &HubClient,
     uri: &Url,
     text: &str,
     tree: &Tree,
@@ -390,7 +371,7 @@ async fn declaration_parameter_types(
     if entry.uri.as_ref() == uri {
         return method_params_at(text, tree, entry.selection_range);
     }
-    let (source_text, source_tree) = read_and_parse(&entry.uri).await?;
+    let (source_text, source_tree) = read_and_parse(client, &entry.uri).await?;
     method_params_at(&source_text, &source_tree, entry.selection_range)
 }
 
@@ -431,7 +412,7 @@ fn method_parameter_types(method: &Node, text: &str) -> Vec<Ty> {
 /// transitively; for a member, every workspace subtype that declares an override
 /// of it. Empty when the cursor names no contract or nothing implements it.
 async fn find_implementation(client: &HubClient, uri: &Url, position: Position) -> Vec<Location> {
-    let Some((text, tree)) = read_and_parse(uri).await else {
+    let Some((text, tree)) = read_and_parse(client, uri).await else {
         return Vec::new();
     };
     let offset = byte_offset(&text, position);
@@ -563,7 +544,9 @@ async fn argument_type(
     node: &Node<'_>,
 ) -> Option<Ty> {
     match node.kind() {
-        "identifier" => identifier_type(client, text, package, node).await,
+        "identifier" => identifier_type(client, text, package, node, 0)
+            .await
+            .map(|receiver| receiver.ty),
         "this" => enclosing_type_name(text, node).map(Ty::reference),
         "type_identifier" | "scoped_type_identifier" => {
             Some(Ty::reference(text[node.byte_range()].to_string()))
@@ -590,12 +573,12 @@ async fn find_references(
     position: Position,
     include_declaration: bool,
 ) -> Vec<Location> {
-    let Some((text, tree)) = read_and_parse(uri).await else {
+    let Some((text, tree)) = read_and_parse(client, uri).await else {
         return Vec::new();
     };
     let offset = byte_offset(&text, position);
     let Some(candidates) =
-        unique_candidates(declaration_candidates(client, &text, &tree, offset).await)
+        unique_candidates(declaration_candidates(client, uri, &text, &tree, offset).await)
     else {
         return Vec::new();
     };
@@ -613,7 +596,7 @@ async fn find_references(
     sources.sort_by(|a, b| a.as_str().cmp(b.as_str()));
 
     for source in sources {
-        let Some((file_text, file_tree)) = read_and_parse(&source).await else {
+        let Some((file_text, file_tree)) = read_and_parse(client, &source).await else {
             continue;
         };
         // Cheap prefilter: only a file that mentions the name can hold a hit.
@@ -749,6 +732,39 @@ impl Target {
     }
 }
 
+/// Whether the cursor's file can name the type `entry`: it is declared in the
+/// file itself, in the file's own package, or imported into it — exactly, or via
+/// a package wildcard. Only the visibility that pins a simple name to one type
+/// is recognised; a miss leaves the candidate set unchanged (the caller falls
+/// back), so a nested type or a qualified reference is never dropped.
+fn type_visible_in_file(entry: &SymbolEntry, uri: &Url, text: &str, tree: &Tree) -> bool {
+    if entry.uri.as_ref() == uri {
+        return true;
+    }
+    if entry.package.as_deref() == file_package(tree, text).as_deref() {
+        return true;
+    }
+    let Some(package) = entry.package.as_deref() else {
+        return false;
+    };
+    let exact = qualified_type_name(package, entry);
+    let wildcard = format!("{package}.*");
+    imports_of(tree, text)
+        .into_iter()
+        .filter(|import| !import.is_static)
+        .any(|import| import.path == exact || import.path == wildcard)
+}
+
+/// The dotted name a type is imported by: its package, its enclosing-type chain,
+/// and its own name (`a.Outer.Inner`), matching how an import path is written.
+fn qualified_type_name(package: &str, entry: &SymbolEntry) -> String {
+    let mut segments: Vec<&str> = Vec::with_capacity(entry.container.len() + 2);
+    segments.push(package);
+    segments.extend(entry.container.iter().map(String::as_str));
+    segments.push(&entry.name);
+    segments.join(".")
+}
+
 // ---------------------------------------------------------------------------
 // Resolving the cursor to its declarations
 // ---------------------------------------------------------------------------
@@ -759,6 +775,7 @@ impl Target {
 /// excluded, as are import entries themselves.
 async fn declaration_candidates(
     client: &HubClient,
+    uri: &Url,
     text: &str,
     tree: &Tree,
     offset: usize,
@@ -812,6 +829,24 @@ async fn declaration_candidates(
             NameConstraint::Any => true,
         })
         .collect();
+
+    // A type name resolves against what the cursor's file can see. Narrowing the
+    // candidates to the types the file can name — its own, its package's, or an
+    // import — before the cross-file ambiguity policy runs keeps a same-named
+    // type in another package (`b.Widget`) from making a visible use of
+    // `a.Widget` ambiguous. When nothing is visible the set is left whole, so a
+    // reference the predicate does not recognise (a nested type, a qualified
+    // name) is never dropped.
+    if matches!(constraint, NameConstraint::Type) {
+        let visible: Vec<Arc<SymbolEntry>> = candidates
+            .iter()
+            .filter(|entry| type_visible_in_file(entry, uri, text, tree))
+            .cloned()
+            .collect();
+        if !visible.is_empty() {
+            candidates = visible;
+        }
+    }
 
     // A member cursor is resolved through the receiver's declared type (D1): keep
     // only the entries the nearest type in the receiver's supertype closure
@@ -1050,295 +1085,6 @@ async fn owner_span_in(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Receiver-typed member resolution
-// ---------------------------------------------------------------------------
-
-/// The type a member cursor resolves its receiver through, or `None` when the
-/// receiver is one of the documented out-of-scope shapes (a chained call,
-/// `super`, an array access, a lambda) or does not resolve.
-///
-/// A `recv.name`/`recv.name()` cursor resolves `recv`: `this` names the enclosing
-/// type; an `identifier` is resolved in the enclosing scope (a parameter, then an
-/// in-scope local, then a field of the enclosing type, then a type name for
-/// `Type.staticMember`); a `type_identifier`/`scoped_type_identifier` is the
-/// written type; a `new T(…)` is `T`. An unqualified call `name(...)` the
-/// enclosing type declares is an implicit `this`.
-async fn receiver_type_of(
-    client: &HubClient,
-    text: &str,
-    package: Option<&str>,
-    node: &Node<'_>,
-) -> Option<Ty> {
-    if let Some(object) = member_access_object(node) {
-        return match object.kind() {
-            "this" => enclosing_type_name(text, node).map(Ty::reference),
-            "identifier" => identifier_type(client, text, package, &object).await,
-            "type_identifier" | "scoped_type_identifier" => {
-                Some(Ty::reference(text[object.byte_range()].to_string()))
-            }
-            "object_creation_expression" => object
-                .child_by_field_name("type")
-                .map(|ty| type_from_node(&ty, text)),
-            _ => None,
-        };
-    }
-    // An implicit `this`: only an unqualified call `name(...)` — a genuine
-    // unqualified member use — whose name the enclosing type declares. A
-    // method-reference name (`Strings::trim`), an annotation name, a declaration
-    // name, and any other bare identifier are not receivers, so the name-only
-    // ambiguity policy stands for them (D4).
-    if !is_implicit_this_use(node) {
-        return None;
-    }
-    let name = &text[node.byte_range()];
-    let enclosing = enclosing_type_name(text, node)?;
-    let ty = Ty::reference(enclosing);
-    members(client, &ty, package)
-        .await
-        .iter()
-        .any(|member| member.name == name)
-        .then_some(ty)
-}
-
-/// True when `node` is the name of an unqualified `method_invocation` — a bare
-/// call `name(...)` with no `object`, the shape an implicit `this` receiver is.
-fn is_implicit_this_use(node: &Node) -> bool {
-    if node.kind() != "identifier" {
-        return false;
-    }
-    node.parent().is_some_and(|parent| {
-        parent.kind() == "method_invocation"
-            && parent.child_by_field_name("object").is_none()
-            && parent
-                .child_by_field_name("name")
-                .is_some_and(|name| name.id() == node.id())
-    })
-}
-
-/// The `object` of the `recv.name`/`recv.name()` a name node belongs to.
-fn member_access_object<'a>(node: &Node<'a>) -> Option<Node<'a>> {
-    let parent = node.parent()?;
-    match parent.kind() {
-        "field_access"
-            if parent
-                .child_by_field_name("field")
-                .is_some_and(|field| field.id() == node.id()) =>
-        {
-            parent.child_by_field_name("object")
-        }
-        "method_invocation"
-            if parent
-                .child_by_field_name("name")
-                .is_some_and(|named| named.id() == node.id()) =>
-        {
-            parent.child_by_field_name("object")
-        }
-        _ => None,
-    }
-}
-
-/// The type a bare identifier receiver names, resolved in the enclosing scope:
-/// the enclosing method's parameter of that name, then an in-scope local, then a
-/// field of the enclosing type (read from the index), then — if the name is a
-/// type — the type itself (`Type.staticMember`).
-async fn identifier_type(
-    client: &HubClient,
-    text: &str,
-    package: Option<&str>,
-    node: &Node<'_>,
-) -> Option<Ty> {
-    let name = &text[node.byte_range()];
-    if let Some(ty) = parameter_type(text, node, name).or_else(|| local_type(text, node, name)) {
-        // A parameter/local typed by a type variable names an unknown type, not
-        // the same-named class the model might hold.
-        return resolvable(ty).filter(|ty| !is_type_parameter_ty(node, text, ty));
-    }
-    if let Some(ty) = field_type(client, text, node, package, name).await {
-        return resolvable(ty).filter(|ty| !is_type_parameter_ty(node, text, ty));
-    }
-    if is_type_parameter(node, text, name) {
-        return None;
-    }
-    let ty = Ty::reference(name);
-    resolves_type(client, &ty, package).await.then_some(ty)
-}
-
-/// True when `ty` names a type parameter of an enclosing method or type rather
-/// than a declared type, so it resolves nothing (D1's generic limitation).
-fn is_type_parameter_ty(node: &Node, text: &str, ty: &Ty) -> bool {
-    match ty {
-        Ty::Ref { name, args } if args.is_empty() => is_type_parameter(node, text, name),
-        Ty::Var(name) => is_type_parameter(node, text, name),
-        _ => false,
-    }
-}
-
-/// True when `name` is a type parameter of `node`'s nearest enclosing method or
-/// type, walking outward through nested types.
-fn is_type_parameter(node: &Node, text: &str, name: &str) -> bool {
-    let mut current = node.parent();
-    while let Some(ancestor) = current {
-        if matches!(
-            ancestor.kind(),
-            "method_declaration"
-                | "constructor_declaration"
-                | "class_declaration"
-                | "interface_declaration"
-                | "enum_declaration"
-                | "record_declaration"
-        ) {
-            if let Some(params) = ancestor.child_by_field_name("type_parameters") {
-                let mut cursor = params.walk();
-                for parameter in params.named_children(&mut cursor) {
-                    if parameter.kind() != "type_parameter" {
-                        continue;
-                    }
-                    // `type_parameter` has no fields: its name is the
-                    // `type_identifier` child (any `type_bound` is ignored).
-                    let mut inner = parameter.walk();
-                    let named = parameter.named_children(&mut inner).any(|child| {
-                        child.kind() == "type_identifier" && &text[child.byte_range()] == name
-                    });
-                    if named {
-                        return true;
-                    }
-                }
-            }
-        }
-        current = ancestor.parent();
-    }
-    false
-}
-
-/// A [`Ty`] a receiver can resolve through: a reference or a type variable (a
-/// primitive, `void`, `null`, an array, or an unknown type names no member — an
-/// array's element type is not the receiver, matching
-/// [`crate::index::query::members_with_overloads`]'s array guard).
-fn resolvable(ty: Ty) -> Option<Ty> {
-    matches!(ty, Ty::Ref { .. } | Ty::Var(_)).then_some(ty)
-}
-
-/// The declared type of the enclosing method's parameter named `name`.
-fn parameter_type(text: &str, node: &Node, name: &str) -> Option<Ty> {
-    let method = enclosing_ancestor(node, &["method_declaration", "constructor_declaration"])?;
-    let params = method.child_by_field_name("parameters")?;
-    let mut cursor = params.walk();
-    for param in params.named_children(&mut cursor) {
-        if !matches!(param.kind(), "formal_parameter" | "spread_parameter") {
-            continue;
-        }
-        let is_named = param
-            .child_by_field_name("name")
-            .is_some_and(|node_name| &text[node_name.byte_range()] == name);
-        if is_named {
-            return param
-                .child_by_field_name("type")
-                .map(|ty| type_from_node(&ty, text));
-        }
-    }
-    None
-}
-
-/// The declared type of an in-scope local named `name` declared before `node` — a
-/// `local_variable_declaration` or an `enhanced_for_statement` binding.
-fn local_type(text: &str, node: &Node, name: &str) -> Option<Ty> {
-    let method = enclosing_ancestor(
-        node,
-        &[
-            "method_declaration",
-            "constructor_declaration",
-            "compact_constructor_declaration",
-        ],
-    )?;
-    let mut stack = vec![method];
-    while let Some(current) = stack.pop() {
-        if current.start_byte() < node.start_byte() {
-            match current.kind() {
-                "local_variable_declaration" => {
-                    let ty = current
-                        .child_by_field_name("type")
-                        .map(|ty| type_from_node(&ty, text));
-                    let mut cursor = current.walk();
-                    for declarator in current.named_children(&mut cursor) {
-                        if declarator.kind() != "variable_declarator" {
-                            continue;
-                        }
-                        let is_named = declarator
-                            .child_by_field_name("name")
-                            .is_some_and(|node_name| &text[node_name.byte_range()] == name);
-                        if is_named {
-                            return ty;
-                        }
-                    }
-                }
-                "enhanced_for_statement" => {
-                    let is_named = current
-                        .child_by_field_name("name")
-                        .is_some_and(|node_name| &text[node_name.byte_range()] == name);
-                    if is_named {
-                        return current
-                            .child_by_field_name("type")
-                            .map(|ty| type_from_node(&ty, text));
-                    }
-                }
-                _ => {}
-            }
-        }
-        let mut cursor = current.walk();
-        for child in current.named_children(&mut cursor) {
-            stack.push(child);
-        }
-    }
-    None
-}
-
-/// The declared type of a field named `name` on the enclosing type, read from the
-/// index (inherited fields included).
-async fn field_type(
-    client: &HubClient,
-    text: &str,
-    node: &Node<'_>,
-    package: Option<&str>,
-    name: &str,
-) -> Option<Ty> {
-    let enclosing = enclosing_type_name(text, node)?;
-    members(client, &Ty::reference(enclosing), package)
-        .await
-        .into_iter()
-        .find(|member| member.kind == SymbolKind::Field && member.name == name)
-        .map(|member| member.ty)
-}
-
-/// The innermost enclosing type declaration's name.
-fn enclosing_type_name(text: &str, node: &Node) -> Option<String> {
-    let declaration = enclosing_ancestor(
-        node,
-        &[
-            "class_declaration",
-            "interface_declaration",
-            "enum_declaration",
-            "record_declaration",
-            "annotation_type_declaration",
-        ],
-    )?;
-    declaration
-        .child_by_field_name("name")
-        .map(|name| text[name.byte_range()].to_string())
-}
-
-/// The nearest ancestor of one of `kinds`.
-fn enclosing_ancestor<'a>(node: &Node<'a>, kinds: &[&str]) -> Option<Node<'a>> {
-    let mut current = node.parent();
-    while let Some(candidate) = current {
-        if kinds.contains(&candidate.kind()) {
-            return Some(candidate);
-        }
-        current = candidate.parent();
-    }
-    None
-}
-
 /// Whether `entry` is declared by the `(name, package)` identity — its innermost
 /// enclosing type's simple name and its package.
 fn declared_by(identity: &(String, Option<String>), entry: &SymbolEntry) -> bool {
@@ -1383,67 +1129,13 @@ fn push_range(
 // Java-reading helpers
 // ---------------------------------------------------------------------------
 
-/// Reads and parses the `.java` file `uri`, or `None` when it cannot be read or
-/// parsed.
-async fn read_and_parse(uri: &Url) -> Option<(String, Tree)> {
-    let path = uri.to_file_path().ok()?;
-    let text = tokio::fs::read_to_string(path).await.ok()?;
+/// Reads and parses the `.java` file `uri` — the open buffer's text when the
+/// editor has it open, otherwise the file on disk — or `None` when neither can be
+/// read or parsed.
+async fn read_and_parse(client: &HubClient, uri: &Url) -> Option<(String, Tree)> {
+    let text = crate::buffers::current_text(client, uri).await?;
     let tree = java_parser().parse(text.as_bytes(), None)?;
-    Some((text, tree))
-}
-
-/// The byte offset of an LSP position (line + UTF-16 code units).
-fn byte_offset(text: &str, position: Position) -> usize {
-    let mut offset = 0usize;
-    for _ in 0..position.line {
-        match text[offset..].find('\n') {
-            Some(nl) => offset += nl + 1,
-            None => return text.len(),
-        }
-    }
-    let line_end = text[offset..]
-        .find('\n')
-        .map_or(text.len(), |nl| offset + nl);
-    let mut units = 0u32;
-    for (i, ch) in text[offset..line_end].char_indices() {
-        if units + ch.len_utf16() as u32 > position.character {
-            return offset + i;
-        }
-        units += ch.len_utf16() as u32;
-    }
-    line_end
-}
-
-/// The run of identifier characters `[A-Za-z0-9_$]` ending at `offset`.
-fn word_prefix(text: &str, offset: usize) -> &str {
-    let offset = offset.min(text.len());
-    let mut start = offset;
-    for (i, ch) in text[..offset].char_indices().rev() {
-        if !is_ident_char(ch) {
-            break;
-        }
-        start = i;
-    }
-    &text[start..offset]
-}
-
-/// The full run of identifier characters containing `offset` — the whole word
-/// under the cursor.
-fn word_at(text: &str, offset: usize) -> &str {
-    let offset = offset.min(text.len());
-    let start = offset - word_prefix(text, offset).len();
-    let mut end = offset;
-    for (i, ch) in text[offset..].char_indices() {
-        if !is_ident_char(ch) {
-            break;
-        }
-        end = offset + i + ch.len_utf8();
-    }
-    &text[start..end]
-}
-
-fn is_ident_char(ch: char) -> bool {
-    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
+    Some(((*text).clone(), tree))
 }
 
 /// What the node kind at the cursor says about the name it references: a
@@ -1470,6 +1162,29 @@ fn name_constraint(node: &Node) -> NameConstraint {
             match parent.kind() {
                 "method_invocation" if is_named_field("name") => return NameConstraint::Member,
                 "field_access" if is_named_field("field") => return NameConstraint::Member,
+                // A declaration's own name is constrained by what it declares, so a
+                // same-named member — a class and its constructor share a name —
+                // never joins the type's candidate set.
+                "class_declaration"
+                | "interface_declaration"
+                | "enum_declaration"
+                | "record_declaration"
+                | "annotation_type_declaration"
+                    if is_named_field("name") =>
+                {
+                    return NameConstraint::Type
+                }
+                "method_declaration"
+                | "constructor_declaration"
+                | "enum_constant"
+                | "variable_declarator"
+                | "formal_parameter"
+                | "spread_parameter"
+                | "enhanced_for_statement"
+                    if is_named_field("name") =>
+                {
+                    return NameConstraint::Member
+                }
                 _ => {}
             }
         }
@@ -1615,7 +1330,7 @@ mod tests {
     fn index_of(uris: &[Url]) -> WorkspaceIndex {
         let paths: Vec<PathBuf> = uris.iter().map(|uri| uri.to_file_path().unwrap()).collect();
         let mut index = WorkspaceIndex::default();
-        let count = scan_sources(&paths, &mut index);
+        let count = scan_sources(&paths, FileOrigin::Workspace, &mut index);
         assert_eq!(count, uris.len(), "every file indexed");
         set_ready(&mut index);
         index
@@ -1760,6 +1475,89 @@ mod tests {
         assert!(with_declaration
             .iter()
             .any(|location| location.uri == widget));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn references_ignore_a_same_named_type_in_another_package() {
+        let dir = temp_dir("refs-dup");
+        let widget = write(
+            &dir,
+            "a/Widget.java",
+            "package a;\n\npublic class Widget {}\n",
+        );
+        let other = write(
+            &dir,
+            "b/Widget.java",
+            "package b;\n\npublic class Widget {}\n",
+        );
+        let use_text = "package a;\n\nclass Use {\n    Widget w;\n}\n";
+        let use_uri = write(&dir, "a/Use.java", use_text);
+        let client = navigate_hub(&[widget.clone(), other, use_uri.clone()]).await;
+
+        // The same-named type in `b` must not make the `a` use ambiguous.
+        let position = position_of(use_text, "Widget w");
+        let locations = references(&client, &use_uri, position, true).await;
+        assert_eq!(locations.len(), 2, "{locations:?}");
+        assert!(locations.iter().any(|location| location.uri == use_uri));
+        assert!(locations.iter().any(|location| location.uri == widget));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn declaration_resolves_a_type_use_with_a_same_named_type_elsewhere() {
+        let dir = temp_dir("decl-dup-type");
+        let widget = write(
+            &dir,
+            "a/Widget.java",
+            "package a;\n\npublic class Widget {}\n",
+        );
+        let other = write(
+            &dir,
+            "b/Widget.java",
+            "package b;\n\npublic class Widget {}\n",
+        );
+        let use_text = "package a;\n\nclass Use {\n    Widget w;\n}\n";
+        let use_uri = write(&dir, "a/Use.java", use_text);
+        let client = navigate_hub(&[widget.clone(), other, use_uri.clone()]).await;
+
+        let position = position_of(use_text, "Widget w");
+        let location = declaration(&client, &use_uri, position).await;
+        assert_eq!(location.map(|location| location.uri), Some(widget));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_type_reference_follows_an_import_when_the_simple_name_is_shared() {
+        let dir = temp_dir("refs-import-dup");
+        let widget = write(
+            &dir,
+            "a/Widget.java",
+            "package a;\n\npublic class Widget {}\n",
+        );
+        let other = write(
+            &dir,
+            "b/Widget.java",
+            "package b;\n\npublic class Widget {}\n",
+        );
+        let use_text = "package c;\n\nimport a.Widget;\n\nclass Other {\n    Widget field;\n}\n";
+        let use_uri = write(&dir, "c/Other.java", use_text);
+        let client = navigate_hub(&[widget.clone(), other, use_uri.clone()]).await;
+
+        // The explicit import pins the target to `a.Widget`, never `b.Widget`:
+        // the import, the field use, and the declaration (included).
+        let position = position_of(use_text, "Widget field");
+        let locations = references(&client, &use_uri, position, true).await;
+        assert_eq!(locations.len(), 3, "{locations:?}");
+        assert!(locations.iter().any(|location| location.uri == widget));
+        assert_eq!(
+            locations
+                .iter()
+                .filter(|location| location.uri == use_uri)
+                .count(),
+            2,
+            "the import and the field use: {locations:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1920,6 +1718,96 @@ class Widget {
             .expect("static qualifier");
         assert_eq!(location.uri, uri);
         assert_eq!(location.range.start.line, 7);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_member_access_resolves_through_a_chained_receiver() {
+        let dir = temp_dir("receiver-chain");
+        let iface_text =
+            "package p;\n\npublic interface TestInterface {\n    void doSomething();\n}\n";
+        let iface = write(&dir, "p/TestInterface.java", iface_text);
+        // `holder.get()` returns the interface, so `doSomething` is reached
+        // through a chained receiver rather than a plain field/parameter.
+        let main_text = "\
+package p;
+
+class Holder {
+    TestInterface get() {
+        return null;
+    }
+}
+
+class Main {
+    Holder holder;
+
+    void run() {
+        holder.get().doSomething();
+    }
+}
+";
+        let main = write(&dir, "p/Main.java", main_text);
+        let client = navigate_hub(&[iface.clone(), main.clone()]).await;
+
+        let position = position_of(main_text, "doSomething");
+        let location = declaration(&client, &main, position)
+            .await
+            .expect("chained receiver declaration");
+        assert_eq!(location.uri, iface);
+
+        let refs = references(&client, &main, position, false).await;
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].uri, main);
+
+        let with_declaration = references(&client, &main, position, true).await;
+        assert_eq!(with_declaration.len(), 2, "{with_declaration:?}");
+        assert!(with_declaration
+            .iter()
+            .any(|location| location.uri == iface));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_member_access_resolves_through_a_field_access_receiver() {
+        let dir = temp_dir("receiver-field-access");
+        let iface_text =
+            "package p;\n\npublic interface TestInterface {\n    void doSomething();\n}\n";
+        let iface = write(&dir, "p/TestInterface.java", iface_text);
+        // `holder.itf` is a field access, so `doSomething` is reached through a
+        // field receiver rather than a plain field/parameter.
+        let main_text = "\
+package p;
+
+class Holder {
+    TestInterface itf;
+}
+
+class Main {
+    Holder holder;
+
+    void run() {
+        holder.itf.doSomething();
+    }
+}
+";
+        let main = write(&dir, "p/Main.java", main_text);
+        let client = navigate_hub(&[iface.clone(), main.clone()]).await;
+
+        let position = position_of(main_text, "doSomething");
+        let location = declaration(&client, &main, position)
+            .await
+            .expect("field-access receiver declaration");
+        assert_eq!(location.uri, iface);
+
+        let refs = references(&client, &main, position, false).await;
+        assert_eq!(refs.len(), 1, "{refs:?}");
+        assert_eq!(refs[0].uri, main);
+
+        let with_declaration = references(&client, &main, position, true).await;
+        assert_eq!(with_declaration.len(), 2, "{with_declaration:?}");
+        assert!(with_declaration
+            .iter()
+            .any(|location| location.uri == iface));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -2318,6 +2206,32 @@ class Use {
             .await
             .expect("declaration found");
         assert_eq!(location.uri, impl_uri);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn references_on_a_class_declaration_survive_a_named_constructor() {
+        let dir = temp_dir("refs-ctor");
+        let greeter_text = "package com.example.greeting;\n\npublic class Greeter {\n    private final String name;\n\n    public Greeter(String name) {\n        this.name = name;\n    }\n\n    public String greet() {\n        return \"Hello\";\n    }\n}\n";
+        let greeter = write(&dir, "com/example/greeting/Greeter.java", greeter_text);
+        let main_text = "package com.example.app;\n\nimport com.example.greeting.Greeter;\n\npublic class Main {\n    Greeter greeter = new Greeter(\"world\");\n\n    void m() {\n        greeter.greet();\n        var inner = new Greeter.Inner();\n    }\n}\n";
+        let main = write(&dir, "com/example/app/Main.java", main_text);
+        let client = navigate_hub(&[greeter.clone(), main.clone()]).await;
+
+        // A class and its constructor share a simple name — the constructor is
+        // indexed as a member of the class — so a cursor on the class
+        // declaration's own name must still resolve to the class, not to the
+        // mixed name group.
+        let position = position_of(greeter_text, "Greeter {");
+        let with_declaration = references(&client, &greeter, position, true).await;
+        assert_eq!(with_declaration.len(), 5, "{with_declaration:?}");
+        assert!(with_declaration
+            .iter()
+            .any(|location| location.uri == greeter));
+
+        let uses = references(&client, &greeter, position, false).await;
+        assert_eq!(uses.len(), 4, "{uses:?}");
+        assert!(uses.iter().all(|location| location.uri == main));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

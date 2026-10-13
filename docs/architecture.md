@@ -15,11 +15,11 @@ transport change rather than a redesign.
 
 > **Rework in progress.** The engine modules are reintroduced one at a time, so
 > several modules listed below are deprecated: commented out of `lib.rs` and kept
-> out of the build under `src/deprecated/` (only `cli`, `hub`, `index`,
-> `messages`, `navigate`, `parser`, `project`, and `server` are built). This section
-> describes the intended design; where a pass has already landed, the text below
-> reflects it.
-> Three have landed. The **hub mechanics** are rebuilt — a request is routed to
+> out of the build under `src/deprecated/` (only `buffers`, `cli`, `completion`,
+> `hub`, `index`, `maven`, `messages`, `model`, `navigate`, `parser`, `server`,
+> `util`, and `workspace` are built). This section describes the intended design;
+> where a pass has already landed, the text below reflects it.
+> Six have landed. The **hub mechanics** are rebuilt — a request is routed to
 > the one module that owns it and the reply rides the hub back to the one
 > requester (`HubClient::{request, respond}` around an awaitable `Reply`) — with
 > `messages.rs` holding the current vocabulary (`Envelope`, `Message`, the
@@ -29,9 +29,24 @@ transport change rather than a redesign.
 > navigation and reads the index over the hub through a coarse, batched read
 > vocabulary (`IndexRequest`/`IndexBatchRequest`), so the index neither contains
 > nor serves navigation and the shared Java-reading helpers live in `parser.rs`.
-> The fuller vocabulary the reintroduced modules bring — the `DriverMessage`
-> notification set, `AnalysisRequest`, the index's `IndexHandle` — appears below
-> only as intended design.
+> And **completion** is its own hub module (`completion.rs`): the shell routes
+> `textDocument/completion` to it, and it resolves the names offerable at a cursor
+> — keywords, the names in scope, the workspace symbols starting with the typed
+> prefix (each with an auto-import edit), and, after a `.`, the receiver's members
+> through the shared receiver step (the reintroduced `util.rs`). And the **buffers** module
+> (`buffers.rs`) now owns the editor's unsaved text: the shell notifies
+> `DocumentOpened`/`DocumentChanged`/`DocumentClosed`, and a consumer that needs a
+> file's current text reads it there (`buffers::current_text`: the open buffer, or
+> the file on disk). And **workspace symbol search** is its own hub module
+> (`workspace.rs`): the shell advertises `workspaceSymbolProvider` and routes
+> `workspace/symbol` to it, and it maps the index's `EntriesByPrefix` matches to
+> `SymbolInformation`. And the **maven** module (`maven/`) parses Maven projects,
+> resolves their dependencies offline, fetches the dependency sources into the
+> home-folder cache, and publishes the workspace source roots and the extracted
+> library roots to the index as two `FoldersDiscoverred` batches with origins,
+> superseding the `project.rs` walk. The fuller vocabulary the reintroduced modules bring — the
+> `DriverMessage` set beyond those document events, `AnalysisRequest`, the index's
+> `IndexHandle` — appears below only as intended design.
 
 ## Layout
 
@@ -50,52 +65,79 @@ src/
                 module and renders diagnostics, progress, and notices
   hub.rs      — the engine hub: Hub (the inbound loop — it broadcasts
                 notifications, routes each request to the module that owns it,
-                routes the reply back to its one requester, and logs every
-                message) and HubClient (register, notify, subscribe, serve,
+                routes the reply back to its one requester, and logs a compact
+                summary of every message) and HubClient (register, notify, subscribe, serve,
                 request → Reply, respond)
   index/      — the index subsystem, split by role: `mod.rs` declares the
                 submodules, re-exports their operations, and owns `spawn` (the
                 workspace source scan and the coarse read server);
-                `types.rs` holds the data (WorkspaceIndex
-                — the workspace symbol entries, the append-only declared-type
-                base, and the per-source models — plus the symbol table and the
-                declared-type model); `analyze.rs` reads Java (`extract_entries`,
+                `types.rs` holds index-owned data (WorkspaceIndex — the workspace
+                symbol entries, the append-only declared-type base, and the
+                per-source models — plus the symbol table and layered views);
+                `analyze.rs` reads Java (`extract_entries`,
                 `collect_type_infos`) and writes the index (the symbol-table
                 upsert, the declared-type store's layer updates, and the context
                 rebuild); `query.rs` reads the index; `read.rs` answers the coarse
-                reads a consumer makes over the hub; `util.rs` holds the value
-                behaviour and small helpers
-  parser.rs   — the shared, stateless Java reading the index and `navigate`
-                both use: the tree-sitter parser, a file's line index, a type
-                node as a `Ty`, and the file's package
+                reads a consumer makes over the hub; `util.rs` holds index-specific
+                helpers shared by analysis and query
+  model.rs    — shared Java declaration vocabulary (`SymbolKind`, `Ty`, `Prim`,
+                `Param`, `Member`, `TypeInfo`) and its value behaviour; index
+                types re-export the old paths for compatibility
+  parser.rs   — the shared, stateless Java reading the index, `navigate`, and
+                `completion` use: the tree-sitter parser, a file's line index,
+                the position conversions and the identifier run at an offset, a
+                type node as a `Ty`, and the file's package
+  util.rs     — the shared receiver step `navigate` and `completion` use: turns a
+                receiver expression before a `.` (`this` or an implicit `this`, a
+                field, a parameter or local — a `var` binding through its
+                initializer's inferred type — `new T()`, or a `Type.staticMember`)
+                into a type over the hub's declared-type reads, and recovers the
+                receiver before an incomplete `.`
   navigate.rs — the navigation hub module (`navigate`): serves the shell's
                 definition, declaration, implementation, and references
                 requests, reading the cursor's file and each candidate source
                 from disk itself and the index only over the hub
+  completion.rs — the completion hub module (`completion`): serves the shell's
+                completion and signature-help requests, reading the requested
+                file (its open buffer, else disk) and the index only over the
+                hub, and offering keywords, in-scope names, workspace symbols
+                (with auto-imports), the receiver's members via `util.rs` after
+                a `.`, and a call's overloads with the cursor's active argument
+  buffers.rs  — the buffers hub module (`buffers`): owns the editor's unsaved
+                text (DocumentStore) — it applies the document lifecycle
+                notifications and answers the text read a consumer makes for a
+                file's current text
+  workspace.rs — the workspace symbol module (`workspace`): serves the shell's
+                `workspace/symbol` — the workspace's declarations whose simple
+                name matches a query — reading the index only over the hub
+  maven/      — the maven module: parses Maven projects, resolves their
+                dependencies, and publishes the source roots to the index.
+                `mod.rs` owns the spawn (reads `ServerStarted`, drives the
+                pass, publishes the two `FoldersDiscoverred` batches with
+                origins); `settings.rs` (user Maven settings and the
+                local-repository / download-base resolution, including new
+                `~/.m2/settings.xml` support), `resolve.rs` (effective poms
+                and the offline dependency closure, reworked from the
+                deprecated `resolve.rs`), `model.rs` (pom discovery, modules,
+                source roots, and the no-pom whole-root fallback — superseding
+                the live `project.rs` walk), and `sources.rs` (sources-jar
+                reuse/download/extract into the home-folder cache, reworked
+                from the deprecated `sources.rs`)
   messages.rs — the hub vocabulary: the Envelope wrapper and Message
                 (Request/Response/Notification), the Request/Response pairs, and
                 the broadcast Notification variants
-  types.rs    — the binding/resolution engine (R7): name resolution, receiver
-                types, overload selection, over the model in `index/types.rs`
+  types.rs    — the deprecated binding/resolution engine (R7): name resolution,
+                receiver types, overload selection, over the shared model
   deprecated/ — engine modules kept out of the build while the rest are
                 reintroduced one at a time; reintroduce one by moving its file
                 back under `src/` and declaring it in `lib.rs`
-    document.rs — the document module: DocumentStore (URI -> { version, bytes },
-                incremental text sync) and its hub client thread
     jars.rs     — the dependency-jar indexer driver: parses resolved jars into
                 the index (the `Jars` stage)
     base_cache.rs — the cross-run cache of the class-file base (jars, JDK): one
                 guarded file per archive, read on demand
-    project.rs  — Maven project model (pom discovery, modules, source roots) and
-                the `walk_project`/`collect_java_files` helpers the startup
-                coordinator drives
-    resolve.rs  — static Maven dependency resolution (effective poms, closure)
-                and the dependency driver
     classfile.rs— minimal jar (ZIP) + class-file reader for dependency indexing
     jdk.rs      — standard-library indexing (JDK discovery, jmods/src.zip/rt.jar)
                 and the JDK indexer driver
-    sources.rs  — dependency sources: fetches -sources.jar, extracts, and
-                publishes them through the hub; the source downloader driver
     startup.rs  — the warm-up coordinator: walks the project model, emits `Ready`,
                 the summary, and progress for the enabled stages, and warns when
                 dependency sources are disabled
@@ -152,6 +194,10 @@ graph TD
     NAV -- "reads .java" --> WS
     NAV -- "locations" --> HUB
 
+    HUB -- "workspace symbol searches" --> SYM{{workspace module}}
+    SYM -- "coarse index reads" --> IDX
+    SYM -- "symbols" --> HUB
+
     HUB -- "every DriverMessage" --> DR{{startup + drivers: startup, dependency, jar, JDK, download}}
     DR -- DriverMessage --> HUB
     DR -- "class files" --> JV[local repo jars]
@@ -165,20 +211,21 @@ graph TD
 
 | Module                                                                                       | Description                                                                                                          | Responsibilities                                                                                                                                                                                                                                                                                                                                                                                                                                   |
 | -------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| **Hub** (`hub.rs`)                                                                           | The engine's central mediator — the hub of the hub-and-spoke.                                                        | Owns the FIFO inbound channel; registers clients and sorts what each receives through a per-client dispatcher; broadcasts notifications to every subscriber; routes each request to the module that owns it (`owner_of`) and the reply back to its one requester; resolves an unowned request to the empty reply; logs every message it forwards. Carries no editor knowledge.                                                                     |
-| **LSP shell** (`server.rs`)                                                                  | The `tower_lsp::LanguageServer` implementation — a hub client like any other, never touching the core directly.      | Serves every editor-facing method; advertises capabilities in `initialize` (incremental text sync, definition, declaration, implementation, references); routes the navigation queries — `textDocument/definition`, `textDocument/declaration`, `textDocument/implementation`, and `textDocument/references` — to the navigate module as `NavigateRequest::FindDeclaration`/`FindReferences`/`FindImplementation` hub requests and renders the reply; notifies input (`DocumentOpened`/`DocumentChanged`/`DocumentClosed`, once the document module returns); renders `Diagnostics`, `Progress` (as `$/progress`), and `Notice` (as `window/showMessage`) on its own drain task. Its hub channel is unbounded, so a slow client never stalls the hub.                                      |
-| **Document module / DocumentStore** (`document.rs`)                                          | The canonical document store — a hub client, not owned by the shell.                                                 | Subscribes to `DocumentOpened`/`DocumentClosed`; applies the editor's incremental changes on a `DocumentChange` request and returns the new text (`None` when not open); answers `DocumentText`; converts LSP positions (line + UTF-16 code units) to byte offsets — the only place position semantics are handled on the way in.                                                                                                                  |
+| **Hub** (`hub.rs`)                                                                           | The engine's central mediator — the hub of the hub-and-spoke.                                                        | Owns the FIFO inbound channel; registers clients and sorts what each receives through a per-client dispatcher; broadcasts notifications to every subscriber; routes each request to the module that owns it (`owner_of`) and the reply back to its one requester; resolves an unowned request to the empty reply; logs a compact summary of every message it forwards. Carries no editor knowledge.                                                                     |
+| **LSP shell** (`server.rs`)                                                                  | The `tower_lsp::LanguageServer` implementation — a hub client like any other, never touching the core directly.      | Serves every editor-facing method; advertises capabilities in `initialize` (incremental text sync, completion, signature help, definition, declaration, implementation, references, workspace symbols); routes the navigation queries — `textDocument/definition`, `textDocument/declaration`, `textDocument/implementation`, and `textDocument/references` — to the navigate module as `NavigateRequest::FindDeclaration`/`FindReferences`/`FindImplementation` hub requests and `textDocument/completion` and `textDocument/signatureHelp` to the completion module as `CompletionRequest`s, rendering each reply; notifies input (`DocumentOpened`/`DocumentChanged`/`DocumentClosed`) for the buffers module; renders `Diagnostics`, `Progress` (as `$/progress`), and `Notice` (as `window/showMessage`) on its own drain task. Its hub channel is unbounded, so a slow client never stalls the hub.                                      |
+| **Buffers module / DocumentStore** (`buffers.rs`)                                            | The editor's unsaved text — the canonical open-buffer store, a hub client, not owned by the shell.                   | Subscribes to `DocumentOpened` (full text), `DocumentChanged` (applies the incremental changes itself), and `DocumentClosed`; answers `BuffersRequest::Text` — a file's current text, or `None` when it is not open — and offers `buffers::current_text` (the open buffer, else the file on disk) as the read a consumer calls; converts LSP positions (line + UTF-16 code units) to byte offsets, the only place position semantics are handled. Its `select!` is biased, so a queued document event is always applied before a read is served. |
 | **Engine wiring** (`engine.rs`, `cli.rs`)                                                    | The single `start_with` path that builds the hub and boots every participant the launch configuration enables.       | Calls each enabled participant's `spawn` — shell first, then modules, then the startup coordinator and drivers — each of which registers under its own name (`Hub::register`), subscribes for the notifications it renders, serves the requests it owns (`serve()`), and starts its own thread or task. `start` runs everything the environment enables. Pure wiring: no channel, name, or receive loop.                                           |
 | **Analysis module / engine core** (`analysis.rs`, `TreeSitterEngine`)                        | Owns the open documents' parse trees and answers the shell's queries.                                                | Parses each open document with `tree-sitter-java`; serves document symbols, folding ranges, semantic tokens, completions, hover, definition/declaration, implementation, references, rename, and inlay hints; applies editor input inline in arrival order and runs each query on the blocking pool, so a slow search never delays typing; notifies `AnalysisUpdated` after each applied document or file event (it does not compute diagnostics). |
-| **Type layer** (`types.rs`, `index/types.rs`)                                                | The declared-type model (`index/types.rs`) and the binding/resolution engine (`types.rs`).                           | Models types, members, hierarchies, generics, records, enums, and syntactically-read Lombok members; infers receiver types; resolves names in Java precedence order; selects overloads by argument types. Backs completion, hover, signature help, inlay hints, and semantic diagnostics through a cached, layered, dirty-overlay view of the base and per-source models.                                                                          |
+| **Type layer** (`model.rs`, `index/types.rs`, deprecated `types.rs`)                                                | Shared Java declarations (`model.rs`), index-owned storage/views (`index/types.rs`), and the deprecated binding/resolution engine (`types.rs`).                           | Models types, members, hierarchies, generics, records, enums, and syntactically-read Lombok members; infers receiver types; resolves names in Java precedence order; selects overloads by argument types. Backs completion, hover, signature help, inlay hints, and semantic diagnostics through a cached, layered, dirty-overlay view of the base and per-source models.                                                                          |
 | **Diagnostics subsystem** (`diagnostics.rs`)                                                 | A self-contained parser and open-document state, separate from the core.                                             | Sweeps on `AnalysisUpdated` (the just-edited file first, then every open document) for syntax errors and unresolved symbols; reads the index and type layer through `IndexHandle` with per-sweep caches; publishes one `Diagnostics` per open document and keeps a queryable cache of each document's latest pass.                                                                                                                                 |
 | **Quick-fix subsystem** (`quickfix.rs`)                                                      | A self-contained parser and open-document text.                                                                      | Turns unresolved-symbol diagnostics into `CodeAction`s — add an import, change to a near member, or create a stub type/member; reads the symbol index (`IndexHandle`) and the diagnostics cache (`DiagnosticsForDocument`); answers the shell's `codeAction` request as an awaited hub request.                                                                                                                                                    |
 | **Index subsystem / WorkspaceIndex** (`index/`)                                            | A workspace-wide in-memory symbol index owned by a dedicated task.                                                   | Stores flat `SymbolEntry`s (name, kind, package, container chain, ranges, `origin`/`synthetic`); owns the workspace source scan — it walks the reported folders on `FoldersDiscoverred`, parses each `.java` file into entries (`extract_entries`) and its declared-type model (`collect_type_infos`); answers a coarse, navigation-shaped read vocabulary over the hub (`IndexRequest`/`IndexBatchRequest` — entries by name, one file's symbols, the workspace files, a type's supertype closure, a type's members, whether a type resolves, and the workspace types reaching a contract); grows the declared-type base append-only, one layer per artifact.          |
-| **Navigate module** (`navigate.rs`) | Cursor navigation — the declaration a symbol names, every reference to it, and its implementations. | Its own hub client, labelled `navigate`; the shell routes `textDocument/definition`, `textDocument/declaration`, `textDocument/implementation`, and `textDocument/references` to it as `NavigateRequest`s. Reads the cursor's file and each candidate source from disk itself (async, `tokio::fs`) and reaches the index only through the hub's coarse reads (`IndexRequest`/`IndexBatchRequest`); resolves the word under the cursor by node kind and, for a member, through the receiver's declared type. |
+| **Navigate module** (`navigate.rs`) | Cursor navigation — the declaration a symbol names, every reference to it, and its implementations. | Its own hub client, labelled `navigate`; the shell routes `textDocument/definition`, `textDocument/declaration`, `textDocument/implementation`, and `textDocument/references` to it as `NavigateRequest`s. Reads the cursor's file and each candidate source through the buffers module (`buffers::current_text` — the open buffer, else disk) and reaches the index only through the hub's coarse reads (`IndexRequest`/`IndexBatchRequest`); resolves the word under the cursor by node kind and, for a member, through the receiver's declared type (the shared receiver step in `util.rs`). |
+| **Completion module** (`completion.rs`) | Autocomplete — the names offerable at a cursor, and a receiver's members after a `.` — plus signature help, a call's overloads and active argument. | Its own hub client, labelled `completion`; the shell routes `textDocument/completion` and `textDocument/signatureHelp` to it as `CompletionRequest`s. Reads the requested file through the buffers module (`buffers::current_text` — the open buffer, else disk) and reaches the index only through the hub's `EntriesByPrefix`, `MembersOf`, and `ConstructorsOf` reads; offers Java keywords, the locals/parameters/fields in scope, and the workspace symbols starting with the typed prefix, each workspace symbol carrying an auto-import edit when the file does not already resolve the name; after a `.` it resolves the receiver's declared type through the shared receiver step (`util.rs`) and offers that type's members — fields first, then one item per method overload with its full signature — inherited members included, statics only for a type qualifier, and nothing for a receiver it cannot type; a call the cursor sits in (or a `new T(…)`) is answered as signature help — the callee's same-named methods (`MembersOf`, statics only for a type qualifier) or the created type's constructors (`ConstructorsOf`) rendered with each overload's signature and the active parameter counted from the cursor's argument, and nothing when the callee or its receiver cannot be resolved. |
+| **Workspace module** (`workspace.rs`) | Workspace symbol search — the workspace's declarations whose simple name matches a query. | Its own hub client, labelled `workspace`; the shell advertises `workspaceSymbolProvider` and routes `workspace/symbol` to it as a `SymbolRequest::Search`. Reads the index only through the hub's `EntriesByPrefix` read (an empty query matches every symbol) and shapes each entry as a `SymbolInformation` — the entry's `selection_range` as the location, its innermost enclosing type as `container_name`, its kind mapped to the LSP kind — dropping imports, constructors, Lombok-synthetic members, and `Dependency` class-file entries. |
 | **Warm-up coordinator** (`startup.rs`)                                                       | Drives the warm-up sequence and shapes its events to the launch configuration.                                       | On `FolderAdded` it walks the project model and drives the warm-up stages — the index's own source scan included; tracks `StageDone` for the enabled stages only; emits `Ready`, the summary, and the progress end; and warns when dependency sources are disabled. The warm-up drivers stay configuration-free.                                                                                                                                   |
-| **Maven project model & dependency resolution** (`project.rs`, `resolve.rs`, `classfile.rs`) | The workspace model and its strictly offline dependency resolver.                                                    | The coordinator walks the root and discovers `pom.xml` modules and source roots (falling back to scanning the whole root); resolves the jar closure from the local repository with Maven mediation, never invoking `mvn` or the network; parses jars and class files into `dependency` index entries.                                                                                                                                              |
+| **Maven module** (`maven/`) | Parses Maven projects and publishes their source roots — the workspace's own and the extracted dependency sources — to the index. | Its own hub client, labelled `maven`; on `ServerStarted` it builds the project model (`model.rs`: every `pom.xml` becomes a module with its effective pom and declared source roots, whole-root fallback when none exist), resolves each module's dependency closure strictly offline from the local repository (`resolve.rs`), fetches each resolved artifact's `-sources.jar` into the local repository and extracts it under the sources cache (`sources.rs`), honoring `~/.m2/settings.xml` (`settings.rs`: `localRepository`, mirrors, `offline`; `$MAVEN_REPO` overrides the local repository), then publishes two `FoldersDiscoverred` batches — the workspace source roots with `origin: Workspace` and the extracted dependency roots with `origin: LibrarySources` — which the index scans and tags `FileOrigin::Workspace` / `FileOrigin::LibrarySource` (the latter completable and openable, never a references/rename candidate). Never invokes `mvn`. `--no-dependencies`/`--no-downloads`/`$JAVA_LSP_OFFLINE` gate the resolution and sourcing. |
 | **JDK indexer** (`jdk.rs`)                                                                   | Indexes the installed JDK's standard library.                                                                        | Discovers the JDK (`$JAVA_LSP_JDK`, `$JAVA_HOME`, common locations incl. SDKMAN) and indexes `jmods/*.jmod`, `lib/src.zip`, or `rt.jar` with streaming per-entry reads; keeps only `java.*`/`javax.*`; a missing JDK is a graceful no-op.                                                                                                                                                                                                          |
-| **Dependency sources** (`sources.rs`)                                                        | Fetches and indexes `-sources.jar` for resolved artifacts.                                                           | Reuses local sources or downloads from Maven Central with bounded concurrency and `.sha1` verification; extracts under the sources cache; republishes source-backed dependency entries (real signatures and ranges), dropping the class-derived ones; disabled by `$JAVA_LSP_OFFLINE`.                                                                                                                                                             |
 | **Jar indexer** (`jars.rs`)                                                                  | Warm-up driver that fills the index. The source scan that used to sit beside it is now the index's own (`index/`). | Parses resolved jars into the index (the `Jars` stage); speaks only `DriverMessage`s.                                                                                                                                                                                                                                                                                                                                                              |
 
 ## Implementation notes
@@ -186,8 +233,8 @@ graph TD
 Detailed behaviour, edge cases, and the documented v1 limitations behind each module in the table above.
 
 Every arrow into or out of the hub is a hub message: the analysis, diagnostics,
-and quick-fix modules also read the index (and the quick-fix module the
-diagnostics cache) through hub-routed requests.
+quick-fix, navigate, completion, and workspace modules also read the index (and
+the quick-fix module the diagnostics cache) through hub-routed requests.
 
 - **LSP shell** (`server.rs`): implements `tower_lsp::LanguageServer`.
   `initialize` advertises incremental text sync, hover, definition,
@@ -339,13 +386,6 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   line reads `gson.var` as a scoped type identifier) — so it is recovered from
   the source as the expression ending at the last non-whitespace byte before that
   dot, and the same members are offered whether or not the name is already typed.
-  **Signature help** serves `textDocument/signatureHelp` from the same type
-  layer: for the call the cursor sits in it offers the callee's overloads,
-  rendered with their declared parameters, and marks the argument the cursor is
-  in as `activeParameter`, returning nothing when the callee or the receiver's
-  type cannot be resolved. A `new T(...)` is answered from the created type's
-  constructors, its overloads listed and the active argument marked the same
-  way.
   Auto-import: every index-sourced item whose symbol lives outside the open
   file's package carries an `additionalTextEdits` inserting
   `import <fqcn>;` (after the last import, else after the `package`
@@ -381,16 +421,19 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   not, since its location is not openable. A single candidate — or several sharing one file (method overloads,
   same-file repeats), resolved to the first by position — is an answer;
   anything spread across multiple files returns no location rather than a
-  wrong one (no result beats a wrong result) — the exception is a cursor on a
-  declaration's own name, which resolves to that declaration, or, when the
-  declaration overrides a supertype member, to the nearest declaration it
-  overrides in the type's supertype closure; only a use keeps the cross-file
-  ambiguity policy. `workspace_symbols` maps
-  `query_prefix` matches to `SymbolInformation` — import entries excluded,
-  the innermost container as `container_name`, the selection range as the
-  location — with an empty query returning everything indexed for the client
-  to filter. Like completions, both serve partial results during warm-up and
-  never block (R6). **Go to implementation** — the `navigate` module's
+  wrong one (no result beats a wrong result). A type name is first narrowed to
+  the types the cursor's file can see — its own, its package's, or an import —
+  so a same-named type elsewhere is never mistaken for ambiguity. The exception
+  is a cursor on a declaration's own name, which resolves to that declaration,
+  or, when the declaration overrides a supertype member, to the nearest
+  declaration it overrides in the type's supertype closure; only a use keeps the
+  cross-file ambiguity policy. **Workspace symbol search** — the `workspace`
+  module's `Search` — maps the index's `EntriesByPrefix` matches to
+  `SymbolInformation`: import entries, constructors, Lombok-synthetic members,
+  and `Dependency` class-file entries are dropped, the innermost container is the
+  `container_name`, and the selection range is the location, with an empty query
+  returning everything indexed for the client to filter. Like completions, both
+  serve partial results during warm-up and never block (R6). **Go to implementation** — the `navigate` module's
   `ImplementationsOf` read — answers `textDocument/implementation` from the same
   binding and the declared-type
   hierarchy: a cursor on a type lists every workspace source type whose
@@ -420,7 +463,7 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   private parser taken from a small pool rather than the shared parse mutex, so
   a search never blocks typing or another search) for
   occurrences that can be attributed with confidence: a type only in files that
-  can see it (its own file, its package, an import, or a fully-qualified use), a
+  can see it (its own file, its package, or an import), a
   member access only where the receiver's declared type — or a supertype of it —
   resolves the name back to the same declaring type, an unqualified member name
   only inside the declaring
@@ -440,9 +483,10 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   Trees are rebuilt from the full text per edit — one file per change, never
   the workspace; `InputEdit`-based incremental reparsing (needs edit ranges
   forwarded from the shell) is a later optimization.
-- **Type layer** (`types.rs`, `index/types.rs`): the declared-type model
-  (`index/types.rs`) and the binding/resolution engine (`types.rs`), chosen for
-  R7. It models
+- **Type layer** (`model.rs`, `index/types.rs`, deprecated `types.rs`): the
+  shared declared-type vocabulary (`model.rs`), the index's storage and layered
+  views (`index/types.rs`), and the deprecated binding/resolution engine
+  (`types.rs`), chosen for R7. It models
   declared types — primitives, `void`, `null`, arrays, named references with
   their generic arguments kept as written, and type variables — and keeps each
   type's package, kind, supertypes (`extends`/`implements`), fields, and
@@ -682,8 +726,9 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   module as `NavigateRequest::FindDeclaration`/`FindReferences`/
   `FindImplementation` hub requests (declaration reuses the definition request —
   Java has no declaration/definition split).
-  Navigation reads the cursor's file and each candidate source from disk itself
-  (async, with `tokio::fs`) and reaches the index only through the hub, over a
+  Navigation reads the cursor's file and each candidate source through the
+  buffers module (`buffers::current_text` — the open buffer, else disk) and
+  reaches the index only through the hub, over a
   coarse read vocabulary (`IndexRequest`/`IndexBatchRequest` — entries by name,
   one file's symbols, the workspace files, a type's supertype closure, a type's
   members, whether a type resolves, and the workspace types reaching a contract).
@@ -697,51 +742,115 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   references are found soundly — every `Type` occurrence of a type the file can
   see (its own file, its package, or an import). Member references are found where
   the receiver's declared type (or a supertype) resolves the name to the same
-  declaring type — `this.member`, a field, a parameter or local, `new T(…)`, or a
+  declaring type — `this.member`, a field, a parameter or local (a `var` binding
+  through its initializer's inferred type), `new T(…)`, or a
   `Type.staticMember` qualifier — or, for a bare name, inside the declaring type's
-  own span. **Documented v1 limitation:** a receiver that cannot be typed from its
-  file — a chained call (`a.b().c()`), a generic type argument, a lambda or
-  anonymous-class scope, `super` — is not resolved through, and receiver-typed
-  overload selection in definition still awaits the full type layer.
-- **Maven project model** (`project.rs` + `resolve.rs` + `classfile.rs`):
-  the project driver builds a model of the workspace — it reacts to the added
-  folder, walks the root (hidden dirs, `target/`, `build/` skipped), and every
-  `pom.xml` becomes a module whose source roots are the standard
-  `src/main/java`/`src/test/java` unless `<build>` overrides them; roots that
-  don't exist are dropped, and a workspace with no poms falls back to
-  scanning the whole root (non-Maven projects keep working). The model rides the
-  hub; the dependency driver resolves the jar list.
+  own span. A member receiver may itself be a call or a field access,
+  resolved recursively through the shared receiver step, so a chain through calls
+  or fields (`a.b().c.member`, `a.field.member`) resolves left to right while every
+  link's receiver can be typed. **Documented v1 limitation:** a receiver that
+  cannot be typed from its file — a generic type argument, a lambda or
+  anonymous-class scope, `super` — is not resolved through, so a chain breaks at
+  such a link; and receiver-typed overload selection in definition still awaits the
+  full type layer.
+- **Completion is its own hub module** (`completion.rs`) — the shell routes
+  `textDocument/completion` and `textDocument/signatureHelp` to the `completion`
+  module as `CompletionRequest`s (`Complete`, `SignatureHelp`). Completion reads
+  the requested file through the buffers module (`buffers::current_text` — the
+  open buffer, else disk) and reaches the index only through the hub's
+  `EntriesByPrefix` read (the name-ordered symbol table range-scanned for the
+  typed prefix). It merges three ranked sources as `sort_text` prefixes
+  `0`/`1`/`2` (clients re-sort alphabetically): Java keywords; the locals,
+  parameters, and fields nameable unqualified at the cursor (read from the parsed
+  tree); and the workspace symbols whose simple name starts with the prefix — a
+  method among them listing each overload of its declaring type (resolved from the
+  entry's innermost container), over the hub's `MembersOf` read, labelled with its
+  full signature and inserting `name(`, so a bare call site offers the same shape
+  the member path does, falling back to a single name-only item when the declaring
+  type does not resolve rather than dropping the symbol. A
+  workspace symbol declared outside the file carries an auto-import edit when the
+  file does not already resolve the name (never-worsen: the same file, the same
+  package, `java.lang`, an equal or `.*` import, or a conflicting same-package
+  simple name all suppress it); each overload item carries the entry's edit. A
+  member access after a `.` resolves the
+  receiver's declared type through the shared receiver step (`util.rs`) — a
+  parameter or local resolving to its declared type (a local written `var` to
+  its initializer's inferred type, through the same receiver machinery), a
+  `method_invocation` receiver resolving recursively to the callee's declared
+  return type and a `field_access` receiver to the accessed field's declared type,
+  so a chain through calls or fields (`a.b().c().`, `a.field.c().`) resolves left
+  to right while every link's receiver can be typed — and offers that
+  type's members over the hub's `MembersOf` read (now overload-preserving) —
+  inherited members included, fields and enum constants first, then one item per
+  method overload (`label` the full signature, `insert_text` `name(`), a type
+  qualifier offering only its statics, and a receiver it cannot type — a nested-type
+  or package qualifier, `super`, a generic type argument, a lambda or
+  anonymous-class scope, or a `var` initializer that resolves nothing — yielding
+  nothing rather than a guess. Both completion
+  paths therefore list a method as one item per overload.
+  **Signature help** serves `textDocument/signatureHelp` from the same receiver
+  step: for the call the cursor sits in it resolves the callee's receiver through
+  `util.rs` and reads the receiver type's same-named methods over the hub's
+  `MembersOf` (statics only for a type qualifier), rendering each overload's
+  `signature()` and marking the argument the cursor is in as `activeParameter`,
+  returning nothing when the callee or its receiver cannot be resolved. A
+  `new T(...)` is answered from the created type's constructors over
+  `ConstructorsOf`, its overloads listed with `constructor_signature()` and the
+  active argument marked the same way. The shell advertises
+  `signatureHelpProvider` with `(` and `,` as the retrigger characters.
+- **Workspace symbol search is its own hub module** (`workspace.rs`) — the shell
+  advertises `workspaceSymbolProvider` and routes `workspace/symbol` to it as a
+  `SymbolRequest::Search`. It reads the index only through the hub's
+  `EntriesByPrefix` read (an empty query matches every symbol) and shapes each
+  entry as a `SymbolInformation` — the entry's `selection_range` as the location,
+  its innermost enclosing type as `container_name`, its kind mapped to the LSP
+  kind. A `Dependency` class-file entry (nothing openable), an import (a path,
+  not a declaration), a constructor, and a Lombok-synthetic member (no declaration
+  of its own) are dropped.
+- **Buffers is its own hub module** (`buffers.rs`) — the editor's unsaved text is
+  the one source of truth, so a consumer that needs a file's current text reads it
+  here rather than from disk. The shell notifies `DocumentOpened` (full text),
+  `DocumentChanged` (the incremental changes), and `DocumentClosed`; the module's
+  `DocumentStore` applies them and answers `BuffersRequest::Text` (`None` when the
+  document is not open). `buffers::current_text` is the read a consumer calls —
+  the open buffer's text when the editor has it open, otherwise the file on disk —
+  so completion and navigation see unsaved edits and untitled buffers. The
+  module's `select!` is biased, so a queued document event is always applied
+  before a read is served; the two arrive on separate channels, and random
+  polling could otherwise serve a read against pre-edit text.
+- **Maven module** (`maven/`): on the shell's `ServerStarted` the module
+  builds the project model — it walks the root (hidden dirs, `target/`, `build/`
+  skipped), and every `pom.xml` becomes a module whose source roots are the
+  standard `src/main/java`/`src/test/java` unless `<build>` overrides them;
+  roots that don't exist are dropped, and a workspace with no poms falls back to
+  scanning the whole root (non-Maven projects keep working) — and publishes
+  those roots as a `FoldersDiscoverred` batch with the `Workspace` origin, which
+  the index scans as `FileOrigin::Workspace` sources. It then resolves each
+  module's dependency closure and, unless disabled, fetches and extracts the
+  dependency sources, publishing the extracted roots as a second batch with the
+  `LibrarySources` origin, which the index scans as `FileOrigin::LibrarySource`
+  — completable and openable (`definition` reaches a library declaration) but
+  never a references/rename candidate (`source_files()` omits them; rename
+  refuses).
   **Dependency resolution** (`resolve.rs`) is static and strictly offline —
-  it reads the local repository (`$MAVEN_REPO` if set, else
-  `~/.m2/repository`) and never invokes `mvn` or the network. Each pom is
-  assembled into an effective model (parent chain via `relativePath` or the
-  repository, `${...}` interpolation with the `project.*` built-ins,
-  parent-first merge; unknown properties interpolate to nothing and the
-  artifact is pruned with a warning). `dependencyManagement` merges down the
-  parent chain (child wins) and expands `import`-scoped BOMs from the
-  repository (direct management beats imported, first imported wins among
-  BOMs). The dependency closure is a breadth-first walk over each artifact's
-  effective pom with Maven's mediation — nearest depth wins, first
+  it reads the local repository (`$MAVEN_REPO` if set, else the settings
+  `localRepository`, else `~/.m2/repository`) and never invokes `mvn` or the
+  network. Each pom is assembled into an effective model (parent chain via
+  `relativePath` or the repository, `${...}` interpolation with the
+  `project.*` built-ins, parent-first merge; unknown properties interpolate to
+  nothing and the artifact is pruned with a warning). `dependencyManagement`
+  merges down the parent chain (child wins) and expands `import`-scoped BOMs
+  from the repository (direct management beats imported, first imported wins
+  among BOMs). The dependency closure is a breadth-first walk over each
+  artifact's effective pom with Maven's mediation — nearest depth wins, first
   declaration wins at equal depth (implemented as first-encountered-in-BFS) —
-  path-scoped exclusions, and optional/test transitive pruning; a missing
-  pom prunes its branch with a warning while the rest of the closure
-  continues. Resolved jars are parsed by a minimal ZIP reader (central
-  directory, STORED/DEFLATE via `flate2`) and class-file parser (constant
-  pool, access flags, member tables with each member's descriptor type, a
-  public `<init>` as a constructor named after its type — `<clinit>`, private,
-  and synthetic members are skipped — plus
-  the superclass and interfaces), producing
-  index entries flagged `dependency: true`: offered in completions with the
-  usual `Container.name` labels, but excluded from definition and
-  `workspace/symbol`, since a class-file jar location cannot be opened by an
-  editor (no result beats a wrong result); a dependency whose sources were
-  indexed instead carries source-backed entries that definition _does_ admit
-  (see the dependency-sources bullet). Known v1 limitations: no profile activation,
-  no plugin-contributed roots or dependencies, no transitive version-range
-  handling, `-SNAPSHOT` metadata is ignored (the local file is used as-is),
-  and dependency scopes are ignored at indexing time (test-scope types may
-  be offered in main sources). The bench's `--maven` mode measures open-to-
-  responsive on a Maven-layout fixture.
+  path-scoped exclusions, and optional/test transitive pruning; a missing pom
+  prunes its branch with a warning while the rest of the closure continues.
+  Known v1 limitations: no profile activation, no plugin-contributed roots or
+  dependencies, no transitive version-range handling, `-SNAPSHOT` metadata is
+  ignored (the local file is used as-is), and dependency scopes are ignored at
+  indexing time (test-scope types may be offered in main sources). The bench's
+  `--maven` mode measures open-to-responsive on a Maven-layout fixture.
 - **Standard library** (`jdk.rs`): the installed JDK's `java.*`/`javax.*`
   declarations are indexed at start by the JDK driver — concurrently with the
   rest, through the same dependency path — offered in
@@ -763,33 +872,29 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   warm-up ≈ 5.5 s and peak RSS ≈ 165 MB in release — both on the background
   task; hover RTT during warm-up stayed ≤ 1.6 ms (R6 holds; see the bench
   baseline in the changelog).
-- **Dependency sources** (`sources.rs`): the download driver starts on the
-  artifact list, alongside the workspace source scan — not after `ready` — and
-  fetches each resolved artifact's
-  sources, reusing an existing `<a>-<v>-sources.jar` in the local repository and
-  otherwise downloading it from `$JAVA_LSP_MAVEN_CENTRAL_URL`
-  (default `https://repo1.maven.org/maven2`) into the repository at Maven's
-  standard path, with the published `.sha1` verified when present. Downloads run
-  on the runtime with bounded concurrency (a semaphore caps at 8); extraction
-  and parsing run on the blocking pool, so the request path is never involved
-  (R6). Each sources jar is unpacked under `$JAVA_LSP_SOURCES_CACHE` (default
-  `$XDG_CACHE_HOME/java-lsp/sources`, else `~/.cache/java-lsp/sources`), its
-  `.java` entries parsed by the same tree-sitter extractor the JDK's `src.zip`
-  uses, and published as source-backed dependency entries (real ranges) while the
-  artifact's class-file entries and layer are dropped first, so two declarations
-  of one type never coexist and make `definition` ambiguous. Their source-derived
-  types are added as later base layers, so they win over the class-derived ones
-  by (name, package, kind, enclosing chain), and hover, `.`-completion, and inlay hints
-  gain real signatures and parameter names, and `definition` resolves a library
+- **Dependency sources** (`maven/sources.rs`): for each resolved artifact a
+  `-sources.jar` already in the local repository is reused; otherwise it is
+  downloaded into the repository at Maven's standard path, with the published
+  `.sha1` verified when present. The base URL is `$JAVA_LSP_MAVEN_CENTRAL_URL`
+  (default `https://repo1.maven.org/maven2`) unless a `~/.m2/settings.xml`
+  mirror matches (`central`/`*`/`external:*`), which replaces it; the env var
+  overrides the mirror. Downloads run on the runtime with bounded concurrency
+  (a semaphore caps at 8); extraction runs on the blocking pool, so the
+  request path is never involved (R6). Each sources jar is unpacked under
+  `$JAVA_LSP_SOURCES_CACHE` (default `$XDG_CACHE_HOME/java-lsp/sources`, else
+  `~/.cache/java-lsp/sources`), one directory per artifact
+  (`<cache>/<group>/<artifact>/<version>`), and the module publishes those
+  directories as the `LibrarySources` `FoldersDiscoverred` batch — the index
+  parses the `.java` files itself through the same tree-sitter path as the
+  workspace sources, so hover, `.`-completion, and inlay hints gain real
+  signatures and parameter names, and `definition` resolves a library
   declaration to its extracted source — an ordinary openable `file://` URI.
   `references` and `rename` are unchanged for libraries: `source_files()` omits
-  the cache, so neither reads nor edits it. A second log line
-  (`library sources indexed`) reports the pass. On by default;
-  `$JAVA_LSP_OFFLINE` (any non-empty value) disables all network work. An
-  unreachable repository, an artifact with no published sources, or a checksum
-  mismatch each degrades to the class-file entries with a warning; artifacts not
-  on the configured repository are skipped, with no credential or
-  `settings.xml` mirror handling in v1.
+  the cache, so neither reads nor edits it. On by default; `--no-downloads` or
+  `$JAVA_LSP_OFFLINE` (any non-empty value) disables the network work, and
+  `--no-dependencies` skips resolution and sourcing entirely. An unreachable
+  repository, an artifact with no published sources, or a checksum mismatch
+  each degrades to nothing for that artifact with a warning.
 
 ## Decisions and constraints
 
@@ -815,7 +920,7 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   configuration (`cli.rs`) decides which participants to build and which stages
   the startup coordinator waits on, so the drivers themselves take no
   configuration. The warm-up drivers live with the work they drive
-  (`resolve.rs`, `jars.rs`, `jdk.rs`, `sources.rs`), and each reacts
+  (`maven/`, `jars.rs`, `jdk.rs`, `sources.rs`), and each reacts
   to the messages it cares about: the startup coordinator (`startup.rs`) walks
   for the model on `FolderAdded` and owns `ready` and the summary;
   the dependency driver resolves the jars; the jar indexer, JDK
@@ -828,9 +933,9 @@ SumType.T…`) would otherwise hide its qualifier, and an incomplete `receiver.`
   notification and routes every request to its owner (the navigate, index,
   analysis, diagnostics, or quick-fix module), carrying no editor knowledge; the
   shell renders the editor-facing notifications. A request with no registered
-  owner resolves to the empty reply rather than waiting. The hub logs every
-  message it forwards (`RUST_LOG=java_lsp::hub=info`), so the whole flow is
-  attributable from one place.
+  owner resolves to the empty reply rather than waiting. The hub logs a compact
+  summary of every message it forwards (`RUST_LOG=java_lsp::hub=info`), so the
+  whole flow is attributable from one place.
   This supersedes the earlier "one driver that discovers, then spawns producers"
   shape and the `Reporter` indirection it threaded through the producers
   (`incremental-indexing-pipeline`).

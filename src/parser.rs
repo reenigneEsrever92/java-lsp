@@ -1,16 +1,16 @@
 //! Shared, stateless Java reading that any module can do without the index.
 //!
-//! The tree-sitter parser, a file's line-start byte offsets and the
-//! byte-offset-to-position conversion they back, and the small reads over a
-//! parsed tree — a type node as a [`Ty`], and the file's package. None of this
-//! touches the index's data, so a module may read Java without depending on the
-//! index's parsing.
+//! The tree-sitter parser, a file's line-start byte offsets, the position
+//! conversions they back (both ways), the identifier run at a byte offset, and
+//! the small reads over a parsed tree — a type node as a [`Ty`], and the file's
+//! package. None of this touches the index's data, so a module may read Java
+//! without depending on the index's parsing.
 
 use tree_sitter::{Node, Parser, Tree};
 
 use tower_lsp::lsp_types::{Position, Range};
 
-use crate::index::types::{Prim, Ty};
+use crate::model::{Prim, Ty};
 
 /// A tree-sitter parser for the Java grammar.
 pub(crate) fn java_parser() -> Parser {
@@ -66,6 +66,66 @@ impl LineIndex {
             end: self.position(text, node.end_byte()),
         }
     }
+}
+
+/// Converts an LSP position (line + UTF-16 code units) to a byte offset — the
+/// inverse of [`LineIndex::position`]. Out-of-range lines and columns clamp to
+/// the nearest valid offset; a column inside a surrogate pair clamps to the
+/// character containing it.
+pub(crate) fn byte_offset(text: &str, position: Position) -> usize {
+    let mut offset = 0usize;
+    for _ in 0..position.line {
+        match text[offset..].find('\n') {
+            Some(nl) => offset += nl + 1,
+            None => return text.len(),
+        }
+    }
+    let line_end = text[offset..]
+        .find('\n')
+        .map_or(text.len(), |nl| offset + nl);
+    let mut units = 0u32;
+    for (i, ch) in text[offset..line_end].char_indices() {
+        if units + ch.len_utf16() as u32 > position.character {
+            return offset + i;
+        }
+        units += ch.len_utf16() as u32;
+    }
+    line_end
+}
+
+/// The run of identifier characters `[A-Za-z0-9_$]` ending at `offset`.
+pub(crate) fn word_prefix(text: &str, offset: usize) -> &str {
+    let offset = offset.min(text.len());
+    let mut start = offset;
+    for (i, ch) in text[..offset].char_indices().rev() {
+        if !is_ident_char(ch) {
+            break;
+        }
+        start = i;
+    }
+    &text[start..offset]
+}
+
+/// The full run of identifier characters `[A-Za-z0-9_$]` containing `offset` —
+/// the whole word under the cursor, complementing the backward-only
+/// [`word_prefix`].
+pub(crate) fn word_at(text: &str, offset: usize) -> &str {
+    let offset = offset.min(text.len());
+    let start = offset - word_prefix(text, offset).len();
+    let mut end = offset;
+    for (i, ch) in text[offset..].char_indices() {
+        if !is_ident_char(ch) {
+            break;
+        }
+        end = offset + i + ch.len_utf8();
+    }
+    &text[start..end]
+}
+
+/// Whether `ch` is a Java identifier character: an ASCII letter, digit, `_`, or
+/// `$`.
+fn is_ident_char(ch: char) -> bool {
+    ch.is_ascii_alphanumeric() || ch == '_' || ch == '$'
 }
 
 /// Converts a type node into a [`Ty`]. Unknown shapes degrade to

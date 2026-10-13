@@ -1,9 +1,9 @@
 //! The launch configuration: the command line.
 //!
 //! [`Cli`] is parsed from `argv` with `clap`. The per-module toggles
-//! (`--no-workspace-index`, `--no-jars`, …) and the resolved `Modules` they fed
-//! are removed while the engine modules are reintroduced one by one; they return
-//! together with the modules they switch off.
+//! (`--no-dependencies`, `--no-downloads`) gate the maven module; the rest
+//! (`--no-workspace-index`, `--no-jars`, …) return together with the modules
+//! they switch off.
 
 use clap::Parser;
 
@@ -16,4 +16,10 @@ pub struct Cli {
     /// stdio).
     #[arg(long)]
     pub stdio: bool,
+    /// Do not resolve or index Maven dependencies (implies `--no-downloads`).
+    #[arg(long)]
+    pub no_dependencies: bool,
+    /// Do not fetch or index dependency sources; resolution stays enabled.
+    #[arg(long)]
+    pub no_downloads: bool,
 }

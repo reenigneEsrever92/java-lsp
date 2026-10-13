@@ -10,6 +10,141 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-10-13
+
+- **Workspace symbol search is served again** — the shell advertises
+  `workspaceSymbolProvider` and answers `workspace/symbol` through a new
+  `workspace` hub module (`src/workspace.rs`), which maps the index's existing
+  `EntriesByPrefix` read to `SymbolInformation` — the entry's `selection_range`
+  as the location and its innermost enclosing type as `container_name` — dropping
+  imports, constructors, Lombok-synthetic members, and `Dependency` class-file
+  entries. Verified by 147 library tests and 7 bench tests (the 8 remaining
+  library tests are Maven source-download tests that need a loopback socket the
+  sandbox blocks). See
+  [Reintroduce workspace symbol search as a workspace hub module](backlog/workspace-symbols.md).
+
+- **The hub logs a compact summary of each message instead of the full payload**
+  — the per-message `Hub message` line now renders a `summary()` of the
+  `Envelope` (kind, sender, uri, counts, and text payloads as byte lengths)
+  rather than the full `Debug`, so a buffer-text response, a `DocumentOpened`,
+  or a full-text `DocumentChanged` no longer dumps the whole file body into the
+  log. Verified by 110 library tests and 7 bench tests. See
+  [Log a compact summary of each hub message](backlog/hub-message-log-summaries.md).
+
+- **Var-declared locals complete from their inferred type** — the shared receiver
+  step in `src/util.rs` no longer reads the written `type` node of a
+  `local_variable_declaration` as-is: a `var` binding resolves through its
+  initializer's inferred type via the same receiver machinery as `new T()`, a
+  method call, or a field access, so `var data = new Data(5); data.` offers
+  `Data`'s members (and a call through a `var` receiver gets signature help)
+  exactly like the explicitly typed form; an initializer that resolves nothing
+  still yields nothing. Verified by 108 library tests and 7 bench tests. See
+  [Complete a var-declared local's members from its inferred type](backlog/var-local-receiver-inference.md).
+
+- **The workspace-index completion path batches its overload reads** — resolving a
+  bare method name's overloads no longer fires one `MembersOf` index request per
+  matching entry: the workspace-index loop now collects the distinct declaring
+  types of the prefix-matching method entries and reads them in a single
+  `IndexBatchRequest`, one `MembersOf` per type. Behaviour is unchanged — the
+  overload item shape and the single name-only fallback are the same — but a short
+  prefix now costs one index round-trip instead of one per entry on every
+  keystroke. Verified by 104 library tests and 7 bench tests. See
+  [Batch the workspace-index overload reads](backlog/batch-overload-completion-reads.md).
+
+- **Field-access receivers resolve** — a receiver that is a field access
+  (`a.field.`, `this.field.`) is now typed through the shared receiver step in
+  `src/util.rs`: it resolves the accessed object's declared type and returns the
+  named field's declared type (an enum constant's type is its enum), behind the
+  same depth guard and fail-safe the call arm uses. Completion after the field
+  completes on that type, navigation of a member reached through a field access
+  resolves for declaration and references, and a chain through a field
+  (`a.field.c()`) resolves left to right; an unresolvable link yields nothing.
+  Verified by 103 library tests and 7 bench tests. See
+  [Resolve a member through a field-access receiver](backlog/field-access-receiver-resolution.md).
+
+- **Signature help serves a call's overloads** — `textDocument/signatureHelp` is
+  advertised (with `(` and `,` retrigger characters) and answered by the
+  `completion` module: for the call the cursor sits in it resolves the callee's
+  receiver through the shared step and reads the receiver type's same-named
+  methods over the hub's overload-preserving `MembersOf` (statics only for a
+  `Type.` qualifier), rendering each overload's signature and the cursor's active
+  argument; a `new T(…)` answers the created type's constructor overloads —
+  including a class's implicit no-arg one — over a new `ConstructorsOf` index
+  read. An unresolvable callee or receiver yields no help. Verified by 98 library
+  tests and 7 bench tests. See
+  [Serve parameter completion inside a call](backlog/signature-help.md).
+
+- **Call-site method completion lists overloads** — a bare method name now
+  offers each overload of its declaring type with its full signature and inserts
+  `name(`, matching the member path; the overload items carry the symbol's
+  auto-import edit, and a method whose declaring type does not resolve keeps the
+  single name-only item rather than disappearing. Keywords, fields, and types are
+  unchanged. Verified by 94 library tests and 7 bench tests. See
+  [Offer each overload with its signature at a call site](backlog/call-site-overload-completion.md).
+
+- **Chained-call receivers resolve** — a receiver that is itself a call
+  (`a.foo().`, `Foo.bar().`) is now typed through the shared receiver step in
+  `src/util.rs`: it resolves the callee's own receiver to its declared type and
+  returns the named method's declared return type, recursing into the receiver
+  before the callee so a longer chain (`a.b().c().`) resolves left to right, behind
+  a depth guard. Completion after the call completes on the returned type, and
+  navigation of a member reached through a chain resolves for declaration and
+  references. Verified by 89 library tests and 7 bench tests. See
+  [Complete members on a call's result](backlog/chained-call-completion.md).
+
+- **Type-aware member completion returns** — `textDocument/completion` on a
+  receiver (`recv.`) now resolves the receiver's declared type and offers its
+  members: fields and enum constants first, then one item per method overload
+  labelled with its full signature and inserting `name(`, inherited members
+  included, statics only for a `Type.` qualifier, and nothing for a receiver it
+  cannot type. The receiver step is shared with `navigate` through a new
+  `util.rs`, and the index's `MembersOf` read now keeps same-named overloads
+  apart. Verified by 84 library tests and 7 bench tests. See
+  [Complete a receiver's members after a dot](backlog/member-completion.md).
+
+- **The editor's unsaved text is its own `buffers` module** — the shell forwards
+  `textDocument/didOpen`/`didChange`/`didClose` onto the hub as
+  `DocumentOpened`/`DocumentChanged`/`DocumentClosed`, and a new `buffers` module
+  owns that text (`DocumentStore`) and applies the incremental changes. Completion
+  and navigation read a file's current text through `buffers::current_text` — the
+  open buffer when the editor has it open, otherwise the file on disk — so they
+  now see unsaved edits and untitled buffers instead of stale disk content. The
+  module's `select!` is biased, so a queued edit is always applied before a read
+  is served. Verified by 72 library tests and 7 bench tests. See
+  [Own the editor's unsaved text in a buffers module](backlog/buffers-module.md).
+
+- **A declaration's own name resolves by what it declares** — `name_constraint`
+  (`src/navigate.rs`) now classifies a declaration's own name by the kind it
+  declares — a type name as a type, a member name as a member — so a class that
+  shares its simple name with its constructor no longer leaves find-references
+  returning nothing when the cursor sits on the class declaration's name.
+  Verified by 60 library tests and 7 bench tests. See
+  [A declaration's own name is constrained by what it declares](backlog/declaration-name-constraint.md).
+
+- **Completion is its own hub module** — the shell advertises
+  `completionProvider` and answers `textDocument/completion` through a new
+  `completion` module over a new coarse `EntriesByPrefix` index read: it offers
+  Java keywords, the locals, parameters, and fields nameable unqualified at the
+  cursor, and the workspace symbols whose simple name starts with the typed
+  prefix, each workspace symbol carrying an auto-import edit when the file does
+  not already resolve the name. The first slice resolves names without types
+  (R4), so a member access after a `.` yields nothing until the type layer
+  returns. The `byte_offset`/`word_prefix`/`word_at` identifier helpers moved out
+  of `navigate.rs` into the shared `parser.rs`, so both modules read Java through
+  one set of helpers. Verified by 59 library tests and 7 bench tests. See
+  [Reintroduce completion as its own module](backlog/completion-module.md).
+
+- **A type name resolves against what the cursor's file can see** —
+  `declaration_candidates` (`src/navigate.rs`) now narrows a type name to what
+  the cursor's file can see — the file's own type, its package's, or an imported
+  one — before the cross-file ambiguity policy runs, so a class/interface/enum/
+  record whose simple name is also declared in another package (`a.Widget` beside
+  `b.Widget`) no longer makes find-references — and go-to-definition from a use —
+  return nothing. A name the predicate does not recognise leaves the candidate set
+  whole, so a nested or qualified reference is never dropped. Verified by 53
+  library tests and 7 bench tests. See
+  [A type name resolves against what the cursor's file can see](backlog/type-name-visibility.md).
+
 ## 2026-10-12
 
 - **Go-to-implementation is restored** — the shell advertises

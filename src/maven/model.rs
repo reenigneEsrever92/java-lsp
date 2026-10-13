@@ -1,10 +1,16 @@
 //! The Maven project model: pom discovery, source roots per module, and the
 //! fallback to a plain whole-root workspace when no `pom.xml` exists.
+//!
+//! A rework of `src/deprecated/project.rs` (which in turn supersedes the live
+//! `src/project.rs` tree walk — see the parent `maven-module` change request).
+//! `walk_project`/`collect_java_files` are dropped: the index scans the
+//! published `FoldersDiscoverred` folders itself, and the `maven` spawn drives
+//! [`crate::maven::sources`] for the closure.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::resolve::{local_repository, EffectivePom, Resolver};
+use crate::maven::resolve::{EffectivePom, Resolver};
 
 /// One Maven module (or the whole workspace in fallback mode).
 #[derive(Debug, Clone)]
@@ -46,7 +52,7 @@ pub fn discover(root: &Path, resolver: &mut Resolver) -> ProjectModel {
         let Some(directory) = pom_path.parent().map(Path::to_path_buf) else {
             continue;
         };
-        let effective = crate::resolve::assemble(&pom_path, resolver, 0);
+        let effective = crate::maven::resolve::assemble(&pom_path, resolver, 0);
         let source_roots = source_roots(&directory, effective.as_ref());
         modules.insert(
             directory.clone(),
@@ -135,41 +141,6 @@ fn find_poms_recursive(dir: &Path, out: &mut Vec<PathBuf>, depth: u32) {
     }
 }
 
-/// Walks the workspace: discovers the Maven model and collects the `.java` files
-/// under its source roots. The warm-up coordinator runs this off the request
-/// path.
-pub(crate) fn walk_project(root: &Path) -> (ProjectModel, Vec<PathBuf>) {
-    let mut resolver = Resolver::new(local_repository());
-    let model = discover(root, &mut resolver);
-    let mut files = Vec::new();
-    for source_root in model.source_roots() {
-        collect_java_files(&source_root, &mut files);
-    }
-    files.sort();
-    (model, files)
-}
-
-/// Every `.java` file under `dir` (hidden directories skipped).
-fn collect_java_files(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            let hidden = path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with('.'));
-            if !hidden {
-                collect_java_files(&path, out);
-            }
-        } else if path.extension().is_some_and(|ext| ext == "java") {
-            out.push(path);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -251,13 +222,7 @@ mod tests {
         assert_eq!(model.modules.len(), 3);
         let roots = model.source_roots();
         // Sorted, deduplicated, exactly the existing roots.
-        assert_eq!(
-            roots,
-            vec![app_src, app_test, lib_src]
-                .into_iter()
-                .map(|root| root)
-                .collect::<Vec<_>>()
-        );
+        assert_eq!(roots, vec![app_src, app_test, lib_src]);
     }
 
     #[test]

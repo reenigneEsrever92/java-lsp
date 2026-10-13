@@ -62,12 +62,15 @@ fn parse_command_line() -> Cli {
     }
 }
 
-fn setup(_cli: Cli) -> Hub {
+fn setup(cli: Cli) -> Hub {
     let hub = Hub::new();
 
-    java_lsp::project::spawn(&hub);
+    java_lsp::maven::spawn(&hub, &cli);
     java_lsp::index::spawn(&hub);
     java_lsp::navigate::spawn(&hub);
+    java_lsp::completion::spawn(&hub);
+    java_lsp::buffers::spawn(&hub);
+    java_lsp::workspace::spawn(&hub);
 
     hub
 }

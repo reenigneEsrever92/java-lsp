@@ -1,10 +1,8 @@
-//! The index's data types: the symbol table, the declared-type store, the
-//! declared-type model, and the shared identity types.
+//! Index-owned storage: the symbol table, the declared-type store and its
+//! layered read view. Shared Java declarations live in [`crate::model`] and
+//! are re-exported here for callers using the older index paths.
 //!
-//! Pure data with its derives; every operation on it lives in the index's
-//! `analyze`, `query`, and `util` modules ([`super::analyze`], [`super::query`],
-//! [`super::util`]). `crate::types` keeps the binding/resolution engine and reads
-//! the model through those functions.
+//! Operations on the store live in [`super::analyze`] and [`super::query`].
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
@@ -12,24 +10,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 use tower_lsp::lsp_types::{Range, Url};
-/// What kind of declaration a symbol is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum SymbolKind {
-    Class,
-    Interface,
-    Enum,
-    Record,
-    Method,
-    Field,
-    /// One `enum` constant — completes as an enum member and is offered by a
-    /// receiver like a field, but is not a type and not a plain field.
-    EnumConstant,
-    Import,
-}
 
-/// Transitional alias for the modules that still say `IndexKind`; new code
-/// should say [`SymbolKind`].
-pub use SymbolKind as IndexKind;
+pub use crate::model::{IndexKind, Member, Param, Prim, SymbolKind, Ty, TypeInfo};
 
 /// Where a file's symbols came from. Replaces a `dependency` + `library_source`
 /// pair of flags: one byte, and the predicates the consumer reads name the
@@ -154,84 +136,6 @@ pub struct WorkspaceIndex {
     /// made ready.
     pub(crate) context: TypeContext,
     pub(crate) ready: bool,
-}
-
-/// A Java primitive type.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Prim {
-    Boolean,
-    Byte,
-    Short,
-    Int,
-    Long,
-    Char,
-    Float,
-    Double,
-}
-
-/// A declared type as written. Named reference types are keyed by the simple
-/// name they were written with (a qualified name keeps its dots and is matched
-/// on its last segment); generic arguments are kept as written.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum Ty {
-    Prim(Prim),
-    Void,
-    Null,
-    Ref {
-        name: String,
-        args: Vec<Ty>,
-    },
-    Array(Box<Ty>),
-    /// A type variable or a name the model could not resolve.
-    Var(String),
-    Unknown,
-}
-
-/// One method parameter: its declared type, plus the name where the source
-/// provides one. Class-file descriptors carry types only, so parameters of jar
-/// and JDK members read from bytecode are name-less.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Param {
-    pub name: Option<String>,
-    pub ty: Ty,
-}
-
-/// One declared member of a type.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Member {
-    pub name: String,
-    /// `IndexKind::Field` or `IndexKind::Method`.
-    pub kind: IndexKind,
-    /// The field's type or the method's return type.
-    pub ty: Ty,
-    /// Parameters; empty for fields.
-    pub params: Vec<Param>,
-    /// The method's declared type parameter names; empty for fields and for
-    /// class-file members, whose signatures are erased.
-    pub type_params: Vec<String>,
-    pub is_static: bool,
-}
-
-/// A declared type and its directly declared members.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TypeInfo {
-    /// The simple name (the last segment of a qualified/indexed name).
-    pub name: String,
-    /// The enclosing nested-type chain (`Map` for `Map$Entry`), when this is a
-    /// nested type; part of the model's identity, so two nested types sharing
-    /// an innermost name in one package do not overwrite each other.
-    pub nested: Option<String>,
-    pub package: Option<String>,
-    pub kind: IndexKind,
-    /// Type parameter names, treated as resolvable-but-opaque.
-    pub parameters: Vec<String>,
-    /// `extends`/`implements` targets, as written.
-    pub supertypes: Vec<Ty>,
-    pub fields: Vec<Member>,
-    pub methods: Vec<Member>,
-    /// The type's constructors, kept separate from `methods` so a constructor
-    /// never appears in a `.`-member listing (`t.T()` is not valid Java).
-    pub constructors: Vec<Member>,
 }
 
 /// The workspace's declared types, indexed by simple name.

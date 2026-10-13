@@ -3,20 +3,23 @@
 //!
 //! The reads are deliberately light — every entry with a name, one file's
 //! entries, the workspace's source files, a type's `(name, package)` supertype
-//! closure, a type's members, whether a type resolves, and the workspace types
-//! reaching a contract — so no declared-type model crosses the hub and `TypeInfo`
-//! stays as stored. [`answer`] maps one [`IndexRequest`] onto the index state; the
+//! closure, a type's members, a type's constructor overloads, whether a type
+//! resolves, and the workspace types reaching a contract — so no declared-type
+//! model crosses the hub and `TypeInfo` stays as stored. [`answer`] maps one
+//! [`IndexRequest`] onto the index state; the
 //! supertype-closure walk that used to live with navigation lives here with the
 //! index it walks.
 
 use std::collections::{HashSet, VecDeque};
+use std::ops::Bound;
 use std::sync::Arc;
 
 use tower_lsp::lsp_types::Url;
 
 use super::query;
-use super::types::{FileOrigin, SymbolEntry, SymbolKind, Ty, WorkspaceIndex};
+use super::types::{FileOrigin, SymbolEntry, WorkspaceIndex};
 use crate::messages::{IndexRequest, IndexResponse, MemberSelector};
+use crate::model::{SymbolKind, Ty};
 
 /// Answers one coarse read from the index.
 pub(crate) fn answer(index: &WorkspaceIndex, request: &IndexRequest) -> IndexResponse {
@@ -29,6 +32,9 @@ pub(crate) fn answer(index: &WorkspaceIndex, request: &IndexRequest) -> IndexRes
                 .cloned()
                 .unwrap_or_default(),
         ),
+        IndexRequest::EntriesByPrefix { prefix } => {
+            IndexResponse::Entries(entries_with_prefix(index, prefix))
+        }
         IndexRequest::FileSymbols { uri } => IndexResponse::File(
             index
                 .symbols
@@ -41,7 +47,10 @@ pub(crate) fn answer(index: &WorkspaceIndex, request: &IndexRequest) -> IndexRes
             IndexResponse::Closure(type_closure(index, ty, package.as_deref()))
         }
         IndexRequest::MembersOf { ty, package } => {
-            IndexResponse::Members(query::members(index, ty, package.as_deref()))
+            IndexResponse::Members(query::members_with_overloads(index, ty, package.as_deref()))
+        }
+        IndexRequest::ConstructorsOf { ty, package } => {
+            IndexResponse::Constructors(query::constructors(index, ty, package.as_deref()))
         }
         IndexRequest::ResolvesType { ty, package } => {
             IndexResponse::Resolves(query::lookup(index, ty, package.as_deref()).is_some())
@@ -57,6 +66,19 @@ pub(crate) fn answer(index: &WorkspaceIndex, request: &IndexRequest) -> IndexRes
             member.as_ref(),
         )),
     }
+}
+
+/// Every entry whose simple name starts with `prefix`, in name order. The symbol
+/// table is name-ordered, so the prefix is a single range scan rather than a walk
+/// of the whole table.
+fn entries_with_prefix(index: &WorkspaceIndex, prefix: &str) -> Vec<Arc<SymbolEntry>> {
+    index
+        .symbols
+        .by_name
+        .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        .take_while(|(name, _)| name.starts_with(prefix))
+        .flat_map(|(_, entries)| entries.iter().cloned())
+        .collect()
 }
 
 /// Every workspace source file the index holds, in index order; extracted library
@@ -77,7 +99,7 @@ fn source_files(index: &WorkspaceIndex) -> Vec<Url> {
 /// never touched.
 fn type_closure(
     index: &WorkspaceIndex,
-    ty: &crate::index::types::Ty,
+    ty: &Ty,
     package: Option<&str>,
 ) -> Vec<(String, Option<String>)> {
     let Some(root) = query::lookup(index, ty, package) else {
@@ -280,7 +302,7 @@ mod tests {
     fn index_of(uris: &[Url]) -> WorkspaceIndex {
         let paths: Vec<PathBuf> = uris.iter().map(|uri| uri.to_file_path().unwrap()).collect();
         let mut index = WorkspaceIndex::default();
-        scan_sources(&paths, &mut index);
+        scan_sources(&paths, FileOrigin::Workspace, &mut index);
         set_ready(&mut index);
         index
     }
@@ -302,6 +324,29 @@ mod tests {
             panic!("expected entries");
         };
         assert_eq!(entries.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn entries_by_prefix_returns_every_name_starting_with_it() {
+        let dir = temp_dir("prefix");
+        let alpha = write(&dir, "a/Alpha.java", "package a;\nclass Alpha {}\n");
+        let alpha_beta = write(&dir, "a/AlphaBeta.java", "package a;\nclass AlphaBeta {}\n");
+        let zed = write(&dir, "a/Zed.java", "package a;\nclass Zed {}\n");
+        let index = index_of(&[alpha, alpha_beta, zed]);
+
+        let response = answer(
+            &index,
+            &IndexRequest::EntriesByPrefix {
+                prefix: "Alpha".to_string(),
+            },
+        );
+        let IndexResponse::Entries(entries) = response else {
+            panic!("expected entries");
+        };
+        // Name order, so `Alpha` precedes `AlphaBeta`.
+        let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_ref()).collect();
+        assert_eq!(names, vec!["Alpha", "AlphaBeta"]);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -375,12 +420,12 @@ mod tests {
     }
 
     #[test]
-    fn members_of_lists_the_types_members() {
+    fn members_of_lists_the_types_members_with_overloads() {
         let dir = temp_dir("members");
         let widget = write(
             &dir,
             "p/Widget.java",
-            "package p;\nclass Widget {\n    int size;\n    void run() {}\n}\n",
+            "package p;\nclass Widget {\n    int size;\n    void run() {}\n    void run(int times) {}\n}\n",
         );
         let index = index_of(std::slice::from_ref(&widget));
 
@@ -395,7 +440,37 @@ mod tests {
             panic!("expected members");
         };
         assert!(members.iter().any(|member| member.name == "size"));
-        assert!(members.iter().any(|member| member.name == "run"));
+        // Overloads survive the read: both `run` declarations are answered.
+        assert_eq!(
+            members.iter().filter(|member| member.name == "run").count(),
+            2
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn constructors_of_lists_the_types_constructor_overloads() {
+        let dir = temp_dir("constructors");
+        let point = write(
+            &dir,
+            "p/Point.java",
+            "package p;\nclass Point {\n    Point() {}\n    Point(int x, int y) {}\n}\n",
+        );
+        let index = index_of(std::slice::from_ref(&point));
+
+        let response = answer(
+            &index,
+            &IndexRequest::ConstructorsOf {
+                ty: Ty::reference("Point"),
+                package: Some("p".to_string()),
+            },
+        );
+        let IndexResponse::Constructors(constructors) = response else {
+            panic!("expected constructors");
+        };
+        // Overloads survive the read: both `Point` declarations are answered.
+        assert_eq!(constructors.len(), 2);
+        assert!(constructors.iter().all(|ctor| ctor.name == "Point"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

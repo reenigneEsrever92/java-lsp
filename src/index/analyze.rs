@@ -17,11 +17,11 @@ use tower_lsp::lsp_types::Url;
 use tree_sitter::{Node, Parser, Tree};
 
 use super::types::{
-    FileOrigin, FileRecord, IndexKind, LayerSet, Member, ModelLayers, Param, Prim,
-    SourceLayerIndex, SymbolEntry, SymbolIndex, SymbolKind, Ty, TypeContext, TypeInfo, TypeModel,
-    WorkspaceIndex,
+    FileOrigin, FileRecord, LayerSet, ModelLayers, SourceLayerIndex, SymbolEntry, SymbolIndex,
+    TypeContext, TypeModel, WorkspaceIndex,
 };
 use super::util::params_key;
+use crate::model::{IndexKind, Member, Param, Prim, SymbolKind, Ty, TypeInfo};
 use crate::parser::{file_package, java_parser, type_from_node, LineIndex};
 /// Builds `TypeInfo`s for every class/interface/enum/record declared in a
 /// parsed document, including nested ones.
@@ -1118,13 +1118,23 @@ fn import_name(node: &Node, text: &str) -> String {
 /// Replaces `uri`'s entries, keeping the name and package views consistent.
 /// Each entry is allocated once and shared between the per-file and per-name
 /// views, so an entry is stored a single time.
+///
+/// The entries are stamped with `origin` so the per-entry and per-file origins
+/// never disagree — a consumer filtering on `entry.origin` (navigation, workspace
+/// symbols) sees the same source the record carries.
 pub fn upsert_file(
     index: &mut WorkspaceIndex,
     uri: &Url,
     origin: FileOrigin,
     entries: Vec<SymbolEntry>,
 ) {
-    let entries: Vec<Arc<SymbolEntry>> = entries.into_iter().map(Arc::new).collect();
+    let entries: Vec<Arc<SymbolEntry>> = entries
+        .into_iter()
+        .map(|mut entry| {
+            entry.origin = origin;
+            Arc::new(entry)
+        })
+        .collect();
     if let Some(old) = index.symbols.by_file.insert(
         uri.clone(),
         FileRecord {
@@ -1236,7 +1246,12 @@ pub fn set_ready(index: &mut WorkspaceIndex) {
 
 /// Parses one `.java` file and records its index entries and its declared-type
 /// model. `false` when the file cannot be read or parsed.
-pub(crate) fn index_source(index: &mut WorkspaceIndex, path: &Path, parser: &mut Parser) -> bool {
+pub(crate) fn index_source(
+    index: &mut WorkspaceIndex,
+    path: &Path,
+    parser: &mut Parser,
+    origin: FileOrigin,
+) -> bool {
     let Ok(text) = std::fs::read_to_string(path) else {
         return false;
     };
@@ -1250,18 +1265,22 @@ pub(crate) fn index_source(index: &mut WorkspaceIndex, path: &Path, parser: &mut
     let mut model = TypeModel::new();
     model.extend(collect_type_infos(package.as_deref(), &tree, &text));
     let entries = extract_entries(&uri, &tree, &text);
-    upsert_file(index, &uri, FileOrigin::Workspace, entries);
+    upsert_file(index, &uri, origin, entries);
     set_source(index, &uri, Arc::new(model));
     true
 }
 
 /// Parses each workspace `.java` file, recording its index entries and its
 /// declared-type model. Returns the number of files indexed.
-pub(crate) fn scan_sources(files: &[PathBuf], index: &mut WorkspaceIndex) -> usize {
+pub(crate) fn scan_sources(
+    files: &[PathBuf],
+    origin: FileOrigin,
+    index: &mut WorkspaceIndex,
+) -> usize {
     let mut parser = java_parser();
     let mut indexed = 0usize;
     for path in files {
-        if index_source(index, path, &mut parser) {
+        if index_source(index, path, &mut parser, origin) {
             indexed += 1;
         }
     }
