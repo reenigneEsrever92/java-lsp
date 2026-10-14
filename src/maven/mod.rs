@@ -34,7 +34,7 @@ use tower_lsp::lsp_types::Url;
 
 use crate::cli::Cli;
 use crate::hub::Hub;
-use crate::messages::{FolderOrigin, Notification};
+use crate::messages::{FolderOrigin, Notification, ProgressUpdate};
 
 use self::resolve::Artifact;
 use self::resolve::Resolver;
@@ -43,6 +43,11 @@ pub mod model;
 pub mod resolve;
 pub mod settings;
 pub mod sources;
+
+/// The token the maven module publishes its progress on, and the title of the
+/// item the shell renders for it.
+const PROGRESS_TOKEN: &str = "java-lsp/maven";
+const PROGRESS_TITLE: &str = "java-lsp";
 
 /// What the maven pass derives from a workspace root before any sourcing work:
 /// the workspace's source roots and the resolved dependency closure.
@@ -91,6 +96,10 @@ pub(crate) fn resolve_pass(root: &Path, repo: &Path) -> Pass {
 /// `--no-dependencies` skips the resolution and the sourcing; `--no-downloads`
 /// (or `$JAVA_LSP_OFFLINE` / the settings `offline` flag) resolves but never
 /// fetches or extracts.
+///
+/// While it works it publishes [`Notification::Progress`] on its own token
+/// (`java-lsp/maven`) — the resolve phase always, the source fetch only when it
+/// runs — so the editor shows what the warm-up is doing.
 pub fn spawn(hub: &Hub, cli: &Cli) {
     let no_dependencies = cli.no_dependencies;
     let no_downloads = cli.no_downloads;
@@ -105,6 +114,13 @@ pub fn spawn(hub: &Hub, cli: &Cli) {
             let Ok(root) = workspace_root.to_file_path() else {
                 continue;
             };
+            hub_client.notify(Notification::Progress {
+                token: PROGRESS_TOKEN.to_string(),
+                update: ProgressUpdate::Begin {
+                    title: PROGRESS_TITLE.to_string(),
+                    message: "Resolving Maven project".to_string(),
+                },
+            });
             let offline = settings::offline();
             let pass = tokio::task::spawn_blocking(move || {
                 let repo = settings::local_repository();
@@ -112,6 +128,19 @@ pub fn spawn(hub: &Hub, cli: &Cli) {
             })
             .await
             .unwrap_or_default();
+            hub_client.notify(Notification::Progress {
+                token: PROGRESS_TOKEN.to_string(),
+                update: ProgressUpdate::Update {
+                    message: format!("Resolved {} dependencies", pass.artifacts.len()),
+                    percentage: None,
+                },
+            });
+            hub_client.notify(Notification::Progress {
+                token: PROGRESS_TOKEN.to_string(),
+                update: ProgressUpdate::End {
+                    message: "Maven project resolved".to_string(),
+                },
+            });
 
             hub_client.notify(Notification::FoldersDiscoverred {
                 uri: pass
@@ -126,8 +155,28 @@ pub fn spawn(hub: &Hub, cli: &Cli) {
                 continue;
             }
 
+            hub_client.notify(Notification::Progress {
+                token: PROGRESS_TOKEN.to_string(),
+                update: ProgressUpdate::Begin {
+                    title: PROGRESS_TITLE.to_string(),
+                    message: "Fetching dependency sources".to_string(),
+                },
+            });
             let (repo, cache) = (settings::local_repository(), sources::cache_dir());
             let roots = sources::fetch_and_extract(&pass.artifacts, &repo, &cache).await;
+            hub_client.notify(Notification::Progress {
+                token: PROGRESS_TOKEN.to_string(),
+                update: ProgressUpdate::Update {
+                    message: format!("Fetched {} dependency sources", roots.len()),
+                    percentage: None,
+                },
+            });
+            hub_client.notify(Notification::Progress {
+                token: PROGRESS_TOKEN.to_string(),
+                update: ProgressUpdate::End {
+                    message: "Dependency sources fetched".to_string(),
+                },
+            });
             if roots.is_empty() {
                 continue;
             }
@@ -547,5 +596,45 @@ mod tests {
         drop(_offline_var);
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&fixture);
+    }
+
+    #[tokio::test]
+    async fn server_started_publishes_progress_on_the_maven_token() {
+        let _lock = env_lock();
+        let root = temp_dir("progress");
+        write(&root, "Main.java", "class Main {}\n");
+
+        let hub = crate::hub::Hub::new();
+        let mut listener = hub.register("test-listener").subscribe().await;
+        let cli = Cli {
+            no_dependencies: true,
+            no_downloads: true,
+            ..Cli::default()
+        };
+        spawn(&hub, &cli);
+        hub.register("server").notify(Notification::ServerStarted {
+            workspace_root: Url::from_directory_path(&root).unwrap(),
+        });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut began, mut updated, mut ended) = (false, false, false);
+        while tokio::time::Instant::now() < deadline && !(began && updated && ended) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Some(message)) = tokio::time::timeout(remaining, listener.recv()).await else {
+                break;
+            };
+            if let Notification::Progress { token, update } = &*message {
+                assert_eq!(token, PROGRESS_TOKEN);
+                match update {
+                    ProgressUpdate::Begin { .. } => began = true,
+                    ProgressUpdate::Update { .. } => updated = true,
+                    ProgressUpdate::End { .. } => ended = true,
+                }
+            }
+        }
+        assert!(began, "expected a begin");
+        assert!(updated, "expected an update");
+        assert!(ended, "expected an end");
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

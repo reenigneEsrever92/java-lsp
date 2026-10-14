@@ -3,7 +3,8 @@ type: ChangeRequest
 kind: feature
 title: "Maven module: dependency sources fetch and extraction"
 description: Rework src/deprecated/sources.rs into src/maven/sources.rs — reuse or download each -sources.jar (sha1-verified) and extract its .java files into the cache, returning the extracted root directories — no direct index writes.
-state: planned
+state: done
+verified: { by: felix, at: 2026-10-14T12:00:29Z }
 priority: medium
 tags: [dev, maven, sources]
 owner: felix

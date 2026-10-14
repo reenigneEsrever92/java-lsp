@@ -269,9 +269,30 @@ pub enum FolderOrigin {
     LibrarySources,
 }
 
+/// One step of a progress stream: a `Begin` that opens it and names the phase,
+/// zero or more `Update`s that report how far the work has come, and the `End`
+/// that closes it. The stream is named by the `token` on the
+/// [`Notification::Progress`] carrying the step, so the shell renders each
+/// stream as its own item without guessing where a message belongs.
+#[derive(Debug, Clone)]
+pub enum ProgressUpdate {
+    /// Opens the stream: the item's `title` and the phase that starts.
+    Begin { title: String, message: String },
+    /// Reports progress: the current `message` and, once the total is known, a
+    /// `percentage` from 0 to 100.
+    Update {
+        message: String,
+        percentage: Option<u32>,
+    },
+    /// Closes the stream with a final `message`.
+    End { message: String },
+}
+
 /// A notification the hub broadcasts to every subscriber; each consumes the
 /// ones it cares about. Large payloads can be retained cheaply by cloning their
-/// shared `Arc`s rather than the value behind them.
+/// shared `Arc`s rather than the value behind them. [`Notification::Progress`]
+/// is the generic progress vocabulary every warm-up module may publish, keyed
+/// by a token so each stream becomes its own editor item.
 #[derive(Debug)]
 pub enum Notification {
     /// Lsp server started in folder "workspace_root"
@@ -295,6 +316,13 @@ pub enum Notification {
     },
     /// The editor closed a document.
     DocumentClosed { uri: Url },
+    /// A step of a generic progress stream: `token` names the stream (the
+    /// editor's grouping key) and `update` is the step. Any module may publish
+    /// its own stream while it works.
+    Progress {
+        token: String,
+        update: ProgressUpdate,
+    },
 }
 
 /// The compact shapes the hub's per-message log line renders. `Debug` keeps the
@@ -495,6 +523,65 @@ impl Notification {
                 )
             }
             Notification::DocumentClosed { uri } => format!("DocumentClosed uri={uri}"),
+            Notification::Progress { token, update } => match update {
+                ProgressUpdate::Begin { title, message } => {
+                    format!("Progress token={token} begin title={title} message={message}")
+                }
+                ProgressUpdate::Update {
+                    message,
+                    percentage,
+                } => match percentage {
+                    Some(percentage) => format!(
+                        "Progress token={token} update message={message} percentage={percentage}"
+                    ),
+                    None => format!("Progress token={token} update message={message}"),
+                },
+                ProgressUpdate::End { message } => {
+                    format!("Progress token={token} end message={message}")
+                }
+            },
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn progress_summary_names_the_token_and_phase() {
+        let begin = Notification::Progress {
+            token: "java-lsp/index".to_string(),
+            update: ProgressUpdate::Begin {
+                title: "java-lsp".to_string(),
+                message: "Indexing workspace".to_string(),
+            },
+        };
+        assert_eq!(
+            begin.summary(),
+            "Progress token=java-lsp/index begin title=java-lsp message=Indexing workspace"
+        );
+
+        let update = Notification::Progress {
+            token: "java-lsp/index".to_string(),
+            update: ProgressUpdate::Update {
+                message: "Indexed 3 of 10 files".to_string(),
+                percentage: Some(30),
+            },
+        };
+        assert_eq!(
+            update.summary(),
+            "Progress token=java-lsp/index update message=Indexed 3 of 10 files percentage=30"
+        );
+
+        let end = Notification::Progress {
+            token: "java-lsp/index".to_string(),
+            update: ProgressUpdate::End {
+                message: "Indexed 10 of 10 files".to_string(),
+            },
+        };
+        let summary = end.summary();
+        assert!(summary.contains("token=java-lsp/index"), "{summary}");
+        assert!(summary.contains("end"), "{summary}");
     }
 }

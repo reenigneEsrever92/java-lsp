@@ -55,8 +55,17 @@ use tokio::sync::mpsc::UnboundedReceiver;
 use crate::hub::{Hub, HubClient};
 use crate::messages::{
     Envelope, FolderOrigin, IndexBatchRequest, IndexBatchResponse, IndexRequest, Message,
-    Notification, Request, Response,
+    Notification, ProgressUpdate, Request, Response,
 };
+
+/// The token the index publishes its progress on, and the title of the item the
+/// shell renders for it.
+const PROGRESS_TOKEN: &str = "java-lsp/index";
+const PROGRESS_TITLE: &str = "java-lsp";
+
+/// The number of files scanned between progress reports, so the item advances
+/// during a large batch without a report per file.
+const SCAN_CHUNK: usize = 128;
 
 // ---------------------------------------------------------------------------
 // The workspace source scan driver
@@ -121,7 +130,23 @@ async fn serve(
                     .iter()
                     .filter_map(|folder| folder.to_file_path().ok())
                     .collect();
+                let phase = match origin {
+                    FolderOrigin::Workspace => "Indexing workspace",
+                    FolderOrigin::LibrarySources => "Indexing library sources",
+                };
+                hub_client.notify(Notification::Progress {
+                    token: PROGRESS_TOKEN.to_string(),
+                    update: ProgressUpdate::Begin {
+                        title: PROGRESS_TITLE.to_string(),
+                        message: phase.to_string(),
+                    },
+                });
                 let origin = file_origin(*origin);
+                // The scan runs on the blocking pool, so the client is cloned in:
+                // each chunk reports from inside the closure rather than through a
+                // sink threaded into `scan_sources` (`HubClient::notify` never
+                // blocks).
+                let progress = hub_client.clone();
                 index = tokio::task::spawn_blocking(move || {
                     let mut index = index;
                     let mut files: Vec<PathBuf> = folders
@@ -130,8 +155,25 @@ async fn serve(
                         .collect();
                     files.sort();
                     files.dedup();
-                    scan_sources(&files, origin, &mut index);
+                    let total = files.len();
+                    let mut done = 0usize;
+                    for chunk in files.chunks(SCAN_CHUNK) {
+                        done += scan_sources(chunk, origin, &mut index);
+                        progress.notify(Notification::Progress {
+                            token: PROGRESS_TOKEN.to_string(),
+                            update: ProgressUpdate::Update {
+                                message: format!("Indexed {done} of {total} files"),
+                                percentage: (total != 0).then(|| (done * 100 / total) as u32),
+                            },
+                        });
+                    }
                     set_ready(&mut index);
+                    progress.notify(Notification::Progress {
+                        token: PROGRESS_TOKEN.to_string(),
+                        update: ProgressUpdate::End {
+                            message: format!("Indexed {done} of {total} files"),
+                        },
+                    });
                     index
                 })
                 .await
@@ -232,6 +274,44 @@ mod tests {
         let uri = Url::from_file_path(&file).unwrap();
         assert!(index.symbols.by_file.contains_key(&uri));
         assert!(index.types.source.positions.contains_key(&uri));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn scan_publishes_begin_update_end_on_the_index_token() {
+        let dir = temp_dir("progress");
+        let file = dir.join("a").join("Widget.java");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "package a;\n\npublic class Widget {}\n").unwrap();
+
+        let hub = Hub::new();
+        let mut listener = hub.register("test-listener").subscribe().await;
+        spawn(&hub);
+        hub.register("server")
+            .notify(Notification::FoldersDiscoverred {
+                uri: vec![Url::from_directory_path(&dir).unwrap()],
+                origin: FolderOrigin::Workspace,
+            });
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        let (mut began, mut updated, mut ended) = (false, false, false);
+        while tokio::time::Instant::now() < deadline && !(began && updated && ended) {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let Ok(Some(message)) = tokio::time::timeout(remaining, listener.recv()).await else {
+                break;
+            };
+            if let Notification::Progress { token, update } = &*message {
+                assert_eq!(token, PROGRESS_TOKEN);
+                match update {
+                    ProgressUpdate::Begin { .. } => began = true,
+                    ProgressUpdate::Update { .. } => updated = true,
+                    ProgressUpdate::End { .. } => ended = true,
+                }
+            }
+        }
+        assert!(began, "expected a begin");
+        assert!(updated, "expected at least one update");
+        assert!(ended, "expected an end");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

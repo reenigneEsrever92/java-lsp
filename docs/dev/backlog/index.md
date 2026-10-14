@@ -33,10 +33,11 @@ holds only open work.
 | [completion-doc-coherence](completion-doc-coherence.md)                    | improvement | low      | done        |
 | [var-local-receiver-inference](var-local-receiver-inference.md)            | bug         | high     | planned      |
 | [hub-message-log-summaries](hub-message-log-summaries.md)                  | improvement | medium   | done          |
-| [maven-module](maven-module.md)                                            | feature     | medium   | planned       |
-| [maven-module-settings](maven-module-settings.md)                          | feature     | medium   | planned       |
-| [maven-module-resolve](maven-module-resolve.md)                            | feature     | medium   | planned       |
-| [maven-module-model](maven-module-model.md)                                | feature     | medium   | planned       |
-| [maven-module-sources](maven-module-sources.md)                            | feature     | medium   | planned       |
-| [maven-module-hub](maven-module-hub.md)                                    | feature     | medium   | planned       |
+| [maven-module](maven-module.md)                                            | feature     | medium   | done          |
+| [maven-module-settings](maven-module-settings.md)                          | feature     | medium   | done          |
+| [maven-module-resolve](maven-module-resolve.md)                            | feature     | medium   | done          |
+| [maven-module-model](maven-module-model.md)                                | feature     | medium   | done          |
+| [maven-module-sources](maven-module-sources.md)                            | feature     | medium   | done          |
+| [maven-module-hub](maven-module-hub.md)                                    | feature     | medium   | done          |
 | [workspace-symbols](workspace-symbols.md)                                  | feature     | medium   | done          |
+| [indexing-progress-notification](indexing-progress-notification.md)         | feature     | medium   | done        |

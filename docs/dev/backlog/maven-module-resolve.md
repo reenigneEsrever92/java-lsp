@@ -3,7 +3,8 @@ type: ChangeRequest
 kind: feature
 title: "Maven module: effective poms and dependency closure"
 description: Rework src/deprecated/resolve.rs into src/maven/resolve.rs — effective-pom assembly (parents, properties, dependencyManagement/BOMs) and the offline transitive closure — minus the old hub driver.
-state: planned
+state: done
+verified: { by: felix, at: 2026-10-14T12:00:29Z }
 priority: medium
 tags: [dev, maven, resolve]
 owner: felix

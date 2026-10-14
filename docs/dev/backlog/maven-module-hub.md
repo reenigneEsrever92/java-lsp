@@ -3,7 +3,8 @@ type: ChangeRequest
 kind: feature
 title: "Maven module: hub integration (spawn, FoldersDiscoverred origin, wiring)"
 description: Wire the module together — src/maven/mod.rs spawn publishing the two FoldersDiscoverred batches with origins, the FolderOrigin message field, index origin threading, --no-dependencies/--no-downloads flags, main/lib wiring, deleting the superseded project.rs and the deprecated Maven files.
-state: planned
+state: done
+verified: { by: felix, at: 2026-10-14T12:00:29Z }
 priority: medium
 tags: [dev, maven, hub]
 owner: felix

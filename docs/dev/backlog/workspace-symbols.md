@@ -172,7 +172,7 @@ index read because `EntriesByPrefix` already range-scans the name-ordered table.
 - [x] `messages.rs` — add `SymbolRequest`/`SymbolResponse` and the
       `Request::Symbols`/`Response::Symbols` variants with their `summary()` arms.
 - [x] `hub.rs` — route `Request::Symbols` to `"workspace"` in `owner_of`.
-- [x] `index/util.rs` — add `SymbolEntry::is_constructor()`; repoint
+- [x] `index/types.rs` — add `SymbolEntry::is_constructor()`; repoint
       `completion.rs` to it and delete its private `is_constructor_entry`.
 - [x] `src/workspace.rs` (new) — the module (spawn/serve/search) and its tests:
       prefix match and empty query, the `selection_range`/`container_name`/kind

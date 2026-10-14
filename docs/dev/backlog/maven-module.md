@@ -3,7 +3,8 @@ type: ChangeRequest
 kind: feature
 title: Maven module — parse pom.xml projects, fetch dependency sources into a home-folder cache, publish source roots via FoldersDiscoverred
 description: Reintroduce the Maven machinery (project model, offline dependency resolution, source fetching) as a `maven` hub module that publishes the extracted dependency sources to the index through the FoldersDiscoverred notification, superseding the generic project.rs source-folder walk.
-state: planned
+state: done
+verified: { by: felix, at: 2026-10-14T12:00:29Z }
 priority: medium
 tags: [dev, maven, project-model, sources]
 owner: felix
@@ -206,8 +207,8 @@ with `cargo test`, and does not touch any other module.
 
 Ordered by the dependency chain; the hub sub-task is last and closes the loop.
 
-- [ ] [Maven module: Maven settings and local repository](maven-module-settings.md)
-- [ ] [Maven module: effective poms and dependency closure](maven-module-resolve.md)
-- [ ] [Maven module: project model with pom-aware source roots](maven-module-model.md)
-- [ ] [Maven module: dependency sources fetch and extraction](maven-module-sources.md)
-- [ ] [Maven module: hub integration (spawn, FoldersDiscoverred origin, wiring)](maven-module-hub.md)
+- [x] [Maven module: Maven settings and local repository](maven-module-settings.md)
+- [x] [Maven module: effective poms and dependency closure](maven-module-resolve.md)
+- [x] [Maven module: project model with pom-aware source roots](maven-module-model.md)
+- [x] [Maven module: dependency sources fetch and extraction](maven-module-sources.md)
+- [x] [Maven module: hub integration (spawn, FoldersDiscoverred origin, wiring)](maven-module-hub.md)

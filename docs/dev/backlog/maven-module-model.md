@@ -3,7 +3,8 @@ type: ChangeRequest
 kind: feature
 title: "Maven module: project model with pom-aware source roots"
 description: Rework src/deprecated/project.rs into src/maven/model.rs — pom discovery, modules with effective poms, declared source roots, no-pom whole-root fallback — superseding the live src/project.rs walk.
-state: planned
+state: done
+verified: { by: felix, at: 2026-10-14T12:00:29Z }
 priority: medium
 tags: [dev, maven, project-model]
 owner: felix

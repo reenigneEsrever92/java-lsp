@@ -10,7 +10,33 @@ Entries that say "Verified by N tests" quote the whole suite's size at that
 point (the cumulative `cargo test` total), not the number of tests covering the
 named change.
 
+## 2026-10-14
+
+- **Report indexing progress to the editor** — `Notification::Progress { token,
+  update }` joins the hub vocabulary, published by the `index` and `maven`
+  modules on the tokens `java-lsp/index` and `java-lsp/maven` during warm-up and
+  rendered by the shell as `$/progress` gated on the client's
+  `window.workDoneProgress`. See
+  [Report indexing progress to the editor](backlog/indexing-progress-notification.md).
+
 ## 2026-10-13
+
+- **Maven module: project model, dependency resolution, and library sources** —
+  new `src/maven/` hub module (`settings.rs`, `resolve.rs`, `model.rs`, `sources.rs`,
+  `mod.rs`) parses Maven projects (every `pom.xml` becomes a module with its
+  effective pom and declared source roots; a no-pom workspace falls back to the
+  whole root, superseding the live `project.rs` walk), resolves each module's
+  dependency closure strictly offline from the local repository, and fetches the
+  dependency `-sources.jar`s into the local repository and extracts them under
+  the home-folder sources cache, honoring `~/.m2/settings.xml` (`localRepository`,
+  mirrors, `offline`). It publishes the workspace source roots and the extracted
+  library roots to the index as two `FoldersDiscoverred` batches with `Workspace`
+  / `LibrarySources` origins, which the index scans and tags
+  `FileOrigin::Workspace` / `LibrarySource` (completable and openable, never a
+  references/rename candidate); `--no-dependencies` / `--no-downloads` gate the
+  resolution and sourcing, and `JAVA_LSP_OFFLINE` disables all network work.
+  Verified by 155 library tests and 7 bench tests. See
+  [Maven module: parse pom.xml projects, fetch dependency sources into a home-folder cache, publish source roots via FoldersDiscoverred](backlog/maven-module.md).
 
 - **Workspace symbol search is served again** — the shell advertises
   `workspaceSymbolProvider` and answers `workspace/symbol` through a new

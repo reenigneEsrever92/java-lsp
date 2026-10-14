@@ -3,7 +3,8 @@ type: ChangeRequest
 kind: feature
 title: "Maven module: Maven settings and local repository"
 description: New src/maven/settings.rs honoring ~/.m2/settings.xml (localRepository, mirrors, offline) plus the env-var precedence for the local repository and the download base.
-state: planned
+state: done
+verified: { by: felix, at: 2026-10-14T12:00:29Z }
 priority: medium
 tags: [dev, maven, settings]
 owner: felix

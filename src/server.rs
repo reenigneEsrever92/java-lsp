@@ -11,30 +11,35 @@
 //! the navigation queries routed to the `navigate` module, and a drain task ready
 //! to render what the modules publish next.
 
+use std::collections::HashSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use tokio::sync::mpsc::UnboundedReceiver;
 use tower_lsp::jsonrpc::Result;
+use tower_lsp::lsp_types::notification::Progress;
 use tower_lsp::lsp_types::request::{
     GotoDeclarationParams, GotoDeclarationResponse, GotoImplementationParams,
-    GotoImplementationResponse,
+    GotoImplementationResponse, WorkDoneProgressCreate,
 };
 use tower_lsp::lsp_types::{
     CompletionOptions, CompletionParams, CompletionResponse, DeclarationCapability,
     DidChangeTextDocumentParams, DidCloseTextDocumentParams, DidOpenTextDocumentParams,
     GotoDefinitionParams, GotoDefinitionResponse, ImplementationProviderCapability,
-    InitializeParams, InitializeResult, InitializedParams, Location, OneOf, ReferenceParams,
-    ServerCapabilities, SignatureHelp, SignatureHelpOptions, SignatureHelpParams,
-    SymbolInformation, TextDocumentPositionParams, TextDocumentSyncCapability,
-    TextDocumentSyncKind, Url, WorkspaceSymbolParams,
+    InitializeParams, InitializeResult, InitializedParams, Location, NumberOrString, OneOf,
+    ProgressParams, ProgressParamsValue, ReferenceParams, ServerCapabilities, SignatureHelp,
+    SignatureHelpOptions, SignatureHelpParams, SymbolInformation, TextDocumentPositionParams,
+    TextDocumentSyncCapability, TextDocumentSyncKind, Url, WorkDoneProgress, WorkDoneProgressBegin,
+    WorkDoneProgressCreateParams, WorkDoneProgressEnd, WorkDoneProgressReport,
+    WorkspaceSymbolParams,
 };
 use tower_lsp::LanguageServer;
 
 use crate::hub::HubClient;
 use crate::messages::{
     CompletionRequest, CompletionResponse as ItemsResponse, NavigateRequest, NavigateResponse,
-    Notification, Request, Response, SymbolRequest, SymbolResponse,
+    Notification, ProgressUpdate, Request, Response, SymbolRequest, SymbolResponse,
 };
 
 /// The LSP shell: the hub's first client.
@@ -44,6 +49,9 @@ pub struct JavaLanguageServer {
     /// The workspace root learned in `initialize`, published on the hub in
     /// `initialized` as [`Notification::ServerStarted`].
     workspace_root: Mutex<Option<Url>>,
+    /// Whether the client advertised `window.workDoneProgress` in `initialize`;
+    /// with it unset, [`Notification::Progress`] is dropped silently.
+    work_done_progress: Arc<AtomicBool>,
 }
 
 impl std::fmt::Debug for JavaLanguageServer {
@@ -54,21 +62,78 @@ impl std::fmt::Debug for JavaLanguageServer {
 
 impl JavaLanguageServer {
     /// Builds the shell on `hub` — the client `main` registered first — with the
-    /// notification subscription `incoming` it took from that client.
+    /// notification subscription `incoming` it took from that client, and the
+    /// `client` tower-lsp hands it for talking back to the editor.
     ///
     /// The shell drains `incoming` on its own task, so the hub never blocks on a
-    /// slow client; the editor-facing notifications (diagnostics, progress,
-    /// notices) are rendered here as the modules that publish them return.
-    pub fn new(hub: HubClient, mut incoming: UnboundedReceiver<Arc<Notification>>) -> Self {
+    /// slow client; it renders each [`Notification::Progress`] as LSP work-done
+    /// progress on the editor (`window/workDoneProgress/create` once per token,
+    /// then `$/progress`), and drops it unless the client advertised
+    /// `window.workDoneProgress` in `initialize`.
+    pub fn new(
+        hub: HubClient,
+        mut incoming: UnboundedReceiver<Arc<Notification>>,
+        client: tower_lsp::Client,
+    ) -> Self {
+        let work_done_progress = Arc::new(AtomicBool::new(false));
+        let drain_progress = Arc::clone(&work_done_progress);
         tokio::spawn(async move {
-            while incoming.recv().await.is_some() {
-                // Nothing to render yet: the modules that publish the
-                // editor-facing notifications are reintroduced one at a time.
+            // The tokens whose item the client has already been asked to create.
+            let mut created: HashSet<String> = HashSet::new();
+            while let Some(message) = incoming.recv().await {
+                let Notification::Progress { token, update } = &*message else {
+                    continue;
+                };
+                if !drain_progress.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let token = token.clone();
+                let update = update.clone();
+                if !created.contains(&token) {
+                    let request = client
+                        .send_request::<WorkDoneProgressCreate>(WorkDoneProgressCreateParams {
+                            token: NumberOrString::String(token.clone()),
+                        })
+                        .await;
+                    // A token whose item could not be created is not marked, so a
+                    // later update retries instead of reporting into nothing.
+                    if request.is_err() {
+                        continue;
+                    }
+                    created.insert(token.clone());
+                }
+                let value = match update {
+                    ProgressUpdate::Begin { title, message } => {
+                        WorkDoneProgress::Begin(WorkDoneProgressBegin {
+                            title,
+                            message: Some(message),
+                            ..Default::default()
+                        })
+                    }
+                    ProgressUpdate::Update {
+                        message,
+                        percentage,
+                    } => WorkDoneProgress::Report(WorkDoneProgressReport {
+                        message: Some(message),
+                        percentage,
+                        ..Default::default()
+                    }),
+                    ProgressUpdate::End { message } => WorkDoneProgress::End(WorkDoneProgressEnd {
+                        message: Some(message),
+                    }),
+                };
+                client
+                    .send_notification::<Progress>(ProgressParams {
+                        token: NumberOrString::String(token),
+                        value: ProgressParamsValue::WorkDone(value),
+                    })
+                    .await;
             }
         });
         Self {
             hub,
             workspace_root: Mutex::new(None),
+            work_done_progress,
         }
     }
 
@@ -99,6 +164,16 @@ impl JavaLanguageServer {
 impl LanguageServer for JavaLanguageServer {
     async fn initialize(&self, params: InitializeParams) -> Result<InitializeResult> {
         tracing::info!("initializing java-lsp");
+        // Remember whether the client renders work-done progress; the drain task
+        // reads this before rendering any `Notification::Progress`.
+        let work_done_progress = params
+            .capabilities
+            .window
+            .as_ref()
+            .and_then(|window| window.work_done_progress)
+            .unwrap_or(false);
+        self.work_done_progress
+            .store(work_done_progress, Ordering::SeqCst);
         let root = params.root_uri.or_else(|| {
             params
                 .workspace_folders
